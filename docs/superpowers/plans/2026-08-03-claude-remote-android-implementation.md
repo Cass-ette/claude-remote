@@ -549,6 +549,7 @@ Goal: a runnable loopback Bridge skeleton with validated protocol models, durabl
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
+    "canonicalize": "^2.0.0",
     "fastify": "^5.0.0",
     "@fastify/websocket": "^11.0.0",
     "ajv": "^8.17.1",
@@ -598,7 +599,7 @@ Expected: FAIL because `loadConfig` is missing.
 
 - [ ] **Step 5: Write the failing HTTP test**
 
-Assert `/api/v1/capabilities` returns `protocolVersion`, `bridgeVersion`, `minimumAndroidVersion`, `serverTime`, and `features: []`; `/api/v1/health` returns `{status:"ok"}`; requests to any path outside `/api/v1/` return 404; and the server binds to `127.0.0.1` only.
+Assert `/api/v1/capabilities` returns `protocolVersion` (string `"claude-remote.v1"`), `bridgeVersion`, `minimumAndroidVersion`, `claudeCodeVersion` (return `null` until Chunk 3 wires the real value), `serverTime`, and `features: []`; `/api/v1/health` returns `{status:"ok"}`; requests to any path outside `/api/v1/` return 404; and the server binds to `127.0.0.1` only.
 
 - [ ] **Step 6: Implement the minimal Fastify server**
 
@@ -631,7 +632,170 @@ git commit -m "feat(bridge): add loopback http skeleton and config"
 
 Assert: opening the database creates the file with mode `0600`; `migrate()` is idempotent; `transaction(fn)` rolls back when `fn` throws; WAL journal mode is enabled; and every table from `001_initial.sql` exists with the expected columns.
 
-Schema covers `projects`, `sessions`, `commands`, `pending_events`, `device_delivery`, `history_snapshots`, `history_snapshot_items`, `session_locks`, `devices`, `device_sessions`, `pairing_tokens`, `auth_challenges`, and `audit_events`. Columns must match the spec sections 6.5, 6.7, 7.4, 8.5, and 10.3 exactly, including `device_delivery.deliveryBase`, `device_delivery.deliveryWatermark`, `history_snapshots.status` (`prepared`/`committed`/`expired`), and `auth_challenges.challengeRaw`.
+Schema covers `projects`, `sessions`, `commands`, `pending_events`, `device_delivery`, `history_snapshots`, `history_snapshot_items`, `session_locks`, `devices`, `device_sessions`, `pairing_tokens`, `auth_challenges`, and `audit_events`. Use exactly the columns below:
+
+```sql
+-- 001_initial.sql
+CREATE TABLE projects (
+  projectId            TEXT PRIMARY KEY,
+  canonicalRealpath    TEXT NOT NULL UNIQUE,
+  deviceNumber         INTEGER NOT NULL,
+  inode                INTEGER NOT NULL,
+  displayName          TEXT NOT NULL,
+  createdAt            INTEGER NOT NULL,
+  authorizedAt         INTEGER NOT NULL
+);
+
+CREATE TABLE sessions (
+  sessionId            TEXT PRIMARY KEY,
+  projectId            TEXT NOT NULL REFERENCES projects(projectId),
+  displayName          TEXT NOT NULL,
+  status               TEXT NOT NULL CHECK (status IN (
+    'inactive','starting','idle','running','waiting_permission',
+    'interrupting','releasing','interrupted','failed'
+  )),
+  source               TEXT NOT NULL CHECK (source IN ('bridge','imported')),
+  lastClaudeVersion    TEXT,
+  lastEventId          INTEGER NOT NULL DEFAULT 0,
+  lastActivityAt       INTEGER NOT NULL,
+  createdAt            INTEGER NOT NULL
+);
+
+CREATE TABLE commands (
+  requestId            TEXT PRIMARY KEY,
+  deviceId             TEXT NOT NULL,
+  sessionId            TEXT NOT NULL,
+  idempotencyKey       TEXT NOT NULL,
+  commandType          TEXT NOT NULL,
+  payloadHash          TEXT NOT NULL,
+  status               TEXT NOT NULL CHECK (status IN (
+    'accepted','dispatching','dispatched',
+    'indeterminate','interrupted','completed','failed'
+  )),
+  resultJson           TEXT,
+  createdAt            INTEGER NOT NULL,
+  updatedAt            INTEGER NOT NULL,
+  UNIQUE (deviceId, idempotencyKey)
+);
+CREATE INDEX idx_commands_session ON commands(sessionId);
+
+CREATE TABLE pending_events (
+  sessionId            TEXT NOT NULL,
+  eventId              INTEGER NOT NULL,
+  eventType            TEXT NOT NULL,
+  payloadJson          TEXT NOT NULL,
+  protocolVersion      TEXT NOT NULL,
+  deleteAfter          INTEGER,
+  createdAt            INTEGER NOT NULL,
+  PRIMARY KEY (sessionId, eventId)
+);
+
+CREATE TABLE device_delivery (
+  deviceId             TEXT NOT NULL,
+  sessionId            TEXT NOT NULL,
+  protocolVersion      TEXT NOT NULL,
+  deliveryBase         INTEGER NOT NULL,
+  deliveryWatermark    INTEGER NOT NULL,
+  deliveryCheckpointWatermark INTEGER NOT NULL DEFAULT 0,
+  pendingCheckpoint    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (deviceId, sessionId)
+);
+
+CREATE TABLE history_snapshots (
+  snapshotId           TEXT PRIMARY KEY,
+  sessionId            TEXT NOT NULL,
+  deviceId             TEXT NOT NULL,
+  status               TEXT NOT NULL CHECK (status IN ('prepared','committed','expired')),
+  historyRevision      TEXT NOT NULL,
+  adapterVersion       TEXT NOT NULL,
+  transcriptPath       TEXT NOT NULL,
+  readByteLimit        INTEGER NOT NULL,
+  deliveryBase         INTEGER NOT NULL,
+  deliveryWatermark    INTEGER NOT NULL,
+  sessionStatus        TEXT NOT NULL,
+  pendingPermissionJson TEXT,
+  createdAt            INTEGER NOT NULL,
+  expiresAt            INTEGER NOT NULL
+);
+
+CREATE TABLE history_snapshot_items (
+  snapshotId           TEXT NOT NULL REFERENCES history_snapshots(snapshotId),
+  ordinal              INTEGER NOT NULL,
+  historyItemId        TEXT NOT NULL,
+  historyRevision      TEXT NOT NULL,
+  payloadJson          TEXT NOT NULL,
+  PRIMARY KEY (snapshotId, ordinal)
+);
+
+CREATE TABLE session_locks (
+  sessionId            TEXT PRIMARY KEY,
+  bridgeInstanceId     TEXT NOT NULL,
+  processLeaseSecret   TEXT,
+  processPid           INTEGER,
+  processStartedAt     INTEGER,
+  heartbeatAt          INTEGER NOT NULL
+);
+
+CREATE TABLE devices (
+  deviceId             TEXT PRIMARY KEY,
+  publicKeySpki        TEXT NOT NULL,
+  accessSubject        TEXT NOT NULL,
+  displayName          TEXT NOT NULL,
+  pairedAt             INTEGER NOT NULL,
+  revokedAt            INTEGER
+);
+
+CREATE TABLE device_sessions (
+  tokenHash            TEXT PRIMARY KEY,
+  deviceId             TEXT NOT NULL REFERENCES devices(deviceId),
+  accessSubject        TEXT NOT NULL,
+  expiresAt            INTEGER NOT NULL,
+  revokedAt            INTEGER,
+  createdAt            INTEGER NOT NULL
+);
+
+CREATE TABLE pairing_tokens (
+  tokenHash            TEXT PRIMARY KEY,
+  expiresAt            INTEGER NOT NULL,
+  consumedAt           INTEGER,
+  createdAt            INTEGER NOT NULL
+);
+
+CREATE TABLE auth_challenges (
+  challengeId          TEXT PRIMARY KEY,
+  deviceId             TEXT NOT NULL,
+  accessSubject        TEXT NOT NULL,
+  hostAscii            TEXT NOT NULL,
+  challengeRaw         BLOB NOT NULL,
+  expiresAt            INTEGER NOT NULL,
+  consumedAt           INTEGER,
+  createdAt            INTEGER NOT NULL
+);
+
+CREATE TABLE audit_events (
+  auditId              INTEGER PRIMARY KEY AUTOINCREMENT,
+  occurredAt           INTEGER NOT NULL,
+  accessSubjectHash    TEXT,
+  deviceId             TEXT,
+  rayId                TEXT,
+  sourceIp             TEXT,
+  requestId            TEXT,
+  operationType        TEXT NOT NULL,
+  sessionId            TEXT,
+  projectId            TEXT,
+  resultCode           TEXT NOT NULL,
+  toolCategory         TEXT,
+  permissionDecision   TEXT,
+  redactedDetail       TEXT
+);
+
+CREATE TABLE schema_migrations (
+  version              INTEGER PRIMARY KEY,
+  appliedAt            INTEGER NOT NULL
+);
+```
+
+Add a column-existence test for every column name in the schema above.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -674,7 +838,7 @@ git commit -m "feat(bridge): add sqlite schema and transaction helper"
 
 - [ ] **Step 2: Write failing validator tests**
 
-Assert: every accepted command payload validates; unknown `commandType` rejects; non-decimal `eventId` rejects; `sentAt` with timezone offset rejects if not RFC3339; oversized payloads reject at 256 KiB.
+Assert: every accepted command payload validates; unknown `commandType` rejects; non-decimal `eventId` rejects; `sentAt` must pass `ajv-formats` `date-time` (RFC3339 with `Z` or explicit offset both accepted, anything else rejected); oversized payloads reject at 256 KiB.
 
 - [ ] **Step 3: Run tests to verify failure**
 
@@ -683,7 +847,7 @@ Expected: FAIL.
 
 - [ ] **Step 4: Implement TypeScript models and validator**
 
-`types.ts` exports discriminated unions mirroring the schemas. `validator.ts` compiles Ajv schemas once and exposes `validateCommand`, `validateEvent`, `validateResponse`. Numeric `eventId` is always parsed to `bigint` after string validation.
+`types.ts` exports discriminated unions mirroring the schemas. `validator.ts` compiles Ajv schemas once with `ajv-formats` and exposes `validateCommand`, `validateEvent`, `validateResponse`. Numeric `eventId` is always parsed to `bigint` after string validation. `protocolVersion` literal is the constant `"claude-remote.v1"`.
 
 - [ ] **Step 5: Run verification**
 
@@ -730,12 +894,16 @@ Expected: FAIL.
 interface CommandLedger {
   accept(envelope: CommandEnvelope, deviceId: string, payloadHash: string): Promise<CommandRecord>;
   acceptDuplicate(envelope: CommandEnvelope, deviceId: string, payloadHash: string): Promise<{ kind: "replay"; record: CommandRecord } | { kind: "conflict" } | { kind: "inserted"; record: CommandRecord }>;
-  transition(requestId: string, next: CommandStatus, options?: { eventId?: bigint }): Promise<CommandRecord>;
+  transitionWithStatusEvent(
+    requestId: string,
+    next: CommandStatus,
+    options: { buildEventPayload: (record: CommandRecord) => Omit<EventPayload, "eventId">; now: number }
+  ): Promise<{ record: CommandRecord; event: PersistedEvent }>;
   get(requestId: string): Promise<CommandRecord | undefined>;
 }
 ```
 
-JCS canonicalization is implemented in a single `canonicalJson()` helper with a unit test ensuring UTF-8 sorted keys, no trailing newline, and deterministic number formatting for the cases used by the spec.
+`transitionWithStatusEvent` must call `eventJournal.appendInside(db.transaction(() => { … }))` so the `commands` row update, `sessions.lastEventId` increment, and `pending_events` insert share one transaction. Add a `package.json` dependency `"canonicalize": "^2.0.0"` (RFC 8785 JCS) and use it for `payloadHash`. Write unit tests for `canonicalJson()` covering nested objects, integer vs float, key ordering under UTF-16 code unit rules, and surrogate pair keys.
 
 - [ ] **Step 4: Run verification**
 
@@ -763,11 +931,12 @@ Assert:
 2. `eventId` is encoded as a decimal string in the persisted payload.
 3. After all events are deleted, the next `append()` still produces a strictly increasing ID.
 4. `replayAfter(sessionId, eventId)` yields events in order, excluding nothing in the unacknowledged window.
-5. `acknowledge(sessionId, deviceId, eventId)` advances `device_delivery` only forward; backward ACK rejects.
-6. `markCheckpointSuperseded(sessionId, deviceId, watermark)` deletes nothing immediately and schedules deletion 600 seconds later.
-7. Hitting the configured byte budget for `pending_events` causes `append()` to throw a `STORAGE_PRESSURE` error without modifying the journal.
-8. Single tool-output payloads larger than the configured limit are stored with a truncation marker and original byte count.
-9. A bridge restart (close + reopen) replays every unacknowledged event.
+5. `acknowledge(sessionId, deviceId, eventId)` sets `pending_events.deleteAfter = now + 600` for every event up to and including `eventId`, and advances `device_delivery.deliveryWatermark` forward; backward ACK rejects.
+6. `markCheckpointSuperseded(sessionId, deviceId, watermark)` sets `deleteAfter = now + 600` (not immediate deletion) on `eventId <= watermark` events; deletion still requires the configured retention delay.
+7. `append()` with `category: "user_command"` throws `STORAGE_PRESSURE` when the configured byte budget for `pending_events` is exceeded, without modifying the journal; `append()` with `category: "system"` (e.g. `session.state.changed`, `command.status.changed`, `session.failed`, `session.interrupted`) bypasses the byte-budget check so terminal-state events always persist.
+8. `truncateLargeToolOutput(payload, limit)` replaces any `tool.output.delta` payload whose UTF-8 byte length exceeds 65,536 with `{ truncated: true, originalByteCount: number, truncatedAt: "65KiB" }` and returns the truncated payload; non-tool-output events pass through unchanged.
+9. A bridge restart (close + reopen) replays every unacknowledged event whose `deleteAfter` is `null` or greater than now; events whose `deleteAfter` has elapsed are removed during the start sweep.
+10. The next sweep (invoked on every `append`) deletes any `pending_events` whose `deleteAfter <= now`.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -776,7 +945,33 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement the journal**
 
-`event-journal.ts` exposes `append`, `replayAfter`, `acknowledge`, `markCheckpointSuperseded`, `truncateLargePayload`, and `pendingBytes`. Retention is implemented with a `pending_events.delete_after` epoch column plus a sweep on every `append` and on Bridge start. `STORAGE_PRESSURE` is checked before allocation, not after.
+`event-journal.ts` exposes:
+
+```ts
+type EventCategory = "user_command" | "system";
+
+interface AppendOptions {
+  category: EventCategory;
+  sessionId: string;
+  eventType: string;
+  payload: EventPayload;
+  now: number;
+}
+
+interface EventJournal {
+  append(opts: AppendOptions): Promise<PersistedEvent>;
+  appendInside<T>(tx: (db: Database) => T): T;  // exposes the active transaction for atomic cross-table writes
+  replayAfter(sessionId: string, eventId: bigint): AsyncIterable<PersistedEvent>;
+  acknowledge(sessionId: string, deviceId: string, eventId: bigint, now: number): Promise<void>;
+  markCheckpointSuperseded(sessionId: string, deviceId: string, watermark: bigint, now: number): Promise<void>;
+  truncateLargeToolOutput(payload: unknown, limit: number): { payload: unknown; truncated: boolean };
+  pendingBytes(): number;
+}
+```
+
+Constants (named in `config.ts`): `PENDING_EVENT_RETENTION_SECONDS = 600`, `TOOL_OUTPUT_BYTE_LIMIT = 65536`, `PENDING_EVENTS_BYTE_BUDGET` (configurable, default 64 MiB).
+
+`append` checks the byte budget only when `category === "user_command"` and only before any allocation. `acknowledge` sets `deleteAfter = now + PENDING_EVENT_RETENTION_SECONDS` on every event up to and including `eventId`, never deletes immediately. A sweep on `append` and on Bridge start removes any row with `deleteAfter IS NOT NULL AND deleteAfter <= now`. `appendInside` lets callers (the command ledger) drive a single transaction that wraps the `commands` update, the `sessions.lastEventId` increment, and the `pending_events` insert.
 
 - [ ] **Step 4: Run verification**
 
@@ -821,7 +1016,8 @@ Expected: FAIL.
 - holds the underlying socket;
 - tracks the device/session association set during auth (initially `null`);
 - exposes `send(event)` that writes a single JSON message and flushes;
-- exposes `close(code, reason)` that closes with one of the documented codes;
+- exposes `close(code, reason)` that closes with one of the documented codes (`4401`, `4403`, `4409`, `4410`, `4426`, `4500`);
+- during Chunk 2 stub auth, accepts any non-empty `Authorization` and `X-Claude-Remote-Device-Session` value;
 - enforces a write deadline based on Access assertion and device-session expiry once Chunk 3 wires those in.
 
 - [ ] **Step 4: Run verification**
@@ -846,7 +1042,7 @@ git commit -m "feat(bridge): add websocket subprotocol and close codes"
 
 - [ ] **Step 1: Write a smoke test**
 
-Boot `main.ts` against a temp data dir and assert: `/api/v1/health` returns ok; `/api/v1/capabilities` reports `protocolVersion: "claude-remote.v1"`; a WebSocket Upgrade with the required subprotocol and stubbed headers connects; closing the socket does not crash the server; `SIGTERM` triggers clean shutdown within 2 seconds.
+Boot `main.ts` against a temp data dir and assert: `/api/v1/health` returns ok; `/api/v1/capabilities` reports `protocolVersion: "claude-remote.v1"` and includes `claudeCodeVersion` (null placeholder acceptable for now); a WebSocket Upgrade with `Sec-WebSocket-Protocol: claude-remote.v1`, `Authorization: Bearer stub`, and `X-Claude-Remote-Device-Session: stub` connects; missing either header closes with `4401`; closing the socket does not crash the server; `SIGTERM` triggers clean shutdown within 2 seconds.
 
 - [ ] **Step 2: Run the smoke test**
 
