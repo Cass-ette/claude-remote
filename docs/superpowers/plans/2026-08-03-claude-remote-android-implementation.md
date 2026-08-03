@@ -1060,3 +1060,546 @@ Expected: PASS.
 git add bridge package.json package-lock.json
 git commit -m "feat(bridge): wire main entrypoint and smoke verification"
 ```
+
+## Chunk 3: Bridge runtime
+
+Goal: turn the Bridge skeleton into a working server. After Chunk 3, the Bridge can authorize projects, own Claude Code subprocesses, route permission prompts through an MCP adapter, import/snapshot history, enforce two-phase resync, verify Cloudflare Access and device signatures, emit redacted audit records, and expose a local admin CLI. Each task lists the spec section it implements.
+
+Prerequisite: Phase 0 gates for the capabilities being added must be unlocked in `build/phase0/summary.json`.
+
+### Task 13: Project registry and identity revalidation
+
+**Files:**
+- Create: `bridge/src/projects/project-registry.ts`
+- Test: `bridge/test/projects/project-registry.test.ts`
+- Spec reference: §6.6, §10.5.
+
+- [ ] **Step 1: Write failing tests**
+
+Assert:
+
+1. `authorize(path, displayName)` resolves realpath, records `projectId`, canonical realpath, st_dev, st_ino, and displayName, and rejects symlinks at the authorized root.
+2. `revalidate(projectId)` re-resolves realpath and rejects when the canonical path changed, st_dev changed, st_ino changed, or the directory is missing.
+3. Revalidate accepts symlinks *inside* the project (no security boundary claim), but rejects a replaced root.
+4. `list()` returns only projects not revoked.
+5. Two projects with the same realpath reject.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- projects/project-registry.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the registry**
+
+Use `fs.realpath.native` for canonical resolution, `fs.statSync` for `dev`/`ino`, and `crypto.randomUUID()` for project IDs. The registry never returns raw paths to the client; only `projectId`.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- projects/project-registry.test.ts && npm run typecheck -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/projects bridge/test/projects package.json package-lock.json
+git commit -m "feat(bridge): add project registry with identity revalidation"
+```
+
+### Task 14: Session state machine
+
+**Files:**
+- Create: `bridge/src/sessions/session-state-machine.ts`
+- Test: `bridge/test/sessions/session-state-machine.test.ts`
+- Spec reference: §7.1, §7.5.
+
+- [ ] **Step 1: Write failing tests**
+
+Assert every legal transition from §7.1 (`inactive→starting`, `starting→idle|failed`, `idle→running`, `running→idle|waiting_permission|interrupting|failed`, `waiting_permission→running|interrupting`, `interrupting→interrupted|failed`, `interrupted→releasing|starting`, `idle→releasing`, `releasing→inactive`) and reject every other transition. Assert terminal `failed` and `inactive` are not auto-left.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- sessions/session-state-machine.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the state machine**
+
+`session-state-machine.ts` exports a pure `canTransition(from, to): boolean` plus `assertTransition(from, to)`. Keep it pure (no DB, no I/O) so it can be reused by tests, the supervisor, and the snapshot writer.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- sessions/session-state-machine.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/sessions bridge/test/sessions package.json package-lock.json
+git commit -m "feat(bridge): add session state machine"
+```
+
+### Task 15: Session supervisor with fake Claude process
+
+**Files:**
+- Create: `bridge/src/sessions/session-supervisor.ts`
+- Create: `bridge/src/sessions/session-locks.ts`
+- Test: `bridge/test/sessions/session-supervisor.test.ts`
+- Spec reference: §6.3, §7.2, §7.3, §7.5, §7.6.
+
+- [ ] **Step 1: Write failing tests against a fake process**
+
+Assert using a stub `ClaudeProcessFactory`:
+
+1. `createSession` generates a UUID, writes session+lock+lease in one transaction, starts the process in the project directory, and rejects if `system/init.session_id` does not match the generated UUID.
+2. `resumeSession` requires `idle` or `interrupted`, obtains the Bridge-wide write lock, reuses a healthy same-instance process, otherwise starts `--resume`, and validates init session_id.
+3. `stop` resolves pending permissions as denied, sends `SIGINT`, waits 5 s, `SIGTERM`, waits 5 s, `SIGKILL`; final state `interrupted`.
+4. `release` is only legal in `idle`/`interrupted`; it closes stdin, waits for transcript stabilization, releases the lock; final state `inactive`.
+5. `cancel` rejects for already-dispatched commands.
+6. Reconcile-on-restart: stale leases from another Bridge instance are expired; PID identity mismatch does not signal.
+7. Concurrent supervisor instances on the same session conflict via `session_locks`.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- sessions/session-supervisor.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the supervisor**
+
+`session-supervisor.ts` exposes:
+
+```ts
+interface SessionSupervisor {
+  createSession(input: { projectId: string; displayName?: string }): Promise<{ sessionId: string }>;
+  resumeSession(input: { sessionId: string }): Promise<void>;
+  stop(input: { sessionId: string }): Promise<void>;
+  release(input: { sessionId: string }): Promise<void>;
+  cancel(input: { requestId: string }): Promise<void>;
+  recoverOnStartup(): Promise<void>;
+}
+```
+
+Process launches are delegated to a `ClaudeProcessFactory` interface so tests can inject a fake; the real factory is wired in Task 16. Stop/release timing constants (5 s each) come from `config.ts`. Transcript stabilization = file size unchanged across three 200 ms observations or 5 s timeout.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- sessions/session-supervisor.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/sessions bridge/test/sessions package.json package-lock.json
+git commit -m "feat(bridge): add session supervisor with fake process"
+```
+
+### Task 16: Claude stream-json adapter and process lease
+
+**Files:**
+- Create: `bridge/src/claude/stream-json-adapter.ts`
+- Create: `bridge/src/claude/process-lease-wrapper.ts`
+- Create: `bridge/src/claude/process-factory.ts`
+- Test: `bridge/test/claude/stream-json-adapter.test.ts`
+- Test: `bridge/test/claude/process-lease-wrapper.test.ts`
+- Spec reference: §4, §6.3, §7.6.
+- Prerequisite: Phase 0 Claude gate must be `passed`.
+
+- [ ] **Step 1: Write failing parser tests**
+
+Use the candidate envelope from Phase 0 as the input fixture. Assert:
+
+1. `sendUser(uuid, sessionId, text)` writes exactly one NDJSON line whose JSON equals the candidate shape.
+2. `events()` yields parsed objects, buffering partial lines until newline.
+3. `system/init` extraction returns `session_id`.
+4. Unknown event types yield a typed `unknownClaudeEvent` object instead of throwing.
+5. `result` does not auto-close the process; only stdin close or supervisor command does.
+6. Resume mode never combines `--session-id` with `--resume`.
+7. Permission-prompt tool name is configurable from `--permission-prompt-tool` flag value.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- claude/stream-json-adapter.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the adapter**
+
+`stream-json-adapter.ts` builds the exact Phase 0 spawn args, manages stdin/stdout, exposes `sendUser`/`closeInput`/`events`/`awaitInit`. `process-factory.ts` is the real `ClaudeProcessFactory` implementation; it reads the configured `claude` binary path, MCP config path, and permission tool name. The MCP config is generated per-session with absolute paths and `--strict-mcp-config`.
+
+- [ ] **Step 4: Write process-lease-wrapper tests**
+
+Assert: when the named control pipe closes (Bridge crash simulation), the wrapper sends `SIGINT`, waits 5 s, `SIGTERM`, waits 5 s, `SIGKILL` to the entire process group. When the Claude process exits cleanly, the wrapper returns without signalling.
+
+- [ ] **Step 5: Implement the lease wrapper**
+
+`process-lease-wrapper.ts` watches a `0600` FIFO created by Bridge. Each child Claude process gets a unique 256-bit lease secret via env var, validated on every MCP adapter connection (Task 17).
+
+- [ ] **Step 6: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- claude/ && npm run typecheck -w @claude-remote/bridge`
+Expected: PASS.
+
+Run real-CLI smoke (optional, opt-in): `RUN_REAL_CLAUDE=1 npm test -w @claude-remote/bridge -- claude/stream-json-adapter.real.test.ts`
+Expected: PASS against a temporary project; otherwise return to Phase 0 findings.
+
+- [ ] **Step 7: Wire the factory into the supervisor**
+
+Replace the fake factory default with `process-factory.ts` and add one integration test that starts and stops a real local fake Claude binary (committed under `bridge/test/fixtures/fake-claude.mjs`) to verify end-to-end ownership without depending on the proprietary CLI.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add bridge/src/claude bridge/test/claude bridge/test/fixtures package.json package-lock.json
+git commit -m "feat(bridge): add claude stream-json adapter and lease wrapper"
+```
+
+### Task 17: Permission broker
+
+**Files:**
+- Create: `bridge/src/permissions/permission-broker.ts`
+- Create: `bridge/src/permissions/socket-protocol.ts`
+- Test: `bridge/test/permissions/permission-broker.test.ts`
+- Spec reference: §6.4, §9, §11.5.
+
+- [ ] **Step 1: Write failing tests**
+
+Assert:
+
+1. Adapter authenticates with the per-process 256-bit lease secret; mismatched secret closes the socket without response.
+2. Pending request stored in `pending_events` and visible to the active device within 200 ms.
+3. `permission.resolve` from the correct device+session returns allow/deny; same request twice rejects the second.
+4. Five-minute timeout auto-denies.
+5. `session.stop` resolves pending as denied.
+6. Device revocation resolves pending as denied.
+7. Allow returns the original `input` verbatim; deny returns user/timeout message with `interrupt: false`.
+8. Adapter crash or socket close denies the current pending request.
+9. MCP result schema mismatch (missing `behavior`, or unknown behavior) denies and terminates the subprocess.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- permissions/permission-broker.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the broker**
+
+`socket-protocol.ts` defines length-prefixed JSON frames over a `0600` Unix domain socket at a path under the Bridge data dir. `permission-broker.ts` exposes:
+
+```ts
+interface PermissionBroker {
+  registerAdapter(leaseSecret: string, sessionId: string): Promise<AdapterConnection>;
+  request(input: PermissionRequestInput): Promise<PermissionDecision>;
+  resolve(input: { permissionRequestId: string; decision: PermissionDecision }): Promise<void>;
+  denyAllForSession(sessionId: string, reason: string): Promise<void>;
+  denyAllForDevice(deviceId: string, reason: string): Promise<void>;
+}
+```
+
+The five-minute timeout is configurable in `config.ts`. The broker never returns `updatedPermissions`, so no permanent allow rules can be created.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- permissions/ && npm run typecheck -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/permissions bridge/test/permissions package.json package-lock.json
+git commit -m "feat(bridge): add permission broker and socket protocol"
+```
+
+### Task 18: Standalone Permission MCP adapter
+
+**Files:**
+- Create: `bridge/src/permission-adapter/main.ts`
+- Create: `bridge/src/permission-adapter/mcp-server.ts`
+- Create: `bridge/src/permission-adapter/package.json`
+- Test: `bridge/test/permission-adapter/mcp-server.test.ts`
+- Spec reference: §6.4.
+- Prerequisite: Phase 0 Claude gate must be `passed` (verifies the MCP protocol shape).
+
+- [ ] **Step 1: Add the standalone executable workspace**
+
+`bridge/src/permission-adapter/package.json` declares `bin.cjs` and is referenced from Bridge-generated MCP configs by absolute path. Build copies the bundled adapter into `bridge/dist/permission-adapter/`.
+
+- [ ] **Step 2: Write failing tests**
+
+Assert:
+
+1. As an MCP stdio server, registers one tool whose input schema matches §6.4.
+2. Returns a single text content block with the JSON decided by the broker.
+3. Includes `toolUseID` only when the original request had `tool_use_id`.
+4. Lease secret read from env; missing or wrong secret closes stdio without forwarding to the broker.
+5. Bridge socket unreachable: returns deny with `message: "bridge_unavailable"` and exits nonzero.
+
+- [ ] **Step 3: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- permission-adapter/`
+Expected: FAIL.
+
+- [ ] **Step 4: Implement the adapter**
+
+Use `@modelcontextprotocol/sdk`. The adapter reads `BRIDGE_PERMISSION_SOCKET`, `BRIDGE_LEASE_SECRET`, `BRIDGE_SESSION_ID` from env; never logs secrets; and forwards each `permission_prompt` call to the broker, returning the broker's JSON as one MCP text content block.
+
+- [ ] **Step 5: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- permission-adapter/ && npm run build -w @claude-remote/bridge`
+Expected: PASS and produces `bridge/dist/permission-adapter/main.cjs`.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add bridge/src/permission-adapter bridge/test/permission-adapter bridge/package.json package-lock.json
+git commit -m "feat(bridge): add standalone permission mcp adapter"
+```
+
+### Task 19: History adapter, importer, and snapshot service
+
+**Files:**
+- Create: `bridge/src/history/claude-2.1.133-adapter.ts`
+- Create: `bridge/src/history/session-importer.ts`
+- Create: `bridge/src/snapshots/snapshot-service.ts`
+- Test: `bridge/test/history/claude-2.1.133-adapter.test.ts`
+- Test: `bridge/test/history/session-importer.test.ts`
+- Test: `bridge/test/snapshots/snapshot-service.test.ts`
+- Spec reference: §6.6, §6.7, §8.5.
+- Prerequisite: Phase 0 transcript gate must be `passed`.
+
+- [ ] **Step 1: Write failing adapter tests**
+
+Promote the Phase 0 probe adapter to production shape. Assert: `readMetadata`, `readSnapshot(byteLimit)` ends at last complete newline, `findTurnEvidence(uuid)` returns the union `complete|interrupted|absent|incompatible`. Add tests for the production error paths (path not under authorized project, missing file, oversized byte limit).
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- history/claude-2.1.133-adapter.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement adapter and importer**
+
+The importer scans only the bound project's transcript directory, requires valid UUID filenames, deduplicates by session ID, and persists bindings atomically.
+
+- [ ] **Step 4: Write failing snapshot-service tests**
+
+Assert the full §6.7 protocol:
+
+1. `begin()` takes the resync mutex, captures `deliveryBase`, `deliveryWatermark`, current session state, all non-terminal commands, and pending permission; returns first page + cursor.
+2. While `prepared` exists for the device, `events.ack` past `deliveryBase` returns `409 CHECKPOINT_COMMIT_REQUIRED`.
+3. `page(cursor)` returns subsequent pages from materialized items; expired cursor returns `410 SNAPSHOT_EXPIRED` and does not change delivery.
+4. `commit(snapshotId, historyRevision, deliveryWatermark, idempotencyKey)` advances `device_delivery` only after atomically validating all three fields, sets snapshot `status = committed`, and marks superseded events' `deleteAfter`.
+5. Duplicate commit returns the same result; mismatched fields return conflict.
+6. `commit` after expiry returns `410 SNAPSHOT_EXPIRED`.
+7. Buffer events during `prepared` get `eventId > deliveryWatermark` after mutex release.
+
+- [ ] **Step 5: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- snapshots/snapshot-service.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 6: Implement the snapshot service**
+
+`snapshot-service.ts` exposes `begin/page/commit/expireStale`. Expiry is a sweep invoked on `begin`/`commit` and on Bridge start; expired snapshots do not advance delivery and do not delete events.
+
+- [ ] **Step 7: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- history/ snapshots/ && npm run typecheck -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add bridge/src/history bridge/src/snapshots bridge/test/history bridge/test/snapshots package.json package-lock.json
+git commit -m "feat(bridge): add history importer and two-phase snapshot service"
+```
+
+### Task 20: Cloudflare Access JWT verifier
+
+**Files:**
+- Create: `bridge/src/auth/access-jwt-verifier.ts`
+- Test: `bridge/test/auth/access-jwt-verifier.test.ts`
+- Spec reference: §10.2.
+- Prerequisite: Phase 0 Cloudflare gate must be `passed`.
+
+- [ ] **Step 1: Write failing tests**
+
+Use a signed test JWT (jose `SignJWT`). Assert: signature, issuer (`https://<team>.cloudflareaccess.com`), audience (`aud` from config), subject presence, and `exp` enforcement. Reject missing assertion, expired, wrong issuer, wrong audience, and missing subject.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- auth/access-jwt-verifier.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the verifier**
+
+`access-jwt-verifier.ts` reads `Cf-Access-Jwt-Assertion` header, decodes without trusting unverified claims, fetches Cloudflare Access JWKS for the configured team domain with caching and refresh on unknown `kid`, and returns `{ subject, audience, expiresAt }`. The verifier never logs the assertion body.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- auth/access-jwt-verifier.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/auth bridge/test/auth package.json package-lock.json
+git commit -m "feat(bridge): add cloudflare access jwt verifier"
+```
+
+### Task 21: Device auth, pairing, challenge, sessions, revocation
+
+**Files:**
+- Create: `bridge/src/auth/signing-bytes.ts`
+- Create: `bridge/src/auth/device-auth.ts`
+- Test: `bridge/test/auth/signing-bytes.test.ts`
+- Test: `bridge/test/auth/device-auth.test.ts`
+- Spec reference: §10.3, §10.4.
+- Prerequisite: Phase 0 Cloudflare gate must be `passed`.
+
+- [ ] **Step 1: Write failing signing-bytes tests**
+
+Assert the exact byte construction from §10.3 matches a fixture checked into `contracts/v1/auth-signing-fixture.json` (generated during Phase 0). Test host normalization (IDNA ToASCII, lowercase, no trailing dot, scheme/path/:443 excluded). Reject userinfo/query/fragment, non-https, non-empty path other than `/`, ports other than empty/443.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- auth/signing-bytes.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement signing-bytes**
+
+`signing-bytes.ts` exports `normalizeHost(input: string): string` and `buildSigningBytes(input: { hostAscii: string; deviceId: string; challengeId: string; accessSubject: string; challengeRaw: Buffer }): Buffer`. Pure functions, no I/O.
+
+- [ ] **Step 4: Write failing device-auth tests**
+
+Assert the full pairing + challenge + session lifecycle:
+
+1. Pairing token consumed atomically; replay rejects.
+2. SPKI DER parse rejects non-P-256, invalid curve point, mismatched deviceId.
+3. Challenge response includes `challengeId`, `challengeRaw`, `accessSubject` from the verified JWT.
+4. `accessSubject` echoed back must match challenge record and current assertion.
+5. ECDSA DER signature verification; `1 <= r,s < n`.
+6. Device session token 15 min, hashed storage.
+7. Refresh requires fresh challenge signature.
+8. Revocation deletes device sessions and challenges, denies pending permissions, closes active sockets.
+9. Only one paired device; new pairing requires prior revocation.
+
+- [ ] **Step 5: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- auth/device-auth.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 6: Implement device-auth**
+
+Use Node `crypto` for P-256/SPKI parsing and ECDSA verification, and the registry pattern from §6.5. Token generation uses `crypto.randomBytes(32)`. Token hashes are SHA-256.
+
+- [ ] **Step 7: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- auth/ && npm run typecheck -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add bridge/src/auth bridge/test/auth contracts package.json package-lock.json
+git commit -m "feat(bridge): add device pairing, challenge, and session auth"
+```
+
+### Task 22: Audit log
+
+**Files:**
+- Create: `bridge/src/audit/audit-log.ts`
+- Test: `bridge/test/audit/audit-log.test.ts`
+- Spec reference: §10.6, §11.
+
+- [ ] **Step 1: Write failing tests**
+
+Assert: file mode `0600`; rotation at 10 MiB; five rotated files retained; thirty-day cap; redaction of `Authorization`, `Cf-Access-Jwt-Assertion`, `X-Claude-Remote-Device-Session`, OAuth tokens, API keys, file paths inside prompts, and stderr tokens. Assert structured fields per §10.6 and that prompts/full tool params/tool outputs never enter the log.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- audit/audit-log.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the audit log**
+
+JSONL writer with synchronous `fs.appendFileSync`, atomic rotation via `fs.renameSync`, and a tested `redact(input: unknown): string` helper. Audit entries are written inside the same transactions that change command/session state when both are available, otherwise after the action with a `committed` flag.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- audit/audit-log.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/audit bridge/test/audit package.json package-lock.json
+git commit -m "feat(bridge): add redacted rotating audit log"
+```
+
+### Task 23: Admin CLI
+
+**Files:**
+- Create: `bridge/src/admin/cli.ts`
+- Test: `bridge/test/admin/cli.test.ts`
+- Spec reference: §10.4, §10.5.
+
+- [ ] **Step 1: Write failing CLI tests**
+
+Assert subcommands:
+
+- `bridge admin authorize-project <path> <displayName>` — adds an authorized project.
+- `bridge admin list-projects` — lists project IDs and paths.
+- `bridge admin revoke-project <projectId>`.
+- `bridge admin list-devices` / `revoke-device <deviceId>` / `revoke-all-devices`.
+- `bridge admin pairing-qrcode` — generates a fresh five-minute token and prints the QR.
+- `bridge admin preflight` — checks loopback bind, data dir, Tunnel-only exposure, and verifies Cloudflare Access JWKS reachability.
+
+All commands require `BRIDGE_DATA_DIR` env and refuse to bind any non-loopback interface.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- admin/cli.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the CLI**
+
+Use `commander` (add to dependencies). The CLI shares `loadConfig` with the server and never opens a Cloudflare Tunnel itself.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- admin/ && npm run typecheck -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/admin bridge/test/admin bridge/package.json package-lock.json
+git commit -m "feat(bridge): add local admin cli"
+```
+
+### Task 24: Wire Bridge runtime into main and end-to-end Chunk 3 verification
+
+**Files:**
+- Modify: `bridge/src/main.ts`
+- Modify: `bridge/src/server/http-server.ts`
+- Modify: `bridge/src/server/websocket-server.ts`
+- Test: `bridge/test/runtime.integration.test.ts`
+
+- [ ] **Step 1: Write failing runtime integration tests**
+
+A single fake-Claude end-to-end test asserts: project authorization; session create/resume/stop/release; permission prompt round trip with allow and deny; command `dispatching → dispatched → completed` with `command.status.changed` events persisted; snapshot begin/page/commit with Room-equivalent state machine; revocation closes sockets; audit log redaction.
+
+- [ ] **Step 2: Wire everything in `main.ts`**
+
+Compose: config → database → audit log → event journal → command ledger → project registry → session supervisor (real factory) → permission broker → snapshot service → access verifier → device auth → HTTP routes → WebSocket handlers → SIGTERM/SIGINT graceful shutdown.
+
+- [ ] **Step 3: Replace WebSocket stub auth**
+
+WebSocket and HTTP request handlers now require valid Access assertion and device session; the stub accept-any path is removed.
+
+- [ ] **Step 4: Run full Bridge verification**
+
+Run: `npm test -w @claude-remote/bridge && npm run typecheck -w @claude-remote/bridge && npm run build -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge package.json package-lock.json
+git commit -m "feat(bridge): wire runtime and integrate verification"
+```
