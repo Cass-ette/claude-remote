@@ -1,0 +1,866 @@
+# Claude Remote Android Implementation Plan
+
+> **For agentic workers:** REQUIRED: Use superpowers:subagent-driven-development (if subagents available) or superpowers:executing-plans to implement this plan. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Build a self-hosted Android client that securely controls Bridge-owned Claude Code sessions running on the user's Mac through Cloudflare Access and Tunnel.
+
+**Architecture:** A loopback-only TypeScript/Node Bridge owns Claude Code stream-json subprocesses, persists command/event state in SQLite, and exposes a versioned HTTP/WebSocket protocol. A Kotlin/Compose Android client authenticates through Cloudflare Managed OAuth plus a Keystore device key, stores its rendered projection in Room, and recovers through durable event replay and two-phase snapshots. Three independent Phase 0 probes unlock only the production capabilities whose external contracts they verify.
+
+**Tech Stack:** Node.js 22, TypeScript, Fastify, WebSocket, SQLite/better-sqlite3, Vitest, MCP TypeScript SDK; Kotlin 2.0, Jetpack Compose, Room, OkHttp, AppAuth-Android, Android Keystore; Cloudflare Access and Tunnel; macOS launchd.
+
+---
+
+## Scope and execution rules
+
+- Execute tasks in order when they depend on each other. A failed Phase 0 gate blocks only the capabilities in the dependency matrix below.
+- Treat `docs/superpowers/specs/2026-08-02-claude-remote-android-design.md` as the authoritative behavior contract.
+- Keep the Bridge bound to `127.0.0.1`; never add a generic shell, arbitrary file-read, or arbitrary process endpoint.
+- Use TDD for deterministic code. Real-service evidence supplements tests; it does not replace unit tests.
+- Use one focused commit after each task. Never amend a previous task's commit.
+- Do not add uploads, notifications, tablet layouts, model selection, permanent permission rules, multi-device support, DPoP, or filesystem sandboxing.
+
+## Phase 0 dependency matrix
+
+| Gate | Passing unlocks | Failure does not block |
+|---|---|---|
+| Claude Code | stream-json adapter, Session Supervisor, Permission Broker/MCP adapter, UUID retry | database, pure protocol validation, Access/device auth, Android UI shells |
+| Transcript | import, history snapshots, command crash reconciliation | new-session control, auth, live event transport |
+| Cloudflare | production Access verification, Android OAuth, remote HTTP/WebSocket | loopback Bridge core, local fake transport tests, Android offline UI/data |
+
+Each gate emits the same machine-readable result:
+
+```ts
+type GateResult = {
+  name: "claude" | "transcript" | "cloudflare";
+  status: "passed" | "failed" | "not_run";
+  startedAt: string;
+  finishedAt: string;
+  checks: Array<{ name: string; passed: boolean; details?: string }>;
+  evidence: Record<string, string | number | boolean>;
+};
+```
+
+Thrown processes, timeouts, missing evidence, or malformed JSON are never treated as passes.
+
+## Planned file map
+
+### Repository and shared contracts
+
+- `package.json` — root npm workspaces and aggregate verification scripts.
+- `package-lock.json` — locked Node dependency graph.
+- `tsconfig.base.json` — shared strict NodeNext compiler options.
+- `tsconfig.json` — root gate-runner project.
+- `.gitignore` — Node, Android, probe output, secrets, databases, and local deployment state.
+- `contracts/v1/command.schema.json` — command envelope and command-specific payload schemas.
+- `contracts/v1/response.schema.json` — command response schemas.
+- `contracts/v1/event.schema.json` — durable server event schemas.
+- `contracts/v1/auth-signing-fixture.json` — fixed cross-language P-256 fixture.
+
+### Phase 0 probes
+
+- `probes/gate-result.schema.json` — shared Ajv-validated evidence schema.
+- `probes/run-phase0.ts` — result validator and capability-unlock aggregator.
+- `probes/run-phase0.test.ts` — malformed/missing/failed evidence tests.
+- `probes/claude-code/package.json`, `tsconfig.json` — Claude probe workspace.
+- `probes/claude-code/src/stream-json-client.ts` — candidate-envelope NDJSON driver.
+- `probes/claude-code/src/permission-probe-server.ts` — randomized harmless target and permission MCP tools.
+- `probes/claude-code/src/transcript-inspector.ts` — transcript discovery, stabilization, and UUID counting.
+- `probes/claude-code/test/stream-json-client.test.ts` — fake-process framing tests.
+- `probes/claude-code/test/compatibility.test.ts` — opt-in real CLI assertions.
+- `probes/claude-code/run-real-gate.ts` — process-level timeout/error wrapper and evidence writer.
+- `probes/transcript/package.json`, `tsconfig.json` — transcript probe workspace.
+- `probes/transcript/src/types.ts`, `adapter.ts` — candidate history adapter.
+- `probes/transcript/test/fixtures/` — secret-scanned redacted fixtures for every evidence state.
+- `probes/transcript/test/adapter.test.ts` — offsets, partial tails, and turn classification.
+- `probes/transcript/run-real-gate.ts` — manifest validation, process timeout, and evidence writer.
+- `probes/cloudflare/origin/package.json`, `tsconfig.json` — temporary Access origin workspace.
+- `probes/cloudflare/origin/src/access-verifier.ts` — issuer/audience/subject/expiry verification.
+- `probes/cloudflare/origin/src/server.ts` — HTTP/WebSocket evidence capture and public App Link statement.
+- `probes/cloudflare/origin/test/server.test.ts` — local origin/auth tests.
+- `probes/cloudflare/android-probe/gradlew`, `gradlew.bat`, `gradle/wrapper/` — checked-in Gradle wrapper.
+- `probes/cloudflare/android-probe/app/src/main/` — minimal AppAuth/OkHttp probe app.
+- `probes/cloudflare/android-probe/app/src/test/` — JVM PKCE/state/config tests.
+- `probes/cloudflare/android-probe/app/src/androidTest/` — real-device HTTP/WebSocket/refresh evidence test.
+- `probes/cloudflare/run-real-gate.ts` — adb/origin evidence collector.
+
+### Mac Bridge
+
+- `bridge/package.json`, `bridge/tsconfig.json`, `bridge/vitest.config.ts` — Bridge build/test configuration.
+- `bridge/src/main.ts`, `config.ts` — composition root and validated local configuration.
+- `bridge/src/server/http-server.ts`, `websocket-server.ts` — loopback HTTP/WebSocket boundary.
+- `bridge/src/protocol/v1/types.ts`, `validator.ts` — protocol models and validation.
+- `bridge/src/db/database.ts`, `db/migrations/001_initial.sql` — SQLite and initial schema.
+- `bridge/src/commands/command-ledger.ts` — idempotent commands and transitions.
+- `bridge/src/events/event-journal.ts` — durable event allocation, replay, ACK, and retention.
+- `bridge/src/projects/project-registry.ts` — local project authorization and identity checks.
+- `bridge/src/sessions/session-state-machine.ts`, `session-supervisor.ts` — session lifecycle and process ownership.
+- `bridge/src/claude/stream-json-adapter.ts`, `process-lease-wrapper.ts` — Claude transport and process lease.
+- `bridge/src/permissions/permission-broker.ts`, `socket-protocol.ts` — permission state and Unix socket.
+- `bridge/src/permission-adapter/main.ts` — standalone stdio MCP adapter.
+- `bridge/src/history/claude-2.1.133-adapter.ts`, `session-importer.ts` — history/import.
+- `bridge/src/snapshots/snapshot-service.ts` — prepared/page/commit checkpoint protocol.
+- `bridge/src/auth/access-jwt-verifier.ts`, `signing-bytes.ts`, `device-auth.ts` — two-layer auth.
+- `bridge/src/audit/audit-log.ts`, `admin/cli.ts` — redacted audit and local administration.
+- `bridge/test/` — mirrored unit/integration tests.
+
+### Android app
+
+- `android/gradlew`, `android/gradlew.bat`, `android/gradle/wrapper/` — checked-in Gradle wrapper.
+- `android/settings.gradle.kts`, `build.gradle.kts`, `gradle/libs.versions.toml` — build configuration.
+- `android/app/build.gradle.kts`, `src/main/AndroidManifest.xml` — API 28 Compose app.
+- `android/app/src/main/java/dev/clauderemote/android/protocol/v1/ProtocolModels.kt` — protocol DTOs.
+- `android/app/src/main/java/dev/clauderemote/android/data/local/` — Room database, entities, and DAOs.
+- `android/app/src/main/java/dev/clauderemote/android/security/DeviceKeyManager.kt` — P-256 Keystore.
+- `android/app/src/main/java/dev/clauderemote/android/auth/` — OAuth and device session lifecycle.
+- `android/app/src/main/java/dev/clauderemote/android/network/` — HTTP/WebSocket and reconnect.
+- `android/app/src/main/java/dev/clauderemote/android/data/SessionRepository.kt` — application API.
+- `android/app/src/main/java/dev/clauderemote/android/sync/` — event reducer and snapshot coordinator.
+- `android/app/src/main/java/dev/clauderemote/android/ui/` — connection, sessions, conversation, permission, import.
+- `android/app/src/test/`, `android/app/src/androidTest/` — JVM/device tests.
+
+### Deployment and end-to-end
+
+- `deploy/launchd/dev.clauderemote.bridge.plist.template` — launchd template without secrets.
+- `deploy/cloudflared/config.yml.template` — Tunnel ingress template.
+- `deploy/scripts/install-launchd.ts`, `preflight.ts` — local install and self-check.
+- `e2e/src/real-environment.test.ts` — opt-in real-device environment checks.
+- `.github/workflows/ci.yml` — deterministic Node/Android checks without secrets.
+
+## Chunk 1: Phase 0 compatibility gates
+
+### Task 1: Bootstrap workspaces and the result contract
+
+**Files:**
+- Create: `package.json`
+- Create: `tsconfig.base.json`
+- Create: `tsconfig.json`
+- Create: `.gitignore`
+- Create: `probes/gate-result.schema.json`
+- Create: `probes/run-phase0.ts`
+- Test: `probes/run-phase0.test.ts`
+
+- [ ] **Step 1: Write the failing result-aggregation tests**
+
+```ts
+import { expect, it } from "vitest";
+import { summarizeGates } from "./run-phase0.js";
+
+it("unlocks only capabilities backed by passed gates", () => {
+  const summary = summarizeGates([
+    { name: "claude", status: "passed", checks: [], evidence: {}, startedAt: "x", finishedAt: "y" },
+    { name: "transcript", status: "failed", checks: [], evidence: {}, startedAt: "x", finishedAt: "y" },
+    { name: "cloudflare", status: "not_run", checks: [], evidence: {}, startedAt: "x", finishedAt: "y" }
+  ]);
+  expect(summary.unlocked).toContain("session-supervisor");
+  expect(summary.blocked).toContain("history-snapshot");
+  expect(summary.blocked).toContain("remote-transport");
+});
+```
+
+Also test malformed JSON, missing gate results, and a check with `passed: false` under a nominal `status: "passed"`. Each individual gate script—not this evidence aggregator—is responsible for converting its subprocess timeout, nonzero exit, or missing runtime prerequisite into validated `failed` or `not_run` evidence.
+
+- [ ] **Step 2: Create exact root configuration**
+
+`package.json`:
+
+```json
+{
+  "name": "claude-remote",
+  "private": true,
+  "type": "module",
+  "workspaces": [],
+  "scripts": {
+    "test:root": "vitest run probes/run-phase0.test.ts",
+    "test:workspaces": "npm run test --workspaces --if-present",
+    "test": "npm run test:root && npm run test:workspaces",
+    "typecheck:root": "tsc -p tsconfig.json --noEmit",
+    "typecheck:workspaces": "npm run typecheck --workspaces --if-present",
+    "typecheck": "npm run typecheck:root && npm run typecheck:workspaces",
+    "phase0": "tsx probes/run-phase0.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ajv": "^8.17.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
+```
+
+`tsconfig.base.json`:
+
+```json
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true
+  }
+}
+```
+
+`tsconfig.json` extends the base config and includes only `probes/run-phase0.ts` and `probes/run-phase0.test.ts`. Each workspace receives its own config in its task.
+
+- [ ] **Step 3: Install and verify the expected failure**
+
+Run: `npm install && npm run test:root`
+Expected: FAIL because `summarizeGates` is missing.
+
+- [ ] **Step 4: Implement schema validation and capability mapping**
+
+Use Ajv to validate one `GateResult` per gate. `summarizeGates` must derive the dependency matrix, not a global boolean. The CLI accepts explicit evidence paths:
+
+```text
+--claude build/phase0/claude.json
+--transcript build/phase0/transcript.json
+--cloudflare build/phase0/cloudflare.json
+```
+
+Missing paths produce `not_run`; malformed evidence files produce `failed`. The aggregator never launches gate processes. Write only `build/phase0/summary.json`, which is ignored by Git.
+
+- [ ] **Step 5: Run focused verification**
+
+Run: `npm run test:root && npm run typecheck:root`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add package.json package-lock.json tsconfig.base.json tsconfig.json .gitignore probes/gate-result.schema.json probes/run-phase0.ts probes/run-phase0.test.ts
+git commit -m "build: bootstrap compatibility gate runner"
+```
+
+### Task 2: Probe Claude Code without assuming the raw contract
+
+**Files:**
+- Create: `probes/claude-code/package.json`
+- Create: `probes/claude-code/tsconfig.json`
+- Create: `probes/claude-code/src/stream-json-client.ts`
+- Create: `probes/claude-code/src/permission-probe-server.ts`
+- Create: `probes/claude-code/src/transcript-inspector.ts`
+- Test: `probes/claude-code/test/stream-json-client.test.ts`
+- Test: `probes/claude-code/test/compatibility.test.ts`
+- Create: `probes/claude-code/run-real-gate.ts`
+
+- [ ] **Step 1: Create the workspace configuration**
+
+Use package name `@claude-remote/probe-claude-code` with scripts `test: vitest run` and `typecheck: tsc -p tsconfig.json --noEmit`. Add `@modelcontextprotocol/sdk` and `zod`; extend `../../tsconfig.base.json` and include `src/**/*.ts` plus `test/**/*.ts`. Add `probes/claude-code` to the root `workspaces` array, then run `npm install` before any workspace test so the lockfile and workspace links are current.
+
+- [ ] **Step 2: Write fake-process tests for framing and lifecycle**
+
+The candidate 2.1.133 envelope under test is:
+
+```ts
+const candidate = {
+  type: "user",
+  uuid: requestId,
+  session_id: sessionId,
+  message: { role: "user", content: [{ type: "text", text: prompt }] },
+  parent_tool_use_id: null
+};
+```
+
+Tests verify one JSON object per newline, partial stdout buffering, `system/init`, replayed UUID, multiple turns while stdin remains open, and clean termination after stdin closes. These tests verify the driver only; the real gate decides whether the candidate envelope is supported.
+
+- [ ] **Step 3: Run the driver test and confirm failure**
+
+Run: `npm test -w @claude-remote/probe-claude-code -- stream-json-client.test.ts`
+Expected: FAIL because `ClaudeStreamClient` is missing.
+
+- [ ] **Step 4: Implement the candidate driver and exact spawn modes**
+
+Create:
+
+```ts
+interface ClaudeStreamClient {
+  startCreate(sessionId: string, cwd: string, mcpConfig: string, permissionTool: string): Promise<void>;
+  startResume(sessionId: string, cwd: string, mcpConfig: string, permissionTool: string): Promise<void>;
+  sendCandidateUser(uuid: string, sessionId: string, text: string): Promise<void>;
+  events(): AsyncIterable<unknown>;
+  closeInput(): Promise<void>;
+}
+```
+
+Create args: `-p --session-id <id> --input-format stream-json --output-format stream-json --verbose --include-partial-messages --replay-user-messages --permission-mode default --strict-mcp-config --mcp-config <absolute> --permission-prompt-tool <name>`.
+
+Resume args replace `--session-id <id>` with `--resume <id>`; never combine them. Keep stdin open after each `result` until the caller closes it.
+
+- [ ] **Step 5: Implement a reliable harmless permission probe**
+
+Run two independent stdio MCP processes in the generated config: a target server with a random tool name such as `echo_probe_<128-bit-hex>`, and a permission server containing only the permission-prompt tool. Instruct Claude to call the exact side-effect-free target with a nonce. Record ordered events from both processes. The gate passes only when:
+
+- permission tool is observed before target execution;
+- allow executes target exactly once;
+- deny and five-second permission timeout execute target zero times and produce a closed failure;
+- terminating only the permission server while leaving the target server healthy still prevents target execution and fails closed;
+- if a local wildcard rule bypasses the randomized target prompt, return `not_run` with `permission_prompt_bypassed` rather than claiming compatibility.
+
+- [ ] **Step 6: Implement transcript discovery and stabilization**
+
+After `system/init`, recursively search `${CLAUDE_CONFIG_DIR:-$HOME/.claude}/projects` for exactly one `<sessionId>.jsonl`. Wait until the file ends in `\n` and its size is unchanged for three 200 ms observations. Count complete JSONL user records whose UUID equals the request UUID before and after resume/retry.
+
+Real prerequisites are explicit: installed/authenticated `claude` 2.1.133, network/API access, writable temporary project, readable transcript directory, and user acceptance of the small model cost. Never print auth environment variables or transcript content.
+
+- [ ] **Step 7: Write and run the opt-in real gate wrapper**
+
+The compatibility test asserts observed—not assumed—support for candidate input, matching init ID, exact replay UUID, two live turns, clean stdin close, resume, duplicate-UUID count remaining one, permission allow/deny/timeout/adapter-exit behavior, and a terminal result. It writes check details to a temporary JSON file, not the final evidence path.
+
+`run-real-gate.ts` validates prerequisites, spawns the focused Vitest process with a ten-minute deadline, kills the exact child process group on timeout, and converts success, assertion failure, nonzero exit, signal, malformed check output, or missing prerequisites into a validated `GateResult` at `build/phase0/claude.json`.
+
+Run: `npm test -w @claude-remote/probe-claude-code && npm run typecheck -w @claude-remote/probe-claude-code`
+Expected: deterministic tests PASS.
+
+Run: `RUN_REAL_CLAUDE=1 npx tsx probes/claude-code/run-real-gate.ts`
+Expected: real gate PASS; otherwise dependent production capabilities remain blocked.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add probes/claude-code package.json package-lock.json
+git commit -m "test: gate Claude Code bridge compatibility"
+```
+
+### Task 3: Probe every transcript classification read-only
+
+**Files:**
+- Create: `probes/transcript/package.json`
+- Create: `probes/transcript/tsconfig.json`
+- Create: `probes/transcript/src/types.ts`
+- Create: `probes/transcript/src/adapter.ts`
+- Create: `probes/transcript/test/fixtures/complete.jsonl`
+- Create: `probes/transcript/test/fixtures/failed.jsonl`
+- Create: `probes/transcript/test/fixtures/interrupted.jsonl`
+- Create: `probes/transcript/test/fixtures/partial-tail.jsonl`
+- Create: `probes/transcript/test/fixtures/incompatible.jsonl`
+- Test: `probes/transcript/test/adapter.test.ts`
+- Test: `probes/transcript/test/fixture-secret-scan.test.ts`
+- Create: `probes/transcript/run-real-gate.ts`
+
+- [ ] **Step 1: Create the workspace and safe fixtures**
+
+Use package name `@claude-remote/probe-transcript`, scripts `test` and `typecheck`, and a config extending `../../tsconfig.base.json`. Add `probes/transcript` to the root `workspaces` array and run `npm install` before its first test.
+
+Create fixtures from copies, never originals. Replace sensitive strings, recompute expected UTF-8 byte offsets from the redacted bytes, and do not claim original byte-layout preservation. Add a secret scan for API-key/token patterns, home-directory paths, emails, and the original fixture strings.
+
+- [ ] **Step 2: Write failing tests for the full evidence union**
+
+```ts
+type TurnEvidence =
+  | { kind: "complete"; outcome: "completed" | "failed" }
+  | { kind: "interrupted" }
+  | { kind: "absent" }
+  | { kind: "incompatible"; reason: string };
+```
+
+Assert user/assistant/tool normalization, known offsets computed with `Buffer.byteLength`, completed, failed, interrupted, absent, ignored partial tail, malformed complete-line incompatibility, and immutable byte-limit reads.
+
+- [ ] **Step 3: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/probe-transcript`
+Expected: FAIL because the adapter is missing.
+
+- [ ] **Step 4: Implement the minimal versioned adapter**
+
+Expose only `readMetadata`, `readSnapshot(path, byteLimit)`, and `findTurnEvidence(path, userUuid)`. Read through the last newline at or before `byteLimit`; never write or repair transcripts.
+
+- [ ] **Step 5: Add the opt-in read-only real-copy gate wrapper**
+
+Require `REAL_TRANSCRIPT_MANIFEST=/absolute/path/to/manifest.json`. The manifest is an array of copied transcript paths plus expected aggregate coverage labels; no single ordinary session must contain every outcome. The focused test hashes every copy before and after and emits temporary check output only if the set collectively covers user, assistant, tool, completed, failed, and interrupted records, normalization succeeds, and every hash is unchanged.
+
+`run-real-gate.ts` validates the manifest and every path, spawns the focused test with a two-minute deadline, terminates it on timeout, and converts success, nonzero exit, signal, malformed output, timeout, or missing prerequisite into `build/phase0/transcript.json`.
+
+Run: `npm test -w @claude-remote/probe-transcript && npm run typecheck -w @claude-remote/probe-transcript`
+Expected: PASS.
+
+Run: `REAL_TRANSCRIPT_MANIFEST=/absolute/manifest.json npx tsx probes/transcript/run-real-gate.ts`
+Expected: PASS with aggregate coverage and unchanged SHA-256 for every input; failure blocks import/history/snapshot/reconciliation only.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add probes/transcript package.json package-lock.json
+git commit -m "test: gate Claude transcript compatibility"
+```
+
+### Task 4: Build a machine-verifiable Cloudflare mobile gate
+
+**Files:**
+- Create: `probes/cloudflare/origin/package.json`
+- Create: `probes/cloudflare/origin/tsconfig.json`
+- Create: `probes/cloudflare/origin/src/access-verifier.ts`
+- Create: `probes/cloudflare/origin/src/server.ts`
+- Test: `probes/cloudflare/origin/test/server.test.ts`
+- Create: `probes/cloudflare/android-probe/` Gradle wrapper/build/app files
+- Test: `probes/cloudflare/android-probe/app/src/test/java/dev/clauderemote/probe/OAuthConfigTest.kt`
+- Test: `probes/cloudflare/android-probe/app/src/androidTest/java/dev/clauderemote/probe/AccessFlowInstrumentedTest.kt`
+- Create: `probes/cloudflare/run-real-gate.ts`
+
+- [ ] **Step 1: Create exact origin workspace configuration**
+
+Use package name `@claude-remote/probe-cloudflare-origin`, scripts `test`, `typecheck`, and `start`; dependencies `fastify`, `@fastify/websocket`, `jose`, and `zod`; extend `../../../tsconfig.base.json`. Add `probes/cloudflare/origin` to the root `workspaces` array and run `npm install` before its first test.
+
+- [ ] **Step 2: Write failing origin and Access-verification tests**
+
+Test loopback binding, redaction, JWKS signature verification, exact issuer/audience/subject/expiry rejection, HTTP assertion capture, WebSocket Upgrade assertion capture, and evidence-file atomic writes. The origin evidence records verified claims metadata but never the assertion/token value.
+
+- [ ] **Step 3: Implement and verify the origin**
+
+The origin serves `/probe/http`, `/probe/ws`, `/probe/evidence`, and `/.well-known/assetlinks.json`. The App Link statement is the only path configured with an Access bypass policy; all probe API paths remain protected.
+
+Run: `npm test -w @claude-remote/probe-cloudflare-origin && npm run typecheck -w @claude-remote/probe-cloudflare-origin`
+Expected: PASS.
+
+- [ ] **Step 4: Bootstrap the Android probe and wrapper**
+
+Prerequisite: Android Studio or an installed `gradle` command once. First create minimal `settings.gradle.kts` with `pluginManagement`/`dependencyResolutionManagement` and a root `build.gradle.kts` declaring the Android/Kotlin plugins without applying them. Then run:
+
+```bash
+gradle -p probes/cloudflare/android-probe wrapper --gradle-version 8.9
+```
+
+Commit `gradlew`, `gradlew.bat`, and `gradle/wrapper/*`. Add the app module and configure application ID `dev.clauderemote.probe`, minSdk 28, Java 17, AppAuth-Android, OkHttp, AndroidX Browser, and a verified HTTPS App Link.
+
+- [ ] **Step 5: Write JVM and instrumented tests before implementation**
+
+JVM tests cover discovery URI, redirect URI, PKCE S256, `state`, required environment values, and prohibition of service-token/cookie fallback. The instrumented test performs OAuth, bearer HTTP, bearer WebSocket, captures assertion-validated server evidence, waits through the configured real expiry, proves the expired old token is rejected for both HTTP and WebSocket, refreshes, reconnects, and uses `java.net.Socket.connect(InetSocketAddress(MAC_LAN_IP, originPort), 3000)` to require connection refusal/timeout to the Mac LAN address. It then writes a `ready-for-tunnel-stop` barrier file while keeping the refreshed bearer and instrumentation process alive. After the runner stops Tunnel and sends `dev.clauderemote.probe.ACTION_TUNNEL_STOPPED`, Android retries HTTP and WebSocket with that refreshed bearer, records the edge response/no-upgrade result, and only then writes final `cloudflare-gate.json`.
+
+Run: `./probes/cloudflare/android-probe/gradlew -p probes/cloudflare/android-probe testDebugUnitTest`
+Expected: FAIL until the probe flow is implemented.
+
+- [ ] **Step 6: Implement the minimal AppAuth/OkHttp flow**
+
+Require runtime inputs for base URL, OAuth resource, redirect URI, and expected Access subject. Use only Authorization Code + PKCE and `Authorization: Bearer` on HTTP and WebSocket Upgrade. Never inspect or copy `CF_Authorization` cookies.
+
+- [ ] **Step 7: Define real environment inputs and evidence collection**
+
+Required environment:
+
+```text
+CF_PROBE_BASE_URL
+CF_ACCESS_TEAM_DOMAIN
+CF_ACCESS_AUD
+CF_EXPECTED_SUBJECT
+CLOUDFLARED_CONFIG
+MAC_LAN_IP
+ANDROID_SERIAL
+APP_LINK_SHA256_FINGERPRINT
+CF_LOGIN_TIMEOUT_MS
+CF_TOKEN_EXPIRY_TIMEOUT_MS
+CF_INSTRUMENTATION_TIMEOUT_MS
+CF_OVERALL_TIMEOUT_MS
+```
+
+Provision one temporary Access application, an exact-path bypass for `/.well-known/assetlinks.json`, a Tunnel to the loopback origin, dynamic public-client registration, and the matching App Link fingerprint. Configure the shortest practical Access session duration and record actual issue/expiry/refresh timestamps rather than simulating expiry. Require `CF_TOKEN_EXPIRY_TIMEOUT_MS` to exceed that real lifetime by at least 120 seconds, and `CF_OVERALL_TIMEOUT_MS` to exceed login timeout + expiry timeout + instrumentation cleanup margin.
+
+Before launching OAuth, `run-real-gate.ts` executes:
+
+```bash
+adb -s "$ANDROID_SERIAL" shell pm verify-app-links --re-verify dev.clauderemote.probe
+adb -s "$ANDROID_SERIAL" shell pm get-app-links dev.clauderemote.probe
+```
+
+It parses the second command and requires the exact probe hostname to be in verified state; browser fallback or merely declaring an intent filter does not pass.
+
+The runner starts the loopback origin and a recorded `cloudflared tunnel --config "$CLOUDFLARED_CONFIG" run` child process, then launches `connectedDebugAndroidTest` without waiting synchronously for completion. It enforces separate login, token-expiry, instrumentation, and overall deadlines. It monitors the Android barrier file; once `ready-for-tunnel-stop` appears, it records the last origin request ID, stops the exact cloudflared process group, and sends the barrier-release broadcast. Android then retries HTTP and WebSocket with its refreshed still-valid bearer. Success requires no HTTP `2xx`, no WebSocket `101`, an expected Cloudflare Tunnel-unavailable edge response when the hostname still answers, and no origin request ID after the recorded boundary.
+
+After instrumentation exits, the runner pulls final Android evidence, reads origin evidence, and verifies issuer/audience/subject, HTTP/WebSocket request IDs, genuinely expired old-token rejection, refresh/reconnect, raw TCP LAN refusal/timeout, and post-Tunnel barrier results. Any deadline, missing login/barrier/evidence, or child failure becomes validated `not_run`/`failed`. On timeout or error it terminates the exact Gradle, origin, and cloudflared process groups, stops outstanding adb commands, runs `adb shell am force-stop dev.clauderemote.probe`, and never leaves a probe process running.
+
+- [ ] **Step 8: Run the real gate**
+
+Run: `RUN_REAL_CLOUDFLARE=1 npx tsx probes/cloudflare/run-real-gate.ts`
+Expected: validated evidence for OAuth discovery/registration/PKCE, App Link callback, bearer HTTP, bearer WebSocket Upgrade, expired-old-token rejection, real refresh/reconnect, LAN unreachability, and remote failure after the runner stops Tunnel. Failure blocks production Access/OAuth/remote transport; never substitute an embedded service token.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add probes/cloudflare package.json package-lock.json
+git commit -m "test: gate Cloudflare mobile access flow"
+```
+
+### Task 5: Produce the Phase 0 capability summary
+
+**Files:**
+- Modify: `package.json`
+- Modify: `probes/run-phase0.ts`
+- Test: `probes/run-phase0.test.ts`
+
+- [ ] **Step 1: Add exact workspace gate scripts**
+
+Add root scripts `phase0:claude: tsx probes/claude-code/run-real-gate.ts`, `phase0:transcript: tsx probes/transcript/run-real-gate.ts`, and `phase0:cloudflare: tsx probes/cloudflare/run-real-gate.ts`. Each wrapper owns subprocess timeouts and emits its evidence file. `phase0` only validates explicit evidence files and reports unlocked/blocked capabilities.
+
+- [ ] **Step 2: Test failure mapping**
+
+Use evidence fixtures for missing output, malformed evidence, nominal pass containing a failed check, and each independent gate failure. Separately test each gate script's adapter that converts its own subprocess nonzero exit, timeout, or missing runtime prerequisite into validated `failed`/`not_run` evidence. The aggregator itself only validates evidence files; no case may default to pass.
+
+- [ ] **Step 3: Run deterministic verification**
+
+Run: `npm test && npm run typecheck`
+Expected: PASS for root and every configured workspace.
+
+- [ ] **Step 4: Run available real gates and inspect the matrix**
+
+Run: `npm run phase0 -- --claude build/phase0/claude.json --transcript build/phase0/transcript.json --cloudflare build/phase0/cloudflare.json`
+Expected: `build/phase0/summary.json` accurately lists unlocked and blocked capabilities. Proceed only with tasks whose dependencies are unlocked.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add package.json package-lock.json probes/run-phase0.ts probes/run-phase0.test.ts probes/gate-result.schema.json
+git commit -m "test: enforce Phase 0 capability gates"
+```
+
+## Chunk 2: Bridge foundation
+
+Goal: a runnable loopback Bridge skeleton with validated protocol models, durable command ledger, durable event journal, and the version-negotiated HTTP/WebSocket boundary. No Claude, auth, or permission logic yet — those land in Chunk 3.
+
+### Task 6: Bridge workspace, configuration, and loopback health
+
+**Files:**
+- Create: `bridge/package.json`
+- Create: `bridge/tsconfig.json`
+- Create: `bridge/vitest.config.ts`
+- Create: `bridge/src/main.ts`
+- Create: `bridge/src/config.ts`
+- Create: `bridge/src/server/http-server.ts`
+- Test: `bridge/test/config.test.ts`
+- Test: `bridge/test/http-server.test.ts`
+
+- [ ] **Step 1: Add the workspace and install dependencies**
+
+`bridge/package.json`:
+
+```json
+{
+  "name": "@claude-remote/bridge",
+  "private": true,
+  "type": "module",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/main.js",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "fastify": "^5.0.0",
+    "@fastify/websocket": "^11.0.0",
+    "ajv": "^8.17.1",
+    "ajv-formats": "^3.0.1",
+    "pino": "^9.5.0",
+    "zod": "^3.23.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
+```
+
+Extend `../../tsconfig.base.json`, include `src/**/*.ts` and `test/**/*.ts`, set `outDir: dist`. Add `bridge` to root `workspaces` and run `npm install`.
+
+- [ ] **Step 2: Write the failing config test**
+
+```ts
+import { describe, expect, it } from "vitest";
+import { loadConfig } from "../src/config.js";
+
+describe("loadConfig", () => {
+  it("requires loopback bind and rejects other interfaces", () => {
+    const cfg = loadConfig({ BRIDGE_HOST: "127.0.0.1", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: "/tmp/bridge-cfg-test" });
+    expect(cfg.host).toBe("127.0.0.1");
+    expect(cfg.port).toBe(43111);
+  });
+
+  it("rejects non-loopback hosts", () => {
+    expect(() => loadConfig({ BRIDGE_HOST: "0.0.0.0", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: "/tmp/x" }))
+      .toThrow(/loopback/);
+  });
+});
+```
+
+- [ ] **Step 3: Run the test to verify it fails**
+
+Run: `npm test -w @claude-remote/bridge -- config.test.ts`
+Expected: FAIL because `loadConfig` is missing.
+
+- [ ] **Step 4: Implement minimal validated config**
+
+`config.ts` exposes a frozen `BridgeConfig` with `host` (only `127.0.0.1` or `::1`), `port`, `dataDir`, `databasePath`, and `auditLogPath`. Reject any non-loopback host, any `port` below 1024 or above 65535, and any `dataDir` that is not an absolute path. Resolve `dataDir` with `fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 })` after validation.
+
+- [ ] **Step 5: Write the failing HTTP test**
+
+Assert `/api/v1/capabilities` returns `protocolVersion`, `bridgeVersion`, `minimumAndroidVersion`, `serverTime`, and `features: []`; `/api/v1/health` returns `{status:"ok"}`; requests to any path outside `/api/v1/` return 404; and the server binds to `127.0.0.1` only.
+
+- [ ] **Step 6: Implement the minimal Fastify server**
+
+`http-server.ts` exposes `startHttpServer(config, { capabilities })` returning the Fastify instance. Register routes for `/api/v1/health` and `/api/v1/capabilities`. Validate response bodies with the same Ajv validator used elsewhere.
+
+- [ ] **Step 7: Implement the entry point**
+
+`main.ts` loads config, starts the HTTP server, installs `SIGTERM`/`SIGINT` handlers that call `server.close()` and `process.exit(0)`, and never starts a Cloudflare Tunnel from inside the Bridge.
+
+- [ ] **Step 8: Run focused verification**
+
+Run: `npm test -w @claude-remote/bridge && npm run typecheck -w @claude-remote/bridge && npm run build -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add bridge package.json package-lock.json
+git commit -m "feat(bridge): add loopback http skeleton and config"
+```
+
+### Task 7: SQLite database, migrations, and transaction helper
+
+**Files:**
+- Create: `bridge/src/db/database.ts`
+- Create: `bridge/src/db/migrations/001_initial.sql`
+- Test: `bridge/test/db/database.test.ts`
+
+- [ ] **Step 1: Write failing database tests**
+
+Assert: opening the database creates the file with mode `0600`; `migrate()` is idempotent; `transaction(fn)` rolls back when `fn` throws; WAL journal mode is enabled; and every table from `001_initial.sql` exists with the expected columns.
+
+Schema covers `projects`, `sessions`, `commands`, `pending_events`, `device_delivery`, `history_snapshots`, `history_snapshot_items`, `session_locks`, `devices`, `device_sessions`, `pairing_tokens`, `auth_challenges`, and `audit_events`. Columns must match the spec sections 6.5, 6.7, 7.4, 8.5, and 10.3 exactly, including `device_delivery.deliveryBase`, `device_delivery.deliveryWatermark`, `history_snapshots.status` (`prepared`/`committed`/`expired`), and `auth_challenges.challengeRaw`.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- db/database.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement migration and transaction helper**
+
+`database.ts` opens with `better-sqlite3`, sets `journal_mode = WAL`, `foreign_keys = ON`, `synchronous = NORMAL`, and `busy_timeout = 5000`. `migrate()` applies `001_initial.sql` inside a transaction and records a `schema_migrations` row. `transaction(fn)` wraps `db.transaction(fn)` and never auto-commits on exception.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- db/database.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/db bridge/test/db package.json package-lock.json
+git commit -m "feat(bridge): add sqlite schema and transaction helper"
+```
+
+### Task 8: Protocol v1 models and validator
+
+**Files:**
+- Create: `contracts/v1/command.schema.json`
+- Create: `contracts/v1/response.schema.json`
+- Create: `contracts/v1/event.schema.json`
+- Create: `bridge/src/protocol/v1/types.ts`
+- Create: `bridge/src/protocol/v1/validator.ts`
+- Test: `bridge/test/protocol/v1/validator.test.ts`
+
+- [ ] **Step 1: Write JSON Schemas**
+
+`command.schema.json` defines the envelope (`protocolVersion`, `requestId` uuid, `idempotencyKey` string, `commandType` enum from spec §8.2, `sessionId` nullable uuid, `sentAt` RFC3339, `payload` per-command discriminated union) and each payload variant.
+
+`event.schema.json` requires `eventId` as a decimal-stringified unsigned 64-bit integer, plus every event type from spec §8.4.
+
+`response.schema.json` requires `protocolVersion`, `requestId`, `responseType`, and conditional `commandStatus`.
+
+- [ ] **Step 2: Write failing validator tests**
+
+Assert: every accepted command payload validates; unknown `commandType` rejects; non-decimal `eventId` rejects; `sentAt` with timezone offset rejects if not RFC3339; oversized payloads reject at 256 KiB.
+
+- [ ] **Step 3: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- protocol/v1/validator.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 4: Implement TypeScript models and validator**
+
+`types.ts` exports discriminated unions mirroring the schemas. `validator.ts` compiles Ajv schemas once and exposes `validateCommand`, `validateEvent`, `validateResponse`. Numeric `eventId` is always parsed to `bigint` after string validation.
+
+- [ ] **Step 5: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- protocol/v1/validator.test.ts && npm run typecheck -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add contracts bridge/src/protocol bridge/test/protocol package.json package-lock.json
+git commit -m "feat(protocol): add v1 schemas, types, and validator"
+```
+
+### Task 9: Command ledger with idempotency and transitions
+
+**Files:**
+- Create: `bridge/src/commands/command-ledger.ts`
+- Test: `bridge/test/commands/command-ledger.test.ts`
+
+- [ ] **Step 1: Write failing tests**
+
+Assert in order:
+
+1. First insert with `(deviceId, idempotencyKey)` succeeds with status `accepted`.
+2. Same key with the same JCS payload hash returns the saved record without re-running side effects.
+3. Same key with a different payload hash returns a conflict and never writes a new row.
+4. Duplicate `requestId` across different keys rejects.
+5. `transition()` from `accepted → dispatching`, `dispatching → dispatched`, `dispatched → completed`, `dispatched → failed`, `dispatching → indeterminate`, and `dispatched → indeterminate` succeed; illegal transitions reject.
+6. Transition to a terminal state is irreversible.
+7. Transitions are persisted in the same transaction as a `command.status.changed` event when requested.
+
+Use a temporary on-disk SQLite file.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- commands/command-ledger.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the ledger**
+
+`command-ledger.ts` exposes:
+
+```ts
+interface CommandLedger {
+  accept(envelope: CommandEnvelope, deviceId: string, payloadHash: string): Promise<CommandRecord>;
+  acceptDuplicate(envelope: CommandEnvelope, deviceId: string, payloadHash: string): Promise<{ kind: "replay"; record: CommandRecord } | { kind: "conflict" } | { kind: "inserted"; record: CommandRecord }>;
+  transition(requestId: string, next: CommandStatus, options?: { eventId?: bigint }): Promise<CommandRecord>;
+  get(requestId: string): Promise<CommandRecord | undefined>;
+}
+```
+
+JCS canonicalization is implemented in a single `canonicalJson()` helper with a unit test ensuring UTF-8 sorted keys, no trailing newline, and deterministic number formatting for the cases used by the spec.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- commands/command-ledger.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/commands bridge/test/commands package.json package-lock.json
+git commit -m "feat(bridge): add idempotent command ledger"
+```
+
+### Task 10: Event journal with high-water mark, ACK, and retention
+
+**Files:**
+- Create: `bridge/src/events/event-journal.ts`
+- Test: `bridge/test/events/event-journal.test.ts`
+
+- [ ] **Step 1: Write failing tests**
+
+Assert:
+
+1. `append()` increments `sessions.lastEventId` and inserts a `pending_events` row in the same transaction; the event is only sent after commit.
+2. `eventId` is encoded as a decimal string in the persisted payload.
+3. After all events are deleted, the next `append()` still produces a strictly increasing ID.
+4. `replayAfter(sessionId, eventId)` yields events in order, excluding nothing in the unacknowledged window.
+5. `acknowledge(sessionId, deviceId, eventId)` advances `device_delivery` only forward; backward ACK rejects.
+6. `markCheckpointSuperseded(sessionId, deviceId, watermark)` deletes nothing immediately and schedules deletion 600 seconds later.
+7. Hitting the configured byte budget for `pending_events` causes `append()` to throw a `STORAGE_PRESSURE` error without modifying the journal.
+8. Single tool-output payloads larger than the configured limit are stored with a truncation marker and original byte count.
+9. A bridge restart (close + reopen) replays every unacknowledged event.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- events/event-journal.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the journal**
+
+`event-journal.ts` exposes `append`, `replayAfter`, `acknowledge`, `markCheckpointSuperseded`, `truncateLargePayload`, and `pendingBytes`. Retention is implemented with a `pending_events.delete_after` epoch column plus a sweep on every `append` and on Bridge start. `STORAGE_PRESSURE` is checked before allocation, not after.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- events/event-journal.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/events bridge/test/events package.json package-lock.json
+git commit -m "feat(bridge): add durable event journal and ack semantics"
+```
+
+### Task 11: WebSocket server, subprotocol, and close codes
+
+**Files:**
+- Create: `bridge/src/server/websocket-server.ts`
+- Test: `bridge/test/server/websocket-server.test.ts`
+
+- [ ] **Step 1: Write failing tests**
+
+Use `ws` as a test client against the in-process Fastify server.
+
+Assert:
+
+1. Missing `Sec-WebSocket-Protocol: claude-remote.v1` rejects the Upgrade.
+2. Missing `Authorization` and `X-Claude-Remote-Device-Session` reject with `4401` (auth wiring lands in Chunk 3; here the server treats them as required headers without verifying content).
+3. `protocolVersion` mismatch returns `4426`.
+4. Server may close with `4401`, `4403`, `4409`, `4410`, `4426`, or `4500` per spec §8.1.
+5. Each event delivered carries a decimal `eventId`.
+6. Concurrent socket from a second "device" is rejected (single paired device enforcement is a stub for now, returning `4403`).
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- server/websocket-server.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the WebSocket boundary**
+
+`websocket-server.ts` registers `@fastify/websocket`, verifies subprotocol selection, enforces required headers, and exposes a `SessionConnection` abstraction that:
+
+- holds the underlying socket;
+- tracks the device/session association set during auth (initially `null`);
+- exposes `send(event)` that writes a single JSON message and flushes;
+- exposes `close(code, reason)` that closes with one of the documented codes;
+- enforces a write deadline based on Access assertion and device-session expiry once Chunk 3 wires those in.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- server/websocket-server.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add bridge/src/server bridge/test/server package.json package-lock.json
+git commit -m "feat(bridge): add websocket subprotocol and close codes"
+```
+
+### Task 12: Bridge main wiring and smoke test
+
+**Files:**
+- Modify: `bridge/src/main.ts`
+- Modify: `bridge/src/server/http-server.ts`
+- Modify: `bridge/src/server/websocket-server.ts`
+- Test: `bridge/test/main.smoke.test.ts`
+
+- [ ] **Step 1: Write a smoke test**
+
+Boot `main.ts` against a temp data dir and assert: `/api/v1/health` returns ok; `/api/v1/capabilities` reports `protocolVersion: "claude-remote.v1"`; a WebSocket Upgrade with the required subprotocol and stubbed headers connects; closing the socket does not crash the server; `SIGTERM` triggers clean shutdown within 2 seconds.
+
+- [ ] **Step 2: Run the smoke test**
+
+Run: `npm test -w @claude-remote/bridge -- main.smoke.test.ts`
+Expected: PASS.
+
+- [ ] **Step 3: Run all Bridge tests and typecheck**
+
+Run: `npm test -w @claude-remote/bridge && npm run typecheck -w @claude-remote/bridge && npm run build -w @claude-remote/bridge`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add bridge package.json package-lock.json
+git commit -m "feat(bridge): wire main entrypoint and smoke verification"
+```
