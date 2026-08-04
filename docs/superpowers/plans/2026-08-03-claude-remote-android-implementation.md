@@ -1691,7 +1691,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement the models**
 
-`ProtocolModels.kt` mirrors the JSON Schemas from Chunk 2 Task 8. Use `@SerialName` discriminators. Keep `eventId` as a `@Serializable(with = DecimalStringLongSerializer::class)` value class.
+`ProtocolModels.kt` mirrors the JSON Schemas from Chunk 2 Task 8. Use `@SerialName` discriminators. `DecimalStringLongSerializer` parses decimal-string `eventId` into a Kotlin `Long` and rejects values greater than `Long.MAX_VALUE` as protocol errors (treat the Bridge's unsigned 64-bit space as bounded by signed `Long.MAX` for the client). Test both a 19-digit accepted and a 20-digit rejected string.
 
 - [ ] **Step 4: Run verification**
 
@@ -1722,8 +1722,9 @@ Assert within a single Room transaction:
 
 1. Replacing a history revision upserts by stable `historyItemId` (no duplicates across snapshot + live events).
 2. `events.ack` writes `lastAckEventId` only when monotonically increasing.
-3. `checkpoint_commit_pending` row persists across process restart.
-4. While `checkpoint_commit_pending` exists, calling `ack(lastAckEventId = deliveryWatermark)` is rejected by the DAO (the wrapper refuses to advance past `deliveryBase` until commit clears pending).
+3. `checkpoint_commit_pending` row persists across process restart. Its required columns are `snapshotId`, `historyRevision`, `deliveryBase`, `deliveryWatermark`, `idempotencyKey`.
+4. While `checkpoint_commit_pending` exists, `ack(lastAckEventId = deliveryBase)` is accepted, but `ack(lastAckEventId = deliveryBase + 1)` and `ack(lastAckEventId = deliveryWatermark)` are both rejected by the DAO wrapper; the ceiling is `deliveryBase`, not `deliveryWatermark`.
+5. A `command.status.changed` event whose `requestId == X` updates the row whose `requestId == X` and no other row, asserting the conversation-side correlation key.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -1754,6 +1755,7 @@ git commit -m "feat(android): add room database with atomic projection daos"
 - Test: `android/app/src/androidTest/java/dev/clauderemote/android/security/DeviceKeyManagerTest.kt`
 - Test: `android/app/src/test/java/dev/clauderemote/android/security/SigningBytesTest.kt`
 - Spec reference: §4 (capability probe), §10.3.
+- Prerequisite: `contracts/v1/auth-signing-fixture.json` from Task 21 and `contracts/v1/{command,response,event}.schema.json` from Task 8 must exist.
 
 - [ ] **Step 1: Write failing JVM signing-bytes tests**
 
@@ -1773,8 +1775,8 @@ Pure JVM code, identical algorithm to `bridge/src/auth/signing-bytes.ts`. Valida
 Assert on a real device:
 
 1. `ensureDeviceKey()` generates a non-exportable P-256 keypair via Android Keystore with `setUserAuthenticationRequired(false)` and `PURPOSE_SIGN`.
-2. The key refuses export via `getKeyProperties()` (`isInsideSecureHardware()` is allowed to be false but `isUserAuthenticationRequirementEnforcedBySecureHardware()` is best-effort).
-3. On devices where P-256 generation fails, the probe surfaces `DeviceUnsupportedError` and never falls back to a software key.
+2. The key refuses export: `KeyStore.getEntry` returns a `PrivateKey` whose `getFormat()` is `null`.
+3. Inject a failing `KeyPairGenerator` via a fake Keystore provider (Robolectric or a wrapper around `KeyPairGenerator.getInstance`) and assert `DeviceUnsupportedError` propagates from every failure path (`ProviderException`, `NoSuchAlgorithmException`, `InvalidAlgorithmParameterException`, StrongBox-unavailable when StrongBox was not requested); never fall back to a software or APK-embedded key.
 4. `sign(signingBytes)` returns a DER `SHA256withECDSA` signature verifiable by a Java `Signature` checker using the public part.
 
 - [ ] **Step 5: Run tests to verify failure**
@@ -1784,7 +1786,7 @@ Expected: FAIL.
 
 - [ ] **Step 6: Implement `DeviceKeyManager.kt`**
 
-Use `KeyStore.getInstance("AndroidKeyStore")`, `KeyPairGenerator.getInstance("EC", "AndroidKeyStore")` with `ECParameterSpec` set to `prime256v1`. Compute deviceId as `Base64.encodeToString(SHA-256(spkiDer), URL_SAFE | NO_PADDING | NO_WRAP)`.
+Use `KeyStore.getInstance("AndroidKeyStore")`, `KeyPairGenerator.getInstance("EC", "AndroidKeyStore")` with `ECParameterSpec` set to `prime256v1`. Wrap every generation path in try/catch and convert `NoSuchAlgorithmException`/`InvalidAlgorithmParameterException`/`ProviderException`/StrongBox-unavailable into `DeviceUnsupportedError`. After generation, assert `KeyStore.getEntry(alias, null).privateKey.getFormat() == null`; otherwise delete the key and surface `DeviceUnsupportedError`. Never register a software `Provider` fallback. Compute deviceId as `Base64.encodeToString(SHA-256(spkiDer), URL_SAFE | NO_PADDING | NO_WRAP)`.
 
 - [ ] **Step 7: Run verification**
 
@@ -1819,7 +1821,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement `OAuthManager.kt`**
 
-Use AppAuth-Android `AuthorizationService` and `TokenRequest`. Store refresh token encrypted with a Keystore-protected AES key (Tink or `MasterKey` from `androidx.security.crypto`). The probe-only `CF_Authorization` cookie is never read.
+Use AppAuth-Android `AuthorizationService` and `TokenRequest`. Store refresh token encrypted with a Keystore-protected AES key (Tink or `MasterKey` from `androidx.security.crypto`). The probe-only `CF_Authorization` cookie is never read. Before any authorization request, call a preflight that checks the configured host is in `PackageManager.getLinksForPackage` verified state; if not verified, surface `AppLinkUnverifiedError` and refuse to start OAuth (mirrors the Phase 0 runner's "browser fallback does not pass" rule).
 
 - [ ] **Step 4: Write failing device-session tests**
 
@@ -1827,7 +1829,7 @@ Assert: challenge request returns `{challengeId, challengeRaw, accessSubject}`; 
 
 - [ ] **Step 5: Implement `DeviceSessionManager.kt`**
 
-Wraps `OAuthManager` + `DeviceKeyManager` + `OkHttpClient` to Bridge endpoints. Exposes `getValidDeviceSessionToken()` that always returns a non-expired opaque token, refreshing via fresh challenge signature when within the last 60 seconds of validity.
+Wraps `OAuthManager` + `DeviceKeyManager` + `OkHttpClient` to Bridge endpoints. Exposes `getValidDeviceSessionToken()` that always returns a non-expired opaque token. Refresh requires a still-valid Access token; if Access has expired or expires within the same 60-second window, refresh Access first, then perform the fresh challenge signature, then call Bridge `/auth/challenge`. The 60-second device-session refresh window must be shorter than the Access remaining lifetime; otherwise Access refresh happens first.
 
 - [ ] **Step 6: Run verification**
 
@@ -1857,10 +1859,16 @@ Assert:
 
 1. Every HTTP request adds `Authorization: Bearer <access>` and `X-Claude-Remote-Device-Session: <token>`.
 2. WebSocket Upgrade uses the same two headers and `Sec-WebSocket-Protocol: claude-remote.v1`.
-3. Reconnect uses exponential backoff with jitter; on `4401` triggers OAuth refresh + device-session refresh before reconnecting.
-4. Reconnect posts the last continuous `eventId` per session.
-5. `4410` invokes the SnapshotCoordinator instead of normal ACK.
-6. Token refresh and reconnect serialize so two simultaneous reconnects cannot interleave.
+3. Reconnect uses exponential backoff with jitter.
+4. Per-close-code policy (mirroring spec §8.1):
+   - `4401` triggers OAuth refresh → `DeviceSessionManager.getValidDeviceSessionToken()` (fresh challenge signature) → new socket, in that order, all inside the same `Mutex`.
+   - `4403` stops reconnect and surfaces re-pair/re-login UI; no retry loop.
+   - `4409` stops command retry for the conflicting command and surfaces to the user.
+   - `4410` invokes the SnapshotCoordinator instead of normal ACK.
+   - `4426` surfaces upgrade-required UI and stops reconnect.
+   - `4500` exponential backoff capped at the configured maximum.
+5. Reconnect posts the last continuous `eventId` per session.
+6. The `Mutex`-protected critical section performs OAuth refresh → device-session refresh → new socket sequentially; no event consumption or `send()` proceeds concurrently.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -1911,10 +1919,11 @@ Expected: FAIL.
 Assert the full two-phase recovery from §6.7:
 
 1. On `4410`, call `snapshot.begin`. Page through all items into a temporary buffer while buffering live events with `eventId > deliveryWatermark`.
-2. Generate a stable commit `idempotencyKey` and write `checkpoint_commit_pending` in the same Room transaction as the history/command/session/permission projection.
+2. Generate a stable commit `idempotencyKey` and write `checkpoint_commit_pending` (with `snapshotId`, `historyRevision`, `deliveryBase`, `deliveryWatermark`, `idempotencyKey`) in the same Room transaction as the history/command/session/permission projection.
 3. While pending exists, normal ACK refuses to advance past `deliveryBase`.
 4. Call `snapshot.commit` with the original key; on success clear pending and apply buffered events in order.
-5. If the App crashes before commit, on restart detect pending and retry the same commit; `410` invalidates the projection and starts a new `begin`.
+5. If the App crashes before commit, on restart detect pending and retry the same commit using the persisted `idempotencyKey`.
+6. If `snapshot.commit` returns `410 SNAPSHOT_EXPIRED`: mark the prior projection rows invalid; retain `checkpoint_commit_pending.deliveryBase` as the enforced ACK upper bound; do NOT call `events.ack(deliveryWatermark)`; only clear the pending row after a subsequent `begin`/`commit` succeeds.
 
 - [ ] **Step 5: Run tests to verify failure**
 
@@ -1950,16 +1959,17 @@ git commit -m "feat(android): add event reducer and crash-safe snapshot coordina
 - Test: `android/app/src/test/java/dev/clauderemote/android/ui/ConversationViewModelTest.kt`
 - Spec reference: §12.
 
-- [ ] **Step 1: Write failing ViewModel tests**
+- [ ] **Step 1: Write failing ViewModel and Compose UI tests**
 
 Assert against fake `SessionRepository`:
 
-1. Messages render with status badges (accepted/dispatching/dispatched/indeterminate/interrupted/completed/failed).
+1. Messages render with status badges (accepted/dispatching/dispatched/indeterminate/interrupted/completed/failed). Status badges key off `requestId` matching between `MessageEntity` and `CommandEventEntity`.
 2. `indeterminate` exposes a single Safe Retry action; `interrupted` exposes Resume + send-continue.
 3. Idle state enables Send; non-idle disables Send.
-4. Permission sheet default focus is not Allow; Allow and Deny are spaced apart.
-5. Stop and Release are distinct buttons; Release only enabled in idle/interrupted.
-6. Refresh-expiry warning appears when Access or device session nears expiry.
+4. Stop and Release are distinct buttons; Release only enabled in idle/interrupted.
+5. Refresh-expiry warning appears when Access or device session nears expiry.
+
+Also add a Compose UI instrumented test (`app/src/androidTest/.../PermissionSheetUiTest.kt`) that renders `PermissionSheet` and asserts the Allow button does not receive initial focus (assert focus is on the title, the Deny button, or no child), and Allow/Deny have at least the configured minimum spacing.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -1992,7 +2002,10 @@ git commit -m "feat(android): add compose ui shells and viewmodels"
 
 - [ ] **Step 1: Write failing end-to-end instrumented test against a fake local server**
 
-Assert: pairing, OAuth login, session create/resume, message send → status transitions → assistant message render, permission prompt → allow executes once, deny stops the turn, disconnect → reconnect replays unacked events, `4410` triggers snapshot recovery, app backgrounded → foregrounded preserves state.
+Assert: pairing, OAuth login, session create/resume, message send → status transitions → assistant message render, permission prompt → allow executes once, deny stops the turn, disconnect → reconnect replays unacked events, `4410` triggers snapshot recovery, app backgrounded → foregrounded preserves state. Additionally:
+
+- Crash-before-commit restart: kill the app process after the Room transaction writes `checkpoint_commit_pending` but before `snapshot.commit` returns; on relaunch, the same `idempotencyKey` is retried and the snapshot reaches `committed`, with no ACK past `deliveryBase` until commit succeeds.
+- 410-on-commit recovery: when `snapshot.commit` returns `410`, the coordinator discards the projection, retains `deliveryBase` as ACK ceiling, and a fresh `begin`/`commit` succeeds.
 
 - [ ] **Step 2: Wire composition root**
 
