@@ -2133,7 +2133,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement the preflight**
 
-The preflight is composed of typed checks returning `{ name, passed, details }`. Output is JSON plus human-readable summary; secrets are never logged.
+The preflight is composed of typed checks returning `{ name, passed, details }`. Output is JSON plus human-readable summary; secrets are never logged. For the `/api/v1/health` check, preflight spawns `node bridge/dist/main.js` with `BRIDGE_PREFLIGHT_HEALTH_ONLY=1` bound to `127.0.0.1:$BRIDGE_PORT`, performs one GET, then terminates the child; absence of an already-bound port (no other listener) is itself part of check 1 (loopback-only bind). The preflight never calls `launchctl bootstrap`; that stays in the installer.
 
 - [ ] **Step 4: Run verification**
 
@@ -2158,7 +2158,20 @@ git commit -m "feat(deploy): add bridge preflight self-check"
 
 - [ ] **Step 1: Document the manual provisioning inputs**
 
-`e2e/README.md` lists: real Android device with API ≥ 28, real Mac, real Claude Code 2.1.133 with API access, real Cloudflare account with Tunnel + Access configured per Chunk 5 Task 35 templates, and required env vars. The driver is opt-in only and runs no real Claude turns in CI.
+`e2e/README.md` lists: real Android device with API ≥ 28, real Mac, real Claude Code 2.1.133 with API access, real Cloudflare account with Tunnel + Access configured per Chunk 5 Task 35 templates, and the required env vars enumerated below. The driver is opt-in only and runs no real Claude turns in CI.
+
+Required env vars consumed by the runner (`run-e2e.ts` reads them up-front and fails closed if any are missing):
+
+- `CLOUDFLARE_ACCOUNT_ID`
+- `CLOUDFLARE_API_TOKEN` — must have scopes `Access: Apps: Edit` and `Cloudflare Tunnel: Edit`
+- `CLOUDFLARE_ZONE_ID`
+- `BRIDGE_CLOUDFLARE_TEAM_DOMAIN`
+- `BRIDGE_CLOUDFLARE_AUD`
+- `BRIDGE_CLOUDFLARE_TUNNEL_NAME`
+- `BRIDGE_CLOUDFLARE_HOSTNAME`
+- `BRIDGE_DATA_DIR`
+- `ANDROID_SERIAL`
+- `RUN_E2E=1`
 
 - [ ] **Step 2: Encode the spec §14 acceptance criteria as machine checks**
 
