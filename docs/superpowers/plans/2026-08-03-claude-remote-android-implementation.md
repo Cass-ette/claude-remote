@@ -714,6 +714,9 @@ CREATE TABLE history_snapshots (
   deliveryWatermark    INTEGER NOT NULL,
   sessionStatus        TEXT NOT NULL,
   pendingPermissionJson TEXT,
+  commitIdempotencyKey TEXT,
+  commitResultJson     TEXT,
+  committedAt          INTEGER,
   createdAt            INTEGER NOT NULL,
   expiresAt            INTEGER NOT NULL
 );
@@ -1157,6 +1160,8 @@ Assert using a stub `ClaudeProcessFactory`:
 6. Reconcile-on-restart: stale leases from another Bridge instance are expired; PID identity mismatch does not signal.
 7. Concurrent supervisor instances on the same session conflict via `session_locks`.
 
+Note: §7.6 step 6 transcript-evidence reconciliation depends on the history adapter (Task 19). `recoverOnStartup` here only expires stale leases and stops mismatched PIDs; it leaves `dispatching`/`dispatched` commands untouched and exposes `reconcileIndeterminateCommands(history)` for Task 19 to call once `findTurnEvidence` exists.
+
 - [ ] **Step 2: Run tests to verify failure**
 
 Run: `npm test -w @claude-remote/bridge -- sessions/session-supervisor.test.ts`
@@ -1174,10 +1179,11 @@ interface SessionSupervisor {
   release(input: { sessionId: string }): Promise<void>;
   cancel(input: { requestId: string }): Promise<void>;
   recoverOnStartup(): Promise<void>;
+  reconcileIndeterminateCommands(history: { findTurnEvidence(sessionId: string, uuid: string): Promise<TurnEvidence> }): Promise<void>;
 }
 ```
 
-Process launches are delegated to a `ClaudeProcessFactory` interface so tests can inject a fake; the real factory is wired in Task 16. Stop/release timing constants (5 s each) come from `config.ts`. Transcript stabilization = file size unchanged across three 200 ms observations or 5 s timeout.
+Process launches are delegated to a `ClaudeProcessFactory` interface so tests can inject a fake; the real factory is wired in Task 16. Stop/release timing constants (5 s each) come from `config.ts`. Transcript stabilization = file size unchanged across three 200 ms observations or 5 s timeout. `recoverOnStartup` is split: lease cleanup here; command reconciliation deferred to Task 19 via `reconcileIndeterminateCommands`.
 
 - [ ] **Step 4: Run verification**
 
@@ -1221,7 +1227,7 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement the adapter**
 
-`stream-json-adapter.ts` builds the exact Phase 0 spawn args, manages stdin/stdout, exposes `sendUser`/`closeInput`/`events`/`awaitInit`. `process-factory.ts` is the real `ClaudeProcessFactory` implementation; it reads the configured `claude` binary path, MCP config path, and permission tool name. The MCP config is generated per-session with absolute paths and `--strict-mcp-config`.
+`stream-json-adapter.ts` builds the exact Phase 0 spawn args, manages stdin/stdout, exposes `sendUser`/`closeInput`/`events`/`awaitInit`. The user-message envelope written to stdin matches the Phase 0 candidate exactly, including `parent_tool_use_id: null`. `process-factory.ts` is the real `ClaudeProcessFactory` implementation; it reads the configured `claude` binary path, generates a per-session MCP config with absolute paths and `--strict-mcp-config`, generates a 256-bit lease secret passed to the subprocess via the `BRIDGE_LEASE_SECRET` env var, and includes `BRIDGE_LEASE_SECRET` in the deny-list used by any future env-logging helper.
 
 - [ ] **Step 4: Write process-lease-wrapper tests**
 
@@ -1263,14 +1269,17 @@ git commit -m "feat(bridge): add claude stream-json adapter and lease wrapper"
 Assert:
 
 1. Adapter authenticates with the per-process 256-bit lease secret; mismatched secret closes the socket without response.
-2. Pending request stored in `pending_events` and visible to the active device within 200 ms.
-3. `permission.resolve` from the correct device+session returns allow/deny; same request twice rejects the second.
-4. Five-minute timeout auto-denies.
-5. `session.stop` resolves pending as denied.
-6. Device revocation resolves pending as denied.
-7. Allow returns the original `input` verbatim; deny returns user/timeout message with `interrupt: false`.
-8. Adapter crash or socket close denies the current pending request.
-9. MCP result schema mismatch (missing `behavior`, or unknown behavior) denies and terminates the subprocess.
+2. The same lease secret cannot be used twice; a second adapter connection with the same secret rejects, enforcing single-use semantics.
+3. A lease secret bound to session A cannot be used to bind the adapter to session B; mismatched `sessionId` rejects.
+4. Pending request stored in `pending_events` and visible to the active device within 200 ms.
+5. `permission.resolve` from the correct device+session returns allow/deny; same request twice rejects the second.
+6. Five-minute timeout auto-denies.
+7. `session.stop` resolves pending as denied.
+8. Bridge graceful shutdown resolves every pending request as denied.
+9. Device revocation resolves pending as denied.
+10. Allow returns the original `input` verbatim; deny returns user/timeout message with `interrupt: false`.
+11. Adapter crash, socket close, or broker-reachable-but-MCP-write-fails denies the current pending request, and when the deny cannot be delivered the broker terminates the bound Claude subprocess group.
+12. MCP result schema mismatch (missing `behavior`, or unknown behavior) denies and terminates the subprocess.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -1382,10 +1391,12 @@ Assert the full §6.7 protocol:
 1. `begin()` takes the resync mutex, captures `deliveryBase`, `deliveryWatermark`, current session state, all non-terminal commands, and pending permission; returns first page + cursor.
 2. While `prepared` exists for the device, `events.ack` past `deliveryBase` returns `409 CHECKPOINT_COMMIT_REQUIRED`.
 3. `page(cursor)` returns subsequent pages from materialized items; expired cursor returns `410 SNAPSHOT_EXPIRED` and does not change delivery.
-4. `commit(snapshotId, historyRevision, deliveryWatermark, idempotencyKey)` advances `device_delivery` only after atomically validating all three fields, sets snapshot `status = committed`, and marks superseded events' `deleteAfter`.
-5. Duplicate commit returns the same result; mismatched fields return conflict.
-6. `commit` after expiry returns `410 SNAPSHOT_EXPIRED`.
-7. Buffer events during `prepared` get `eventId > deliveryWatermark` after mutex release.
+4. `commit(snapshotId, historyRevision, deliveryWatermark, idempotencyKey)` advances `device_delivery` only after atomically validating all three fields, sets snapshot `status = committed`, persists `commitIdempotencyKey`/`commitResultJson`/`committedAt`, advances `device_delivery.deliveryCheckpointWatermark`, and marks superseded events' `deleteAfter`.
+5. Duplicate commit with the same `idempotencyKey` returns the persisted `commitResultJson` and performs no further state change.
+6. Same `idempotencyKey` with different fields returns a conflict and performs no state change.
+7. `commit` after `expireStale` has flipped the snapshot to `expired` returns `410 SNAPSHOT_EXPIRED` regardless of wall-clock timing.
+8. `expireStale(now)` invoked on `begin`, `commit`, and Bridge start flips rows whose `expiresAt <= now` from `prepared` to `expired`; expired rows never advance delivery.
+9. Buffer events during `prepared` get `eventId > deliveryWatermark` after mutex release.
 
 - [ ] **Step 5: Run tests to verify failure**
 
@@ -1394,7 +1405,7 @@ Expected: FAIL.
 
 - [ ] **Step 6: Implement the snapshot service**
 
-`snapshot-service.ts` exposes `begin/page/commit/expireStale`. Expiry is a sweep invoked on `begin`/`commit` and on Bridge start; expired snapshots do not advance delivery and do not delete events.
+`snapshot-service.ts` exposes `begin/page/commit/expireStale`. Duplicate commit recognition reads `commitIdempotencyKey` from the snapshot row; on first commit it persists `commitIdempotencyKey`, `commitResultJson`, and `committedAt` in the same transaction that flips status to `committed`. Expiry is a sweep invoked on `begin`/`commit` and on Bridge start; expired snapshots do not advance delivery and do not delete events. After successful commit, `reconcileIndeterminateCommands` (Task 15) is called by Task 24 wiring using the production history adapter to satisfy §7.6 step 6.
 
 - [ ] **Step 7: Run verification**
 
@@ -1451,9 +1462,11 @@ git commit -m "feat(bridge): add cloudflare access jwt verifier"
 - Spec reference: §10.3, §10.4.
 - Prerequisite: Phase 0 Cloudflare gate must be `passed`.
 
-- [ ] **Step 1: Write failing signing-bytes tests**
+- [ ] **Step 1: Generate and validate the shared auth-signing fixture**
 
-Assert the exact byte construction from §10.3 matches a fixture checked into `contracts/v1/auth-signing-fixture.json` (generated during Phase 0). Test host normalization (IDNA ToASCII, lowercase, no trailing dot, scheme/path/:443 excluded). Reject userinfo/query/fragment, non-https, non-empty path other than `/`, ports other than empty/443.
+Add `bridge/scripts/gen-auth-fixture.ts` (one-shot) that uses a hard-coded P-256 test keypair to emit `contracts/v1/auth-signing-fixture.json` containing: SPKI DER (base64), deviceId, canonical host, Access subject, challenge ID, challenge raw bytes, the exact signing-content as hex, and a fixed DER signature produced deterministically (RFC6979 nonce) so both implementations verify the same bytes. Run it once, commit the JSON, never regenerate.
+
+Then write failing tests asserting: `buildSigningBytes()` output equals the fixture hex byte-for-byte; `normalizeHost()` performs IDNA ToASCII, lowercase, no trailing dot; and inputs with userinfo, query, fragment, non-https scheme, non-empty path other than `/`, or ports other than empty/443 all reject.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -1508,7 +1521,7 @@ git commit -m "feat(bridge): add device pairing, challenge, and session auth"
 
 - [ ] **Step 1: Write failing tests**
 
-Assert: file mode `0600`; rotation at 10 MiB; five rotated files retained; thirty-day cap; redaction of `Authorization`, `Cf-Access-Jwt-Assertion`, `X-Claude-Remote-Device-Session`, OAuth tokens, API keys, file paths inside prompts, and stderr tokens. Assert structured fields per §10.6 and that prompts/full tool params/tool outputs never enter the log.
+Assert: file mode `0600`; rotation at 10 MiB; five rotated files retained; thirty-day cap; redaction of `Authorization`, `Cf-Access-Jwt-Assertion`, `X-Claude-Remote-Device-Session`, OAuth tokens, API keys, file paths inside prompts, stderr tokens, and any string matching a generic credential pattern (`sk-[A-Za-z0-9]{20,}`, `Bearer [A-Za-z0-9._-]+`, `AKIA[0-9A-Z]{16}`, and high-entropy base64 longer than 32 chars). Assert structured fields per §10.6 and that prompts/full tool params/tool outputs never enter the log.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -1582,7 +1595,11 @@ git commit -m "feat(bridge): add local admin cli"
 
 - [ ] **Step 1: Write failing runtime integration tests**
 
-A single fake-Claude end-to-end test asserts: project authorization; session create/resume/stop/release; permission prompt round trip with allow and deny; command `dispatching → dispatched → completed` with `command.status.changed` events persisted; snapshot begin/page/commit with Room-equivalent state machine; revocation closes sockets; audit log redaction.
+A single fake-Claude end-to-end test asserts: project authorization; session create/resume/stop/release; permission prompt round trip with allow and deny; command `dispatching → dispatched → completed` with `command.status.changed` events persisted; snapshot begin/page/commit with Room-equivalent state machine; revocation closes sockets; audit log redaction. Additionally:
+
+- A forced `4410` resync flow: client state diverges, server returns `4410`, client runs `snapshot.begin → page → commit`, and live events with `eventId > deliveryWatermark` apply afterward without re-triggering `4410`.
+- §7.6 reconciliation: kill the Bridge mid-`dispatched` command, restart, run `recoverOnStartup()` and `reconcileIndeterminateCommands(history)`, and assert `dispatching`/`dispatched` commands classify into `completed`/`failed`/`interrupted`/`indeterminate` per transcript evidence.
+- Graceful shutdown: with an active session, `SIGTERM` triggers pending-permission denial, then the SIGINT → 5 s → SIGTERM → 5 s → SIGKILL stop order, ending in `interrupted`.
 
 - [ ] **Step 2: Wire everything in `main.ts`**
 
