@@ -2022,3 +2022,219 @@ Expected: PASS, producing a debug APK.
 git add android/app
 git commit -m "feat(android): wire end-to-end flow and instrumented verification"
 ```
+
+## Chunk 5: Deployment and end-to-end verification
+
+Goal: ship the Bridge as a managed launchd service that speaks only through Cloudflare Tunnel, give the user one safe installer and a preflight self-check, and capture the real-environment acceptance criteria from spec §14 in an executable real-device suite. CI runs deterministic checks only; real-device verification stays a documented, locally executed flow.
+
+### Task 34: launchd plist and installer
+
+**Files:**
+- Create: `deploy/launchd/dev.clauderemote.bridge.plist.template`
+- Create: `deploy/scripts/install-launchd.ts`
+- Create: `deploy/scripts/uninstall-launchd.ts`
+- Test: `deploy/scripts/install-launchd.test.ts`
+- Spec reference: §5, §10.1, §10.6.
+
+- [ ] **Step 1: Write failing installer tests**
+
+Assert:
+
+1. The plist template keeps `Sockets`/`Listeners` empty so launchd does not open any port itself (Bridge binds `127.0.0.1` only).
+2. The rendered plist points `ProgramArguments` at the installed `bridge` binary and passes `BRIDGE_DATA_DIR`, `BRIDGE_HOST=127.0.0.1`, `BRIDGE_PORT`, `BRIDGE_CLOUDFLARE_TEAM_DOMAIN`, `BRIDGE_CLOUDFLARE_AUD` from a generated `.env` file with mode `0600` owned by the user.
+3. `StandardOutPath`/`StandardErrorPath` point inside `BRIDGE_DATA_DIR/logs/` with `0600`.
+4. Hardened Runtime is not required (this is a user agent, not privileged), but the installer refuses to write to `/Library/LaunchDaemons` (system-wide) and only writes under `~/Library/LaunchAgents`.
+5. `install-launchd.ts` runs `launchctl bootstrap gui/$UID` only after `bridge preflight` succeeds.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -- deploy/scripts/install-launchd.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the installer**
+
+`install-launchd.ts` reads `bridge/dist/main.js`, `BRIDGE_DATA_DIR`, and Cloudflare env from CLI args or `.env`. It writes `~/Library/LaunchAgents/dev.clauderemote.bridge.plist` (mode `0644`), the `.env` (mode `0600`), and runs `launchctl bootstrap`. `uninstall-launchd.ts` runs `bootout` and leaves data intact. The plist references `node` via absolute path; never trust `PATH`.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -- deploy/scripts/install-launchd.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add deploy/launchd deploy/scripts deploy/scripts/install-launchd.test.ts
+git commit -m "feat(deploy): add user launchd installer"
+```
+
+### Task 35: Cloudflare Tunnel and Access configuration templates
+
+**Files:**
+- Create: `deploy/cloudflared/config.yml.template`
+- Create: `deploy/cloudflared/access-app.example.json`
+- Create: `deploy/scripts/render-cloudflared-config.ts`
+- Test: `deploy/scripts/render-cloudflared-config.test.ts`
+- Spec reference: §5, §10.1, §10.2.
+
+- [ ] **Step 1: Write failing tests**
+
+Assert:
+
+1. The rendered `config.yml` sets `ingress:` with one hostname mapping to `http://127.0.0.1:<port>` and a final `service: http_status:404` catch-all; no `originRequest` overrides that disable TLS verification on origin.
+2. The `access-app.example.json` defines one Access application bound to the same hostname, an exact-path bypass for `/.well-known/assetlinks.json`, and an email-based identity policy listing only the user-supplied Access subject(s).
+3. The renderer rejects inputs that would map a second hostname, expose a non-HTTPS public scheme, or include a service token in the rendered config.
+4. The renderer rejects any template variable that resolves to an empty string.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -- deploy/scripts/render-cloudflared-config.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the renderer**
+
+Read inputs from `.env` and emit `config.yml` and `access-app.json` (warnings included as comments). The output explicitly does not configure `cloudflared` to forward any port other than the Bridge HTTP port.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -- deploy/scripts/render-cloudflared-config.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add deploy/cloudflared deploy/scripts/render-cloudflared-config.ts deploy/scripts/render-cloudflared-config.test.ts
+git commit -m "feat(deploy): add cloudflared config templates"
+```
+
+### Task 36: Bridge preflight self-check
+
+**Files:**
+- Create: `deploy/scripts/preflight.ts`
+- Modify: `bridge/src/admin/cli.ts` (wire `preflight` subcommand)
+- Test: `bridge/test/admin/preflight.test.ts`
+- Spec reference: §10.1, §11.
+
+- [ ] **Step 1: Write failing preflight tests**
+
+Assert preflight exits nonzero with structured output when any of the following fails:
+
+1. `BRIDGE_HOST` is not `127.0.0.1` or `::1`.
+2. Cloudflare Access JWKS for the configured team domain is unreachable (without logging the assertion).
+3. `BRIDGE_DATA_DIR` mode is not `0700` (or stronger) and not owned by the current user.
+4. The plist path resolves outside `~/Library/LaunchAgents`.
+5. `cloudflared` is not installed or `cloudflared tunnel info` cannot find the named tunnel.
+6. The configured Access application's identity policy does not include the configured expected subject.
+7. Bridge HTTP responds to `/api/v1/health` with `ok` from `127.0.0.1` only.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `npm test -w @claude-remote/bridge -- admin/preflight.test.ts`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the preflight**
+
+The preflight is composed of typed checks returning `{ name, passed, details }`. Output is JSON plus human-readable summary; secrets are never logged.
+
+- [ ] **Step 4: Run verification**
+
+Run: `npm test -w @claude-remote/bridge -- admin/preflight.test.ts`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add deploy/scripts/preflight.ts bridge/src/admin/cli.ts bridge/test/admin/preflight.test.ts
+git commit -m "feat(deploy): add bridge preflight self-check"
+```
+
+### Task 37: Real-environment end-to-end verification
+
+**Files:**
+- Create: `e2e/README.md`
+- Create: `e2e/checklist.md`
+- Create: `e2e/src/real-environment.test.ts`
+- Create: `e2e/src/run-e2e.ts`
+- Spec reference: §13.5, §14.
+
+- [ ] **Step 1: Document the manual provisioning inputs**
+
+`e2e/README.md` lists: real Android device with API ≥ 28, real Mac, real Claude Code 2.1.133 with API access, real Cloudflare account with Tunnel + Access configured per Chunk 5 Task 35 templates, and required env vars. The driver is opt-in only and runs no real Claude turns in CI.
+
+- [ ] **Step 2: Encode the spec §14 acceptance criteria as machine checks**
+
+`e2e/src/real-environment.test.ts` enforces the 28 acceptance criteria where automation is feasible: criteria 1-4 (Phase 0 gates recap), 5 (challenge subject round-trip), 6 (unpaired device blocked), 7 (import), 8 (snapshot history), 9 (create + init ID match), 10 (status events), 11 (idempotency), 12 (indeterminate safe retry single UUID), 13 (permission allow once, deny stops), 14 (5-min timeout), 15 (reconnect replays), 16 (decimal eventId monotonic), 17 (Bridge restart replays), 18 (4410 two-phase recovery), 19 (Bridge crash lease wrapper), 20 (Stop vs Release), 21 (no auto-replay), 22 (Bridge-second-writer rejected), 23 (whitelist enforcement), 24 (Access/device expiry close socket), 25 (revocation), 26 (fail-closed on incompatible), 27 (audit redaction), 28 (Tunnel shutdown unreachable). Criteria that require pure manual verification (UI feel, OS notifications) are recorded as `manual: true` and never marked `passed` from automation.
+
+- [ ] **Step 3: Implement the runner**
+
+`e2e/src/run-e2e.ts` reads `RUN_E2E=1`, executes the Bridge locally under a temporary data dir, uses ADB against `ANDROID_SERIAL`, provisions a temporary Access application + Tunnel via the configured `cloudflared`, and runs the criteria suite. It writes a JSON report to `build/e2e/report.json` (gitignored).
+
+- [ ] **Step 4: Validate the suite locally**
+
+Run: `RUN_E2E=1 npx tsx e2e/src/run-e2e.ts`
+Expected: all 28 criteria either `passed` (automatable) or `manual: true` (with explicit user sign-off recorded in the report). Any `failed` blocks release.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add e2e
+git commit -m "test(e2e): add real-environment acceptance runner"
+```
+
+### Task 38: CI pipeline (deterministic only)
+
+**Files:**
+- Create: `.github/workflows/ci.yml`
+- Spec reference: §13.
+
+- [ ] **Step 1: Write the workflow**
+
+`ci.yml` runs on push/PR: Node setup, `npm ci`, `npm run typecheck`, `npm test` (root + workspaces), `npm run build` for Bridge and Permission Adapter, `./android/gradlew -p android app:testDebugUnitTest app:assembleDebug`, and `npm run phase0` without real env vars (must produce `not_run` evidence without failing the build). Real Claude, real Cloudflare, and real-device tests are never invoked from CI.
+
+- [ ] **Step 2: Verify CI runs locally with `act` (optional)**
+
+Run: `act -j build` (only if installed)
+Expected: PASS without secrets.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add .github/workflows/ci.yml
+git commit -m "ci: add deterministic node and android checks"
+```
+
+### Task 39: Handoff documentation
+
+**Files:**
+- Create: `README.md`
+- Create: `docs/operations/deploy.md`
+- Create: `docs/operations/troubleshooting.md`
+- Spec reference: §11, §15.
+
+- [ ] **Step 1: Write deployment runbook**
+
+`docs/operations/deploy.md` walks through: install Bridge, run preflight, configure Cloudflare Tunnel + Access, install launchd, pair one device. It includes the exact qr-pairing command and a fail-closed checklist if any preflight check fails.
+
+- [ ] **Step 2: Write troubleshooting guide**
+
+`docs/operations/troubleshooting.md` lists known symptoms from spec §11 and §15: connection drops, Access assertion expiry, `4410` loops, indeterminate commands, revocation, Bridge crash recovery, audit redaction verification, and storage pressure.
+
+- [ ] **Step 3: Write top-level README**
+
+`README.md` describes purpose, security model summary (loopback-only Bridge, single paired device, no shell/file endpoints, two-layer auth), pointers to spec and plan, and the no-warranty notice.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add README.md docs/operations
+git commit -m "docs: add deployment and troubleshooting runbooks"
+```
+
+- [ ] **Step 5: Final integration smoke**
+
+Re-run the deterministic verification:
+
+```bash
+npm test && npm run typecheck && npm run build && ./android/gradlew -p android app:testDebugUnitTest app:assembleDebug
+```
+
+Expected: PASS. Real-environment acceptance stays gated behind `RUN_E2E=1`.
