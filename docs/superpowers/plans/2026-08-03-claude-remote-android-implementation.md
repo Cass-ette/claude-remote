@@ -1620,3 +1620,392 @@ Expected: PASS.
 git add bridge package.json package-lock.json
 git commit -m "feat(bridge): wire runtime and integrate verification"
 ```
+
+## Chunk 4: Android client
+
+Goal: a Compose-first Android app that authenticates through Cloudflare Access, holds a non-exportable P-256 device key, talks the Bridge HTTP/WebSocket protocol, persists projection in Room, runs the two-phase snapshot recovery, and renders sessions/conversation/permission/import UI. Each task lists the spec section it implements.
+
+Min SDK 28 (Android 9), Java/Kotlin 17, Compose, AppAuth-Android, OkHttp, Android Keystore, Room.
+
+### Task 25: Android Gradle scaffold and Compose app shell
+
+**Files:**
+- Create: `android/settings.gradle.kts`
+- Create: `android/build.gradle.kts`
+- Create: `android/gradle/libs.versions.toml`
+- Create: `android/gradle/wrapper/gradle-wrapper.properties`
+- Create: `android/gradlew`, `android/gradlew.bat`, `android/gradle/wrapper/gradle-wrapper.jar`
+- Create: `android/app/build.gradle.kts`
+- Create: `android/app/src/main/AndroidManifest.xml`
+- Create: `android/app/src/main/java/dev/clauderemote/android/ClaudeRemoteApp.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/ui/MainActivity.kt`
+- Create: `android/app/src/main/res/values/strings.xml`, `themes.xml`
+- Test: `android/app/src/test/java/dev/clauderemote/android/VersionTest.kt`
+- Spec reference: §12.
+
+- [ ] **Step 1: Generate the Gradle wrapper**
+
+Create minimal `settings.gradle.kts` and root `build.gradle.kts`, then run once with a locally installed Gradle:
+
+```bash
+gradle -p android wrapper --gradle-version 8.9
+```
+
+Commit the wrapper files. Never depend on a system Gradle in CI.
+
+- [ ] **Step 2: Write a failing JVM smoke test**
+
+Assert the application ID is `dev.clauderemote.android`, `minSdk = 28`, `targetSdk` matches the latest stable API, and Compose is enabled.
+
+- [ ] **Step 3: Implement the app module**
+
+`app/build.gradle.kts` declares Compose, Room, OkHttp, AppAuth-Android, AndroidX Browser, and coroutines. `MainActivity` hosts a Compose navigation graph placeholder. `ClaudeRemoteApp` is the `Application` class with no logic yet.
+
+- [ ] **Step 4: Run JVM tests**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add android
+git commit -m "feat(android): add gradle scaffold and compose shell"
+```
+
+### Task 26: Protocol v1 Kotlin models
+
+**Files:**
+- Create: `android/app/src/main/java/dev/clauderemote/android/protocol/v1/ProtocolModels.kt`
+- Test: `android/app/src/test/java/dev/clauderemote/android/protocol/v1/ProtocolModelsTest.kt`
+- Spec reference: §8.
+
+- [ ] **Step 1: Write failing serialization tests**
+
+Assert every command variant serializes with `protocolVersion = "claude-remote.v1"`, `eventId` is parsed from a JSON string into a `Long` (Kotlin `Long` is 64-bit), `sentAt` is RFC3339, and the discriminator field is `commandType`. Use `kotlinx.serialization.json`.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*ProtocolModelsTest*"`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the models**
+
+`ProtocolModels.kt` mirrors the JSON Schemas from Chunk 2 Task 8. Use `@SerialName` discriminators. Keep `eventId` as a `@Serializable(with = DecimalStringLongSerializer::class)` value class.
+
+- [ ] **Step 4: Run verification**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*ProtocolModelsTest*"`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add android/app/src/main/java/dev/clauderemote/android/protocol android/app/src/test/java/dev/clauderemote/android/protocol
+git commit -m "feat(android): add v1 protocol models"
+```
+
+### Task 27: Room database and atomic projection/ACK DAOs
+
+**Files:**
+- Create: `android/app/src/main/java/dev/clauderemote/android/data/local/AppDatabase.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/data/local/Entities.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/data/local/Daos.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/data/local/Converters.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/data/local/Migrations.kt`
+- Test: `android/app/src/androidTest/java/dev/clauderemote/android/data/local/RoomProjectionTest.kt`
+- Spec reference: §6.1, §6.7, §8.5.
+
+- [ ] **Step 1: Write failing instrumented tests**
+
+Assert within a single Room transaction:
+
+1. Replacing a history revision upserts by stable `historyItemId` (no duplicates across snapshot + live events).
+2. `events.ack` writes `lastAckEventId` only when monotonically increasing.
+3. `checkpoint_commit_pending` row persists across process restart.
+4. While `checkpoint_commit_pending` exists, calling `ack(lastAckEventId = deliveryWatermark)` is rejected by the DAO (the wrapper refuses to advance past `deliveryBase` until commit clears pending).
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:connectedDebugAndroidTest --tests "*RoomProjectionTest*"`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement entities and DAOs**
+
+Entities: `SessionEntity`, `MessageEntity` (with `historyItemId`/`sourceIdsJson`/`status`), `CommandEventEntity`, `PendingCommandEventEntity`, `DeviceSessionEntity`, `CheckpointCommitPendingEntity`, `ConnectionStateEntity`. DAOs wrap multi-step operations in `@Transaction`. `Converters.kt` handles `Long`/JSON/`Instant`.
+
+- [ ] **Step 4: Run verification**
+
+Run: `./android/gradlew -p android app:connectedDebugAndroidTest --tests "*RoomProjectionTest*"`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add android/app/src/main/java/dev/clauderemote/android/data android/app/src/androidTest/java/dev/clauderemote/android/data
+git commit -m "feat(android): add room database with atomic projection daos"
+```
+
+### Task 28: Keystore ECDSA P-256 manager with capability probe
+
+**Files:**
+- Create: `android/app/src/main/java/dev/clauderemote/android/security/DeviceKeyManager.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/security/SigningBytes.kt`
+- Test: `android/app/src/androidTest/java/dev/clauderemote/android/security/DeviceKeyManagerTest.kt`
+- Test: `android/app/src/test/java/dev/clauderemote/android/security/SigningBytesTest.kt`
+- Spec reference: §4 (capability probe), §10.3.
+
+- [ ] **Step 1: Write failing JVM signing-bytes tests**
+
+Assert `buildSigningBytes()` produces the same bytes as `contracts/v1/auth-signing-fixture.json`, including the ASCII tag, the 0x00 separator, big-endian length prefixes, and the trailing 32-byte challenge. Mirror the TypeScript helper exactly.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*SigningBytesTest*"`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement `SigningBytes.kt`**
+
+Pure JVM code, identical algorithm to `bridge/src/auth/signing-bytes.ts`. Validate against the fixture.
+
+- [ ] **Step 4: Write failing instrumented capability tests**
+
+Assert on a real device:
+
+1. `ensureDeviceKey()` generates a non-exportable P-256 keypair via Android Keystore with `setUserAuthenticationRequired(false)` and `PURPOSE_SIGN`.
+2. The key refuses export via `getKeyProperties()` (`isInsideSecureHardware()` is allowed to be false but `isUserAuthenticationRequirementEnforcedBySecureHardware()` is best-effort).
+3. On devices where P-256 generation fails, the probe surfaces `DeviceUnsupportedError` and never falls back to a software key.
+4. `sign(signingBytes)` returns a DER `SHA256withECDSA` signature verifiable by a Java `Signature` checker using the public part.
+
+- [ ] **Step 5: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:connectedDebugAndroidTest --tests "*DeviceKeyManagerTest*"`
+Expected: FAIL.
+
+- [ ] **Step 6: Implement `DeviceKeyManager.kt`**
+
+Use `KeyStore.getInstance("AndroidKeyStore")`, `KeyPairGenerator.getInstance("EC", "AndroidKeyStore")` with `ECParameterSpec` set to `prime256v1`. Compute deviceId as `Base64.encodeToString(SHA-256(spkiDer), URL_SAFE | NO_PADDING | NO_WRAP)`.
+
+- [ ] **Step 7: Run verification**
+
+Run: `./android/gradlew -p android app:connectedDebugAndroidTest --tests "*DeviceKeyManagerTest*"`
+Expected: PASS on devices that meet §4; otherwise `DeviceUnsupportedError` is acceptable and must block pairing UI.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add android/app/src/main/java/dev/clauderemote/android/security android/app/src/androidTest/java/dev/clauderemote/android/security android/app/src/test/java/dev/clauderemote/android/security
+git commit -m "feat(android): add p-256 keystore manager and signing bytes"
+```
+
+### Task 29: OAuth and device-session managers
+
+**Files:**
+- Create: `android/app/src/main/java/dev/clauderemote/android/auth/OAuthManager.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/auth/DeviceSessionManager.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/auth/EncryptedTokenStore.kt`
+- Test: `android/app/src/test/java/dev/clauderemote/android/auth/OAuthManagerTest.kt`
+- Test: `android/app/src/androidTest/java/dev/clauderemote/android/auth/DeviceSessionManagerTest.kt`
+- Spec reference: §10.2, §10.3.
+
+- [ ] **Step 1: Write failing OAuth tests**
+
+Assert: PKCE S256 verifier and challenge derive correctly; `state` is 128-bit random; discovery hits `/.well-known/oauth-authorization-server`; dynamic registration uses no `client_secret`; redirect URI is the verified App Link; refresh serializes through a mutex.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*OAuthManagerTest*"`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement `OAuthManager.kt`**
+
+Use AppAuth-Android `AuthorizationService` and `TokenRequest`. Store refresh token encrypted with a Keystore-protected AES key (Tink or `MasterKey` from `androidx.security.crypto`). The probe-only `CF_Authorization` cookie is never read.
+
+- [ ] **Step 4: Write failing device-session tests**
+
+Assert: challenge request returns `{challengeId, challengeRaw, accessSubject}`; the device signs exactly the bytes received; `accessSubject` echoed back byte-for-byte; refresh requires a fresh signature; 15-minute token cached in `EncryptedTokenStore`; expired token triggers refresh; refresh failure surfaces re-login UI.
+
+- [ ] **Step 5: Implement `DeviceSessionManager.kt`**
+
+Wraps `OAuthManager` + `DeviceKeyManager` + `OkHttpClient` to Bridge endpoints. Exposes `getValidDeviceSessionToken()` that always returns a non-expired opaque token, refreshing via fresh challenge signature when within the last 60 seconds of validity.
+
+- [ ] **Step 6: Run verification**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*OAuthManagerTest*"`
+Run: `./android/gradlew -p android app:connectedDebugAndroidTest --tests "*DeviceSessionManagerTest*"`
+Expected: PASS.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add android/app/src/main/java/dev/clauderemote/android/auth android/app/src/test/java/dev/clauderemote/android/auth android/app/src/androidTest/java/dev/clauderemote/android/auth
+git commit -m "feat(android): add oauth and device session managers"
+```
+
+### Task 30: HTTP and WebSocket transport with reconnect
+
+**Files:**
+- Create: `android/app/src/main/java/dev/clauderemote/android/network/BridgeApi.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/network/BridgeWebSocket.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/network/ConnectionCoordinator.kt`
+- Test: `android/app/src/test/java/dev/clauderemote/android/network/ConnectionCoordinatorTest.kt`
+- Spec reference: §8.1, §11.1.
+
+- [ ] **Step 1: Write failing tests**
+
+Assert:
+
+1. Every HTTP request adds `Authorization: Bearer <access>` and `X-Claude-Remote-Device-Session: <token>`.
+2. WebSocket Upgrade uses the same two headers and `Sec-WebSocket-Protocol: claude-remote.v1`.
+3. Reconnect uses exponential backoff with jitter; on `4401` triggers OAuth refresh + device-session refresh before reconnecting.
+4. Reconnect posts the last continuous `eventId` per session.
+5. `4410` invokes the SnapshotCoordinator instead of normal ACK.
+6. Token refresh and reconnect serialize so two simultaneous reconnects cannot interleave.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*ConnectionCoordinatorTest*"`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the transport**
+
+Use OkHttp `WebSocketListener`. `ConnectionCoordinator` is the single point that owns the active socket lifecycle, expose `send(command)` and `events(): Flow<PersistedEvent>`. Use a `Mutex` to serialize refresh/reconnect.
+
+- [ ] **Step 4: Run verification**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*ConnectionCoordinatorTest*"`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add android/app/src/main/java/dev/clauderemote/android/network android/app/src/test/java/dev/clauderemote/android/network
+git commit -m "feat(android): add http/websocket transport and reconnect"
+```
+
+### Task 31: Event reducer, repository, and SnapshotCoordinator
+
+**Files:**
+- Create: `android/app/src/main/java/dev/clauderemote/android/sync/EventReducer.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/sync/SnapshotCoordinator.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/data/SessionRepository.kt`
+- Test: `android/app/src/test/java/dev/clauderemote/android/sync/EventReducerTest.kt`
+- Test: `android/app/src/androidTest/java/dev/clauderemote/android/sync/SnapshotCoordinatorTest.kt`
+- Spec reference: §6.7, §8.4, §8.5.
+
+- [ ] **Step 1: Write failing reducer tests**
+
+Assert every event type updates Room correctly: `session.state.changed`, `command.status.changed`, `assistant.message.delta`/`.completed`, `tool.started`/`.output.delta`/`.completed`, `permission.requested`/`.resolved`, `session.interrupted`, `session.failed`. Assert duplicate `eventId` is ignored, and out-of-order delivery waits unless higher events are checkpoint-superseded.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*EventReducerTest*"`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the reducer**
+
+`EventReducer.apply(tx, event)` runs inside a Room transaction. Stable source ID upsert prevents duplicates between snapshot and live events.
+
+- [ ] **Step 4: Write failing snapshot coordinator tests**
+
+Assert the full two-phase recovery from §6.7:
+
+1. On `4410`, call `snapshot.begin`. Page through all items into a temporary buffer while buffering live events with `eventId > deliveryWatermark`.
+2. Generate a stable commit `idempotencyKey` and write `checkpoint_commit_pending` in the same Room transaction as the history/command/session/permission projection.
+3. While pending exists, normal ACK refuses to advance past `deliveryBase`.
+4. Call `snapshot.commit` with the original key; on success clear pending and apply buffered events in order.
+5. If the App crashes before commit, on restart detect pending and retry the same commit; `410` invalidates the projection and starts a new `begin`.
+
+- [ ] **Step 5: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:connectedDebugAndroidTest --tests "*SnapshotCoordinatorTest*"`
+Expected: FAIL.
+
+- [ ] **Step 6: Implement `SnapshotCoordinator.kt`**
+
+Use the HTTP client and DAOs from earlier tasks. `pending` is consulted before every reconnect/event consumption cycle.
+
+- [ ] **Step 7: Run verification**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*EventReducerTest*"`
+Run: `./android/gradlew -p android app:connectedDebugAndroidTest --tests "*SnapshotCoordinatorTest*"`
+Expected: PASS.
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add android/app/src/main/java/dev/clauderemote/android/sync android/app/src/main/java/dev/clauderemote/android/data/SessionRepository.kt android/app/src/test/java/dev/clauderemote/android/sync android/app/src/androidTest/java/dev/clauderemote/android/sync
+git commit -m "feat(android): add event reducer and crash-safe snapshot coordinator"
+```
+
+### Task 32: Compose UI shells with fake repositories
+
+**Files:**
+- Create: `android/app/src/main/java/dev/clauderemote/android/ui/connection/ConnectionScreen.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/ui/sessions/SessionListScreen.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/ui/conversation/ConversationScreen.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/ui/permission/PermissionSheet.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/ui/import_/ImportSessionScreen.kt`
+- Create: `android/app/src/main/java/dev/clauderemote/android/ui/ViewModel.kt`
+- Test: `android/app/src/test/java/dev/clauderemote/android/ui/ConversationViewModelTest.kt`
+- Spec reference: §12.
+
+- [ ] **Step 1: Write failing ViewModel tests**
+
+Assert against fake `SessionRepository`:
+
+1. Messages render with status badges (accepted/dispatching/dispatched/indeterminate/interrupted/completed/failed).
+2. `indeterminate` exposes a single Safe Retry action; `interrupted` exposes Resume + send-continue.
+3. Idle state enables Send; non-idle disables Send.
+4. Permission sheet default focus is not Allow; Allow and Deny are spaced apart.
+5. Stop and Release are distinct buttons; Release only enabled in idle/interrupted.
+6. Refresh-expiry warning appears when Access or device session nears expiry.
+
+- [ ] **Step 2: Run tests to verify failure**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*ViewModel*"`
+Expected: FAIL.
+
+- [ ] **Step 3: Implement the screens**
+
+Use Material 3, dark-first theming. Wire navigation through a single-activity Compose nav graph. ViewModel uses `StateFlow<UiState>` and is independent of Android framework types so it can be tested on JVM.
+
+- [ ] **Step 4: Run verification**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest --tests "*ViewModel*"`
+Expected: PASS.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add android/app/src/main/java/dev/clauderemote/android/ui android/app/src/test/java/dev/clauderemote/android/ui
+git commit -m "feat(android): add compose ui shells and viewmodels"
+```
+
+### Task 33: Wire app end-to-end and instrumented verification
+
+**Files:**
+- Modify: `android/app/src/main/java/dev/clauderemote/android/ClaudeRemoteApp.kt`
+- Modify: `android/app/src/main/java/dev/clauderemote/android/ui/MainActivity.kt`
+- Test: `android/app/src/androidTest/java/dev/clauderemote/android/E2eFlowTest.kt`
+- Spec reference: full.
+
+- [ ] **Step 1: Write failing end-to-end instrumented test against a fake local server**
+
+Assert: pairing, OAuth login, session create/resume, message send → status transitions → assistant message render, permission prompt → allow executes once, deny stops the turn, disconnect → reconnect replays unacked events, `4410` triggers snapshot recovery, app backgrounded → foregrounded preserves state.
+
+- [ ] **Step 2: Wire composition root**
+
+`ClaudeRemoteApp` builds the dependency graph (Keystore, OAuth, transport, Room, repository, snapshot coordinator). `MainActivity` renders the nav graph.
+
+- [ ] **Step 3: Run all Android verification**
+
+Run: `./android/gradlew -p android app:testDebugUnitTest app:connectedDebugAndroidTest app:assembleDebug`
+Expected: PASS, producing a debug APK.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add android/app
+git commit -m "feat(android): wire end-to-end flow and instrumented verification"
+```
