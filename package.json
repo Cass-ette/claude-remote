@@ -1,0 +1,22 @@
+{
+  "name": "claude-remote",
+  "private": true,
+  "type": "module",
+  "workspaces": [],
+  "scripts": {
+    "test:root": "vitest run probes/run-phase0.test.ts",
+    "test:workspaces": "npm run test --workspaces --if-present",
+    "test": "npm run test:root && npm run test:workspaces",
+    "typecheck:root": "tsc -p tsconfig.json --noEmit",
+    "typecheck:workspaces": "npm run typecheck --workspaces --if-present",
+    "typecheck": "npm run typecheck:root && npm run typecheck:workspaces",
+    "phase0": "tsx probes/run-phase0.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "ajv": "^8.17.1",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}
