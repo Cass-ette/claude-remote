@@ -2,7 +2,7 @@
   "name": "claude-remote",
   "private": true,
   "type": "module",
-  "workspaces": [],
+  "workspaces": ["probes/claude-code"],
   "scripts": {
     "test:root": "vitest run probes/run-phase0.test.ts",
     "test:workspaces": "npm run test --workspaces --if-present",
