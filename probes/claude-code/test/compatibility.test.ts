@@ -18,8 +18,9 @@
 //   * permission allow executes the target tool exactly once;
 //   * permission deny and a five-second permission timeout both execute the
 //     target zero times and close failure;
-//   * killing ONLY the permission server (target server stays up) still
-//     prevents target execution and fails closed;
+//   * the permission MCP adapter exiting mid-session (stdio pipe closes) while
+//     the target server stays alive still prevents target execution and fails
+//     closed;
 //   * a terminal `result` event is observed.
 //
 // Check details are written to a temporary JSON file (NOT the final evidence
@@ -67,7 +68,14 @@ async function readEventLog(path: string): Promise<ProbeEvent[]> {
 
 async function writeMcpConfig(
   dir: string,
-  opts: { targetTool: string; nonce: string; eventLog: string; decision: "allow" | "deny"; hangMs?: number }
+  opts: {
+    targetTool: string;
+    nonce: string;
+    eventLog: string;
+    decision: "allow" | "deny";
+    hangMs?: number;
+    exitAfterPromptMs?: number;
+  }
 ): Promise<string> {
   const probeModule = resolve(import.meta.dirname, "../src/permission-probe-server.ts");
   const cfg = {
@@ -99,6 +107,9 @@ async function writeMcpConfig(
           "--decision",
           opts.decision,
           ...(opts.hangMs ? ["--hang-ms", String(opts.hangMs)] : []),
+          ...(opts.exitAfterPromptMs
+            ? ["--exit-after-prompt-ms", String(opts.exitAfterPromptMs)]
+            : []),
           "--event-log",
           opts.eventLog,
           "--server-name",
@@ -127,7 +138,6 @@ async function runScenario(opts: {
   sessionId: string;
   promptText: string;
   permissionTool: string;
-  killPermissionAfterMs?: number;
   drainTimeoutMs?: number;
 }): Promise<ScenarioResult> {
   const client = new ClaudeStreamClient();
@@ -148,15 +158,6 @@ async function runScenario(opts: {
   const events = client.events();
   const observed: unknown[] = [];
   let sawTerminalResult = false;
-  let killTimer: NodeJS.Timeout | null = null;
-  if (opts.killPermissionAfterMs !== undefined) {
-    killTimer = setTimeout(() => {
-      // Killing the permission MCP adapter is done by Claude Code itself; we
-      // approximate the failure mode by sending SIGTERM to the permission
-      // server via its event-log convention (the gate records this). Real
-      // adapter crashes surface as no further permission prompts resolving.
-    }, opts.killPermissionAfterMs);
-  }
 
   const deadline = Date.now() + (opts.drainTimeoutMs ?? 30000);
   const drain: Promise<void> = (async () => {
@@ -174,7 +175,6 @@ async function runScenario(opts: {
     setTimeout(() => resolve("timeout"), opts.drainTimeoutMs ?? 30000)
   );
   await Promise.race([drain, timeout]);
-  if (killTimer) clearTimeout(killTimer);
   try {
     await client.closeInput();
   } catch {
@@ -274,16 +274,17 @@ describe.skipIf(!RUN)("claude code real CLI compatibility", () => {
     });
     expect(timeoutRun.targetInvocations).toBe(0);
 
-    // -------- Scenario 4: ADAPTER EXIT (permission server killed, target alive) --------
-    // Modeled here by leaving target healthy but configuring permission to
-    // hang; Claude Code treats the unresponsive adapter the same way as a
-    // crashed one — fail closed.
+    // -------- Scenario 4: ADAPTER EXIT (permission server exits mid-session, target alive) --------
+    // The permission server records `permission_prompted`, then cleanly exits
+    // a short moment later (closing its MCP stdio pipe). The target server is
+    // a separate process and stays alive. Claude Code must observe the closed
+    // permission pipe, fail closed, and never invoke the target tool.
     const adapterExitConfig = await writeMcpConfig(cwd, {
       targetTool,
       nonce: randomUUID(),
       eventLog: eventLogAdapterExit,
       decision: "allow",
-      hangMs: 60000
+      exitAfterPromptMs: 500
     });
     const adapterExit = await runScenario({
       cwd,
@@ -295,6 +296,10 @@ describe.skipIf(!RUN)("claude code real CLI compatibility", () => {
       drainTimeoutMs: 10000
     });
     expect(adapterExit.targetInvocations).toBe(0);
+    expect(
+      adapterExit.events.some((e) => e.kind === "permission_prompted"),
+      "permission must be prompted before adapter exits"
+    ).toBe(true);
 
     // -------- Transcript stabilization + UUID replay count --------
     const transcript = await stabilizeAndRead(sessionId, { timeoutMs: 15000 });

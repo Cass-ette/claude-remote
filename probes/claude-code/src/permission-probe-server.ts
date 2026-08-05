@@ -42,6 +42,13 @@ export interface ProbeOptions {
   decision?: "allow" | "deny" | undefined;
   /** Permission role only: when set, never respond (simulate a hung broker). */
   hangMs?: number | undefined;
+  /**
+   * Permission role only: when set, exit the server cleanly (code 0) this many
+   * ms after recording `permission_prompted`. This closes the MCP stdio pipe
+   * from the server side — the observable Claude Code sees when its MCP
+   * adapter crashes mid-session.
+   */
+  exitAfterPromptMs?: number | undefined;
   /** Shared event log path. */
   eventLog: string;
   /** Server name as it appears in mcp-config (e.g. `claude_remote_probe`). */
@@ -54,6 +61,7 @@ interface ParsedArgs {
   nonce?: string | undefined;
   decision?: "allow" | "deny" | undefined;
   hangMs?: number | undefined;
+  exitAfterPromptMs?: number | undefined;
   eventLog: string;
   serverName: string;
 }
@@ -87,6 +95,10 @@ export function parseProbeArgs(argv: readonly string[]): ParsedArgs {
       if (!next) throw new Error("--hang-ms requires a value");
       out.hangMs = Number(next);
       i++;
+    } else if (a === "--exit-after-prompt-ms") {
+      if (!next) throw new Error("--exit-after-prompt-ms requires a value");
+      out.exitAfterPromptMs = Number(next);
+      i++;
     } else if (a === "--event-log") {
       if (!next) throw new Error("--event-log requires a value");
       out.eventLog = next;
@@ -98,7 +110,8 @@ export function parseProbeArgs(argv: readonly string[]): ParsedArgs {
     } else if (a === "--help" || a === "-h") {
       process.stdout.write(
         "usage: --role target|permission [--tool-name N] [--nonce V] " +
-          "[--decision allow|deny] [--hang-ms N] --event-log PATH --server-name N\n"
+          "[--decision allow|deny] [--hang-ms N] [--exit-after-prompt-ms N] " +
+          "--event-log PATH --server-name N\n"
       );
       process.exit(0);
     } else {
@@ -127,7 +140,7 @@ const PermissionInput = z.object({
   input: z.unknown().optional()
 });
 
-async function runTarget(opts: Required<Omit<ProbeOptions, "decision" | "hangMs">>): Promise<void> {
+async function runTarget(opts: Required<Omit<ProbeOptions, "decision" | "hangMs" | "exitAfterPromptMs">>): Promise<void> {
   const server = new Server(
     { name: opts.serverName, version: "0.0.0" },
     { capabilities: { tools: {} } }
@@ -184,6 +197,7 @@ async function runPermission(
     serverName: string;
     decision?: "allow" | "deny" | undefined;
     hangMs?: number | undefined;
+    exitAfterPromptMs?: number | undefined;
   }
 ): Promise<void> {
   const server = new Server(
@@ -226,6 +240,14 @@ async function runPermission(
       tool: toolName
     });
 
+    if (opts.exitAfterPromptMs !== undefined && opts.exitAfterPromptMs > 0) {
+      // Simulate a mid-session MCP adapter crash: schedule a clean exit so the
+      // MCP stdio pipe closes from the server side. The compatibility gate
+      // asserts that Claude Code observes the closed pipe and fails closed,
+      // without ever invoking the target tool.
+      setTimeout(() => process.exit(0), opts.exitAfterPromptMs);
+    }
+
     if (opts.hangMs !== undefined && opts.hangMs > 0) {
       // Simulate a hung permission broker: never respond. The compatibility
       // gate's five-second timeout will fire and assert fail-closed.
@@ -254,7 +276,8 @@ async function runPermission(
     kind: "permission_started",
     server: opts.serverName,
     decision: opts.decision ?? "(unset)",
-    hangMs: opts.hangMs ?? 0
+    hangMs: opts.hangMs ?? 0,
+    exitAfterPromptMs: opts.exitAfterPromptMs ?? 0
   });
 }
 
@@ -274,7 +297,8 @@ export async function runProbeServer(opts: ProbeOptions): Promise<void> {
       eventLog: opts.eventLog,
       serverName: opts.serverName,
       decision: opts.decision,
-      hangMs: opts.hangMs
+      hangMs: opts.hangMs,
+      exitAfterPromptMs: opts.exitAfterPromptMs
     });
   }
 }
