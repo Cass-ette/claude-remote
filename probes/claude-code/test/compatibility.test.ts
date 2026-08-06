@@ -126,6 +126,8 @@ async function writeMcpConfig(
 interface ScenarioResult {
   events: ProbeEvent[];
   observedFrames: unknown[];
+  requestUuid: string;
+  secondTurnSent: boolean;
   sawTerminalResult: boolean;
   targetInvocations: number;
   permissionPrompts: number;
@@ -139,6 +141,11 @@ async function runScenario(opts: {
   promptText: string;
   permissionTool: string;
   drainTimeoutMs?: number;
+  // When true, after the first `result` is observed the scenario sends a
+  // second user turn with a fresh UUID and waits for a second `result`.
+  // Only the `allow` path needs this: it requires Claude to actually run
+  // to completion on turn 1 before turn 2 is sent.
+  sendSecondTurn?: boolean;
 }): Promise<ScenarioResult> {
   const client = new ClaudeStreamClient();
   await client.startCreate(
@@ -158,6 +165,7 @@ async function runScenario(opts: {
   const events = client.events();
   const observed: unknown[] = [];
   let sawTerminalResult = false;
+  let secondTurnSent = false;
 
   const deadline = Date.now() + (opts.drainTimeoutMs ?? 30000);
   const drain: Promise<void> = (async () => {
@@ -166,6 +174,23 @@ async function runScenario(opts: {
       const e = ev as { type?: string; subtype?: string };
       if (e.type === "result") {
         sawTerminalResult = true;
+        // Send a second turn after the first result, then keep draining
+        // until the second result arrives (or the deadline elapses).
+        if (opts.sendSecondTurn && !secondTurnSent) {
+          secondTurnSent = true;
+          try {
+            await client.sendCandidateUser(
+              randomUUID(),
+              opts.sessionId,
+              "What did I just ask?"
+            );
+          } catch {
+            // stdin may have closed; treat as no second turn.
+            secondTurnSent = false;
+          }
+          if (Date.now() > deadline) return;
+          continue;
+        }
         return;
       }
       if (Date.now() > deadline) return;
@@ -185,6 +210,8 @@ async function runScenario(opts: {
   return {
     events: allEvents,
     observedFrames: observed,
+    requestUuid,
+    secondTurnSent,
     sawTerminalResult,
     targetInvocations: allEvents.filter((e) => e.kind === "target_invocation").length,
     permissionPrompts: allEvents.filter((e) => e.kind === "permission_prompted").length
@@ -217,7 +244,8 @@ describe.skipIf(!RUN)("claude code real CLI compatibility", () => {
       sessionId,
       promptText: `Call the MCP tool named ${targetTool} exactly once with nonce="${nonceAllow}". Do not call any other tool.`,
       permissionTool: "mcp__claude_remote_permission__decide",
-      drainTimeoutMs: 60000
+      drainTimeoutMs: 60000,
+      sendSecondTurn: true
     });
 
     const initFrame = allow.observedFrames.find(
@@ -335,8 +363,12 @@ describe.skipIf(!RUN)("claude code real CLI compatibility", () => {
     const checks = {
       candidate_input_supported: true,
       init_id_matches: initFrame?.session_id === sessionId,
-      replay_uuid_observed: allow.events.some((e) => e.kind === "target_invocation"),
-      two_live_turns: allow.observedFrames.length >= 3,
+      replay_uuid_observed: allow.observedFrames.some(
+        (f: any) => f && f.type === "user" && f.uuid === allow.requestUuid
+      ),
+      two_live_turns:
+        allow.secondTurnSent &&
+        allow.observedFrames.filter((f: any) => f && f.type === "result").length >= 2,
       clean_stdin_close: true,
       resume_reattaches: resumeTranscript !== null,
       duplicate_uuid_count_one: replayCount <= 1,
