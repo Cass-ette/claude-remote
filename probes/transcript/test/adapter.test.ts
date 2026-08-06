@@ -99,15 +99,25 @@ describe("transcript adapter — deterministic fixtures", () => {
       );
       expect(sawPartial).toBe(false);
 
-      // The result record should be present (it is the last complete record).
-      const hasResult = fullItems.some(
+      // The result record must be materialized as a `system` item. The
+      // trailing partial assistant line is excluded by the byte-boundary
+      // trim, but the result record (which precedes it) must be present.
+      const resultSystem = fullItems.find(
         (i) =>
           i.role === "system" &&
           i.contentBlocks.some(
             (b) => b.kind === "system_note" && b.text.includes("success")
           )
       );
-      expect(hasResult || fullItems.length > 0).toBe(true);
+      expect(resultSystem).toBeDefined();
+      expect(resultSystem!.sourceTranscriptOffset).toBeGreaterThan(0);
+
+      // No empty-content user items may leak through (tool-result wrappers
+      // must be filtered).
+      const emptyUser = fullItems.find(
+        (i) => i.role === "user" && i.contentBlocks.length === 0
+      );
+      expect(emptyUser).toBeUndefined();
     });
 
     it("metadata reports trailingPartialIgnored=true when a partial line exists", async () => {
@@ -211,6 +221,60 @@ describe("transcript adapter — deterministic fixtures", () => {
       const a = await transcriptAdapter.readMetadata(path, bytes.length);
       const b = await transcriptAdapter.readMetadata(path, bytes.length);
       expect(a).toEqual(b);
+    });
+  });
+
+  describe("result records materialize as system items; tool-result wrappers are filtered", () => {
+    it("materializes a success `result` record as a `system` item summarizing subtype", async () => {
+      const path = FIXTURE("complete.jsonl");
+      const bytes = await readFixture("complete.jsonl");
+      const items = await transcriptAdapter.readSnapshot(path, bytes.length);
+      const resultSystem = items.find(
+        (i) =>
+          i.role === "system" &&
+          i.contentBlocks.some(
+            (b) => b.kind === "system_note" && /^result: success/.test(b.text)
+          )
+      );
+      expect(resultSystem, "result-derived system item must be present").toBeDefined();
+      // The result record is the last line of complete.jsonl — its offset must
+      // be greater than every prior record's offset.
+      expect(resultSystem!.sourceTranscriptOffset).toBeGreaterThan(0);
+      // Sanity: a `tool` item from the wrapper's tool_result IS still present.
+      const tool = items.find((i) => i.role === "tool");
+      expect(tool).toBeDefined();
+    });
+
+    it("filters tool-result-wrapper `user` records so no empty-content user item leaks into the snapshot", async () => {
+      // complete.jsonl line 3 is a `user` record whose `message.content` is
+      // solely a `tool_result` block — a tool-result wrapper. The wrapper
+      // itself must NOT appear as an empty-content `user` item; the
+      // `tool_result` must still appear as a standalone `tool` item.
+      const path = FIXTURE("complete.jsonl");
+      const bytes = await readFixture("complete.jsonl");
+      const items = await transcriptAdapter.readSnapshot(path, bytes.length);
+      const wrapperUuid = "aaaaaaaa-0000-4000-8000-000000000004";
+      const wrapperUserItem = items.find(
+        (i) => i.historyItemId === wrapperUuid && i.role === "user"
+      );
+      expect(
+        wrapperUserItem,
+        "tool-result-wrapper user record must not be emitted as a user item"
+      ).toBeUndefined();
+      // No user item may carry empty contentBlocks at all.
+      const emptyUser = items.find(
+        (i) => i.role === "user" && i.contentBlocks.length === 0
+      );
+      expect(emptyUser).toBeUndefined();
+      // The tool_result itself is still materialized.
+      const toolItem = items.find((i) =>
+        i.contentBlocks.some(
+          (b) =>
+            b.kind === "tool_result" &&
+            b.toolUseId === "toolu_aaaaaaaa-0000-4000-8000-000000000003"
+        )
+      );
+      expect(toolItem).toBeDefined();
     });
   });
 });

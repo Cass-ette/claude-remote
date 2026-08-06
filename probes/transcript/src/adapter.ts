@@ -138,13 +138,25 @@ function toHistoryItems(rec: ParsedRecord): HistoryItem[] {
       | { content?: unknown }
       | undefined;
     const blocks = normalizeContent(msg?.content);
-    items.push({
-      historyItemId: uuid ?? `offset-${baseOffset}`,
-      role: "user",
-      contentBlocks: blocks.userBlocks,
-      createdAt,
-      sourceTranscriptOffset: baseOffset
-    });
+    // A `user` record whose content is solely `tool_result` blocks is a
+    // tool-result wrapper (part of an in-flight assistant turn). Such records
+    // carry no user-authored text or tool_use, and `normalizeContent` already
+    // surfaces each `tool_result` as a standalone `tool` item below, so the
+    // wrapper itself contributes no `user` item. Skip it to avoid leaking an
+    // empty-content `user` item into the snapshot.
+    const isWrapper =
+      blocks.toolResults.length > 0 &&
+      blocks.userBlocks.length === 0 &&
+      blocks.toolUses.length === 0;
+    if (!isWrapper) {
+      items.push({
+        historyItemId: uuid ?? `offset-${baseOffset}`,
+        role: "user",
+        contentBlocks: blocks.userBlocks,
+        createdAt,
+        sourceTranscriptOffset: baseOffset
+      });
+    }
     for (const tr of blocks.toolResults) {
       items.push({
         historyItemId: tr.toolUseId,
@@ -185,11 +197,11 @@ function toHistoryItems(rec: ParsedRecord): HistoryItem[] {
         sourceTranscriptOffset: baseOffset
       });
     }
-  } else if (obj.type === "system" || obj.type === "result") {
-    const text = obj.type === "system"
-      ? asString((rec.json as { content?: unknown }).content) ??
-        asString((rec.json as { subtype?: unknown }).subtype) ?? ""
-      : "";
+  } else if (obj.type === "system") {
+    const text =
+      asString((rec.json as { content?: unknown }).content) ??
+      asString((rec.json as { subtype?: unknown }).subtype) ??
+      "";
     if (text) {
       items.push({
         historyItemId: `offset-${baseOffset}`,
@@ -199,6 +211,26 @@ function toHistoryItems(rec: ParsedRecord): HistoryItem[] {
         sourceTranscriptOffset: baseOffset
       });
     }
+  } else if (obj.type === "result") {
+    // Materialize the terminal `result` record as a `system` item so snapshot
+    // consumers get a turn-completion marker. The text summarizes `subtype`
+    // (e.g. "success", "error", "failure_max_turns") and notes `is_error` when
+    // present. This is a real history item, NOT a tool-result wrapper, and
+    // must not be filtered by `isToolResultWrapper`-style checks (which only
+    // apply to `user` records).
+    const subtype = asString((rec.json as { subtype?: unknown }).subtype);
+    const isError = (rec.json as { is_error?: unknown }).is_error === true;
+    const parts: string[] = ["result"];
+    if (subtype) parts.push(subtype);
+    if (isError) parts.push("is_error");
+    const text = parts.join(": ");
+    items.push({
+      historyItemId: `offset-${baseOffset}`,
+      role: "system",
+      contentBlocks: [{ kind: "system_note", text }],
+      createdAt,
+      sourceTranscriptOffset: baseOffset
+    });
   }
   return items;
 }
