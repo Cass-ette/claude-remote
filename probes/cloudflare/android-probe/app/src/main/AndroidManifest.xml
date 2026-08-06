@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <application
+        android:allowBackup="false"
+        android:label="Claude Remote Probe"
+        android:supportsRtl="true">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+              Verified HTTPS App Link for the probe hostname. The actual host
+              is substituted at build time via manifestPlaceholders or kept as
+              a placeholder here; the real verification happens via
+              `adb shell pm verify-app-links` at runtime.
+              The SHA-256 fingerprint configured on the Cloudflare side must
+              match the signing certificate of THIS APK.
+            -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https"
+                      android:host="${probeHostname}"
+                      android:pathPattern="/.*" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Receiver that lets the runner signal "Tunnel has been stopped, retry
+          HTTP and WebSocket with your refreshed bearer, then write final
+          evidence". The instrumented test waits for this broadcast.
+        -->
+        <receiver
+            android:name=".TunnelStoppedReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="dev.clauderemote.probe.ACTION_TUNNEL_STOPPED" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

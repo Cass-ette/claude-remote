@@ -1,0 +1,10 @@
+# Gradle / Android Studio build outputs
+.gradle/
+build/
+local.properties
+*.iml
+.idea/
+
+# Runner-local barrier / pulled-evidence temp files
+.barrier-ready
+.cloudflare-gate.json
