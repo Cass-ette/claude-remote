@@ -1,0 +1,3 @@
+{"type":"user","uuid":"bbbbbbbb-0000-4000-8000-000000000001","timestamp":"2026-08-01T11:00:00.000Z","sessionId":"bbbbbbbb-0000-4000-8000-000000000099","cwd":"/fake/project/demo","message":{"role":"user","content":[{"type":"text","text":"Please fail this turn"}]}}
+{"type":"assistant","uuid":"bbbbbbbb-0000-4000-8000-000000000002","timestamp":"2026-08-01T11:00:01.000Z","sessionId":"bbbbbbbb-0000-4000-8000-000000000099","cwd":"/fake/project/demo","message":{"role":"assistant","content":[{"type":"text","text":"Unable to proceed."}]}}
+{"type":"result","subtype":"error","is_error":true,"duration_ms":1500,"result":"command exited 1","timestamp":"2026-08-01T11:00:01.500Z","session_id":"bbbbbbbb-0000-4000-8000-000000000099"}

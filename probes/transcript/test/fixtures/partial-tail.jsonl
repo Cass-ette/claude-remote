@@ -1,0 +1,4 @@
+{"type":"user","uuid":"dddddddd-0000-4000-8000-000000000001","timestamp":"2026-08-01T13:00:00.000Z","sessionId":"dddddddd-0000-4000-8000-000000000099","cwd":"/fake/project/demo","message":{"role":"user","content":[{"type":"text","text":"Tail truncation test"}]}}
+{"type":"assistant","uuid":"dddddddd-0000-4000-8000-000000000002","timestamp":"2026-08-01T13:00:01.000Z","sessionId":"dddddddd-0000-4000-8000-000000000099","cwd":"/fake/project/demo","message":{"role":"assistant","content":[{"type":"text","text":"Done."}]}}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":500,"result":"Done.","timestamp":"2026-08-01T13:00:01.500Z","session_id":"dddddddd-0000-4000-8000-000000000099"}
+{"type":"assistant","uuid":"dddddddd-0000-4000-8000-000000000003","timestamp":"2026-08-01T13:00:02.000Z","sessionId":"dddddddd-0000-4000-8000-000000000099","cwd":"/fake/project/demo","message":{"role":"assistant","content":[{"type":"text","text":"PARTIAL_NO_NEWLINE

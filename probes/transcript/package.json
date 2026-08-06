@@ -1,0 +1,9 @@
+{
+  "name": "@claude-remote/probe-transcript",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  }
+}
