@@ -174,8 +174,9 @@ class OAuthConfigTest {
     @Test(expected = IllegalArgumentException::class)
     fun probeConfig_rejectsExpiryTooCloseToLogin() {
         val env = validEnvMap().toMutableMap()
-        // tokenExpiryTimeoutMs must exceed loginTimeoutMs + 120s
-        env["CF_TOKEN_EXPIRY_TIMEOUT_MS"] = "200000"
+        // tokenExpiryTimeoutMs must strictly exceed loginTimeoutMs + 120s
+        // (60000 + 120000 = 180000); 180000 is NOT strictly greater, so reject.
+        env["CF_TOKEN_EXPIRY_TIMEOUT_MS"] = "180000"
         ProbeConfig.fromEnv(env)
     }
 
@@ -227,7 +228,7 @@ class OAuthConfigTest {
 
     // -- helpers -------------------------------------------------------------
 
-    private fun androidUri(s: String): android.net.Uri = android.net.Uri.parse(s)
+    private fun androidUri(s: String): String = s
 
     private fun validEnvMap(): Map<String, String> = mapOf(
         "CF_PROBE_BASE_URL" to "https://probe.example.com",

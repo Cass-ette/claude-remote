@@ -22,6 +22,10 @@ android {
         // at install time, but the manifest placeholder default must be set
         // so the build does not fail.
         manifestPlaceholders["probeHostname"] = "probe.example.com"
+        // Required by the AppAuth library manifest merger
+        // (net.openid.appauth.RedirectUriReceiverActivity uses
+        // ${appAuthRedirectScheme} as the redirect URI scheme).
+        manifestPlaceholders["appAuthRedirectScheme"] = "dev.clauderemote.probe"
     }
 
     buildTypes {

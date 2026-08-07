@@ -75,7 +75,7 @@ class AccessFlowInstrumentedTest {
 
         // ---- 3-4. OAuth via App Link (driver lives in run-real-gate.ts). ----
         val callbackUri = waitForAppLinkCallback(loginTimeoutMs)
-        val response = OAuthCoordinator.parseAuthorizationResponse(callbackUri, state)
+        val response = OAuthCoordinator.parseAuthorizationResponse(callbackUri.toString(), state)
         assertTrue("code is non-blank", response.code.isNotBlank())
 
         // ---- 5-6. Bearer HTTP + bearer WebSocket Upgrade ----

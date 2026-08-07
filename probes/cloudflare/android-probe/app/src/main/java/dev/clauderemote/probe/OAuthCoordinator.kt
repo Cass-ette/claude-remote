@@ -1,6 +1,6 @@
 package dev.clauderemote.probe
 
-import android.net.Uri
+import java.net.URI
 import java.security.MessageDigest
 import java.security.SecureRandom
 import java.util.Locale
@@ -59,21 +59,27 @@ object OAuthCoordinator {
     /**
      * Validate that an inbound redirect matches the expected `state` and
      * carries a `code` query parameter. Throws on mismatch / failure.
+     *
+     * Accepts the redirect URI as a [String] (rather than `android.net.Uri`)
+     * so the parsing logic is exercised by plain JVM unit tests without
+     * Robolectric. Query parsing uses [java.net.URI], which is available on
+     * Android API 26+ (`minSdk = 28`) and on the JVM.
      */
     fun parseAuthorizationResponse(
-        redirectUri: Uri,
+        redirectUri: String,
         expectedState: String
     ): AuthorizationResponse {
-        val state = redirectUri.getQueryParameter("state")
+        val params = parseQueryParams(redirectUri)
+        val state = params["state"]
             ?: throw IllegalStateException("redirect missing state")
         if (!constantTimeEquals(state, expectedState)) {
             throw IllegalStateException("state mismatch")
         }
-        val error = redirectUri.getQueryParameter("error")
+        val error = params["error"]
         if (error != null) {
             throw IllegalStateException("authorization error: $error")
         }
-        val code = redirectUri.getQueryParameter("code")
+        val code = params["code"]
             ?: throw IllegalStateException("redirect missing code")
         return AuthorizationResponse(code = code, state = state)
     }
@@ -94,11 +100,31 @@ object OAuthCoordinator {
         return base64UrlEncode(digest)
     }
 
+    /**
+     * Parse the query string of [uriString] into a key->value map. Uses
+     * [java.net.URI] (not `android.net.Uri`) so this is JVM-test friendly.
+     * Values are URL-decoded.
+     */
+    private fun parseQueryParams(uriString: String): Map<String, String> {
+        val raw = URI(uriString).rawQuery ?: return emptyMap()
+        return raw.split('&')
+            .filter { it.isNotEmpty() }
+            .associate { pair ->
+                val idx = pair.indexOf('=')
+                if (idx < 0) {
+                    java.net.URLDecoder.decode(pair, Charsets.UTF_8.name()) to ""
+                } else {
+                    java.net.URLDecoder.decode(pair.substring(0, idx), Charsets.UTF_8.name()) to
+                        java.net.URLDecoder.decode(pair.substring(idx + 1), Charsets.UTF_8.name())
+                }
+            }
+    }
+
     private fun base64UrlEncode(bytes: ByteArray): String {
-        return android.util.Base64.encodeToString(
-            bytes,
-            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING
-        )
+        // java.util.Base64 is available on API 26+ (minSdk = 28), and unlike
+        // android.util.Base64 it is usable from JVM unit tests without
+        // Robolectric or returnDefaultValues mocking.
+        return java.util.Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
     }
 
     private fun ByteArray.toHex(): String {
