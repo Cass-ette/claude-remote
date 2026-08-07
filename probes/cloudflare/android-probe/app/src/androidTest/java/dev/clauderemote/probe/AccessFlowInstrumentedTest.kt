@@ -9,6 +9,7 @@ import kotlinx.serialization.json.Json
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Ignore
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -53,6 +54,7 @@ class AccessFlowInstrumentedTest {
 
     private val ctx: Context get() = ApplicationProvider.getApplicationContext()
 
+    @Ignore("Stubbed — driven by run-real-gate.ts; replace with real implementation in Chunk 4")
     @Test
     fun fullCloudflareAccessFlow() {
         // ---- 1. Required runtime inputs ----

@@ -44,12 +44,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { writeFile, mkdir, readFile, access, rm } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { hostname } from "node:os";
 import type { GateResult } from "../run-phase0.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const evidencePath = resolve(here, "../../build/phase0/cloudflare.json");
 const originDir = resolve(here, "origin");
+const originEvidenceFile = resolve(here, "origin/cloudflare-origin-evidence.json");
 
 const REQUIRED_ENV = [
   "CF_PROBE_BASE_URL",
@@ -216,13 +216,78 @@ async function main(): Promise<number> {
   }
 
   // 3. Start loopback origin (detached process group).
-  children.origin = spawn(
-    "npm",
-    ["run", "start", "--prefix", originDir],
-    { detached: true, stdio: ["ignore", "pipe", "pipe"] }
-  );
-  children.origin.stdout?.on("data", () => {});
+  //   The origin prints `ORIGIN_PORT=<n>` and `ORIGIN_EVIDENCE_FILE=<abs>`
+  //   on stdout once it's listening; we parse those to wire the gradle
+  //   child + evidence read paths.
+  const originEnv: NodeJS.ProcessEnv = {
+    ...process.env,
+    CF_ACCESS_TEAM_DOMAIN: env.CF_ACCESS_TEAM_DOMAIN,
+    CF_ACCESS_AUD: env.CF_ACCESS_AUD,
+    CF_EXPECTED_SUBJECT: env.CF_EXPECTED_SUBJECT,
+    CF_ORIGIN_PORT: "0",
+    CF_ORIGIN_EVIDENCE_FILE: originEvidenceFile,
+    CF_ORIGIN_BIND: "127.0.0.1"
+  };
+  children.origin = spawn("npm", ["run", "start", "--prefix", originDir], {
+    detached: true,
+    stdio: ["ignore", "pipe", "pipe"],
+    env: originEnv
+  });
+  let originStdoutBuf = "";
+  let originPort: number | null = null;
+  let originEvidenceParsed: string | null = null;
+  children.origin.stdout?.on("data", (b: Buffer) => {
+    originStdoutBuf += b.toString();
+    let idx: number;
+    while ((idx = originStdoutBuf.indexOf("\n")) >= 0) {
+      const line = originStdoutBuf.slice(0, idx).trim();
+      originStdoutBuf = originStdoutBuf.slice(idx + 1);
+      if (!line) continue;
+      const portMatch = /^ORIGIN_PORT=(\d+)$/.exec(line);
+      if (portMatch) {
+        originPort = parseInt(portMatch[1] as string, 10);
+      }
+      const evMatch = /^ORIGIN_EVIDENCE_FILE=(.*)$/.exec(line);
+      if (evMatch) {
+        originEvidenceParsed = (evMatch[1] as string).trim();
+      }
+    }
+  });
   children.origin.stderr?.on("data", () => {});
+
+  // Wait (bounded) for the origin handshake lines before spawning gradle,
+  // so the instrumented test gets a concrete CF_ORIGIN_PORT.
+  const originHandshakeDeadline = Date.now() + 15_000;
+  while (
+    (originPort === null || originEvidenceParsed === null) &&
+    Date.now() < originHandshakeDeadline &&
+    children.origin.exitCode === null
+  ) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (originPort === null || originEvidenceParsed === null) {
+    // Origin didn't come up in time. Skip to cleanup + emit failed.
+    killGroup(children.origin, "SIGTERM");
+    setTimeout(() => killGroup(children.origin, "SIGKILL"), 5000).unref();
+    await emit(
+      buildResult(
+        "failed",
+        [
+          {
+            name: "origin_handshake",
+            passed: false,
+            details: "origin did not emit ORIGIN_PORT / ORIGIN_EVIDENCE_FILE in time"
+          }
+        ],
+        { origin_started: false },
+        startedAt,
+        new Date().toISOString()
+      )
+    );
+    process.stderr.write("cloudflare gate: failed (origin handshake)\n");
+    return 0;
+  }
+  const originEvidenceAbs: string = originEvidenceParsed;
 
   // 4. Start cloudflared (detached process group).
   children.cloudflared = spawn(
@@ -245,6 +310,7 @@ async function main(): Promise<number> {
     CF_EXPECTED_SUBJECT: env.CF_EXPECTED_SUBJECT,
     MAC_LAN_IP: env.MAC_LAN_IP,
     CLOUDFLARED_CONFIG: cloudflaredConfigAbs,
+    CF_ORIGIN_PORT: String(originPort),
     CF_LOGIN_TIMEOUT_MS: env.CF_LOGIN_TIMEOUT_MS,
     CF_TOKEN_EXPIRY_TIMEOUT_MS: env.CF_TOKEN_EXPIRY_TIMEOUT_MS,
     CF_INSTRUMENTATION_TIMEOUT_MS: env.CF_INSTRUMENTATION_TIMEOUT_MS
@@ -260,12 +326,8 @@ async function main(): Promise<number> {
   const loginMs = parseInt(env.CF_LOGIN_TIMEOUT_MS, 10);
   const expiryMs = parseInt(env.CF_TOKEN_EXPIRY_TIMEOUT_MS, 10);
   const instrMs = parseInt(env.CF_INSTRUMENTATION_TIMEOUT_MS, 10);
-
-  const start = Date.now();
+  const deadlineMs = Math.min(overallMs, loginMs + expiryMs + instrMs + 60_000);
   let timedOut = false;
-  const overallTimer = setTimeout(() => {
-    timedOut = true;
-  }, Math.min(overallMs, loginMs + expiryMs + instrMs + 60_000));
 
   // 7. Wait for barrier file via adb polling.
   const barrierLocal = resolve(here, ".barrier-ready");
@@ -284,10 +346,7 @@ async function main(): Promise<number> {
       await writeFile(barrierLocal, r.stdout, "utf8");
       // Record the last origin request id (pulled from origin evidence file).
       try {
-        const evText = await readFile(
-          resolve(here, "origin/cloudflare-origin-evidence.json"),
-          "utf8"
-        );
+        const evText = await readFile(originEvidenceAbs, "utf8");
         const ev = JSON.parse(evText) as { httpRequestIds: string[]; wsRequestIds: string[] };
         const all = [...ev.httpRequestIds, ...ev.wsRequestIds];
         lastOriginRequestId = all[all.length - 1] ?? "";
@@ -312,91 +371,109 @@ async function main(): Promise<number> {
   }, 5000);
   barrierPoll.unref();
 
-  // 8. Await gradle child exit.
+  // 8. Await gradle child exit — but enforce the overall deadline. On
+  //    timeout, kill the gradle group and fall through to evidence
+  //    collection (which will record `failed` / `not_run`).
   const gradleExit: Promise<{ code: number | null; signal: NodeJS.Signals | null }> = new Promise((res) => {
     children.gradle?.on("exit", (code, signal) => res({ code, signal }));
     children.gradle?.on("error", () => res({ code: -1, signal: null }));
   });
-  const outcome = await gradleExit;
-  clearTimeout(overallTimer);
+  const deadlinePromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null; timedOut: true }>(
+    (res) => {
+      setTimeout(() => {
+        res({ code: null, signal: null, timedOut: true });
+      }, deadlineMs).unref();
+    }
+  );
+  const outcome = await Promise.race([gradleExit, deadlinePromise]);
+  if ("timedOut" in outcome && outcome.timedOut) {
+    timedOut = true;
+    killGroup(children.gradle, "SIGKILL");
+  }
   clearInterval(barrierPoll);
   const finishedAt = new Date().toISOString();
 
-  // 9. Cleanup — always kill all children + force-stop the app.
-  killGroup(children.gradle, "SIGKILL");
-  killGroup(children.origin, "SIGTERM");
-  setTimeout(() => killGroup(children.origin, "SIGKILL"), 5000).unref();
-  killGroup(children.cloudflared, "SIGKILL");
-  await forceStopApp(env.ANDROID_SERIAL);
-
-  // 10. Pull final evidence + verify.
   const gateLocal = resolve(here, ".cloudflare-gate.json");
-  const pulled = await pullFile(
-    env.ANDROID_SERIAL,
-    "/data/data/dev.clauderemote.probe/files/cloudflare-gate.json",
-    gateLocal
-  );
+  let status: GateResult["status"] = "failed";
+  try {
+    // 9. Cleanup — always kill all children + force-stop the app.
+    killGroup(children.gradle, "SIGKILL");
+    killGroup(children.origin, "SIGTERM");
+    setTimeout(() => killGroup(children.origin, "SIGKILL"), 5000).unref();
+    killGroup(children.cloudflared, "SIGKILL");
+    await forceStopApp(env.ANDROID_SERIAL);
 
-  const checks: { name: string; passed: boolean; details?: string }[] = [];
-  const evidence: Record<string, string | number | boolean> = {
-    timed_out: timedOut,
-    barrier_seen: barrierSeen,
-    gradle_exit: outcome.code ?? -1
-  };
+    // 10. Pull final evidence + verify.
+    const pulled = await pullFile(
+      env.ANDROID_SERIAL,
+      "/data/data/dev.clauderemote.probe/files/cloudflare-gate.json",
+      gateLocal
+    );
 
-  if (timedOut) {
-    checks.push({ name: "deadline", passed: false, details: `exceeded ${overallMs}ms` });
-  } else if (outcome.signal) {
-    checks.push({ name: "process", passed: false, details: `killed by signal ${outcome.signal}` });
-  } else if ((outcome.code ?? -1) !== 0) {
-    checks.push({ name: "gradle", passed: false, details: `exit=${outcome.code}` });
-  }
+    const checks: { name: string; passed: boolean; details?: string }[] = [];
+    const evidence: Record<string, string | number | boolean> = {
+      timed_out: timedOut,
+      barrier_seen: barrierSeen,
+      gradle_exit: outcome.code ?? -1
+    };
 
-  if (!barrierSeen) {
-    checks.push({ name: "barrier_seen", passed: false, details: "ready-for-tunnel-stop never appeared" });
-  }
-
-  if (pulled && (await pathReadable(gateLocal))) {
-    try {
-      const text = await readFile(gateLocal, "utf8");
-      const gate = JSON.parse(text) as {
-        issuer: string;
-        audience: string;
-        subject: string;
-        expiredHttpRejected: boolean;
-        expiredWsRejected: boolean;
-        refreshedHttpOk: boolean;
-        lanUnreachable: boolean;
-        postTunnelHttpFailed: boolean;
-        postTunnelWsFailed: boolean;
-      };
-      checks.push({ name: "issuer_match", passed: gate.issuer === `https://${env.CF_ACCESS_TEAM_DOMAIN}` });
-      checks.push({ name: "audience_match", passed: gate.audience === env.CF_ACCESS_AUD });
-      checks.push({ name: "subject_match", passed: gate.subject === env.CF_EXPECTED_SUBJECT });
-      checks.push({ name: "expired_http_rejected", passed: gate.expiredHttpRejected });
-      checks.push({ name: "expired_ws_rejected", passed: gate.expiredWsRejected });
-      checks.push({ name: "refreshed_http_ok", passed: gate.refreshedHttpOk });
-      checks.push({ name: "lan_unreachable", passed: gate.lanUnreachable });
-      checks.push({ name: "post_tunnel_http_failed", passed: gate.postTunnelHttpFailed });
-      checks.push({ name: "post_tunnel_ws_failed", passed: gate.postTunnelWsFailed });
-      evidence.issuer_match = gate.issuer === `https://${env.CF_ACCESS_TEAM_DOMAIN}`;
-      evidence.last_origin_request_id = lastOriginRequestId;
-    } catch (err) {
-      checks.push({ name: "evidence_json", passed: false, details: (err as Error).message });
+    if (timedOut) {
+      checks.push({ name: "deadline", passed: false, details: `exceeded ${overallMs}ms` });
+    } else if (outcome.signal) {
+      checks.push({ name: "process", passed: false, details: `killed by signal ${outcome.signal}` });
+    } else if ((outcome.code ?? -1) !== 0) {
+      checks.push({ name: "gradle", passed: false, details: `exit=${outcome.code}` });
     }
-  } else {
-    checks.push({ name: "evidence_pulled", passed: false, details: "could not pull cloudflare-gate.json" });
+
+    if (!barrierSeen) {
+      checks.push({ name: "barrier_seen", passed: false, details: "ready-for-tunnel-stop never appeared" });
+    }
+
+    if (pulled && (await pathReadable(gateLocal))) {
+      try {
+        const text = await readFile(gateLocal, "utf8");
+        const gate = JSON.parse(text) as {
+          issuer: string;
+          audience: string;
+          subject: string;
+          expiredHttpRejected: boolean;
+          expiredWsRejected: boolean;
+          refreshedHttpOk: boolean;
+          lanUnreachable: boolean;
+          postTunnelHttpFailed: boolean;
+          postTunnelWsFailed: boolean;
+        };
+        checks.push({ name: "issuer_match", passed: gate.issuer === `https://${env.CF_ACCESS_TEAM_DOMAIN}` });
+        checks.push({ name: "audience_match", passed: gate.audience === env.CF_ACCESS_AUD });
+        checks.push({ name: "subject_match", passed: gate.subject === env.CF_EXPECTED_SUBJECT });
+        checks.push({ name: "expired_http_rejected", passed: gate.expiredHttpRejected });
+        checks.push({ name: "expired_ws_rejected", passed: gate.expiredWsRejected });
+        checks.push({ name: "refreshed_http_ok", passed: gate.refreshedHttpOk });
+        checks.push({ name: "lan_unreachable", passed: gate.lanUnreachable });
+        checks.push({ name: "post_tunnel_http_failed", passed: gate.postTunnelHttpFailed });
+        checks.push({ name: "post_tunnel_ws_failed", passed: gate.postTunnelWsFailed });
+        evidence.issuer_match = gate.issuer === `https://${env.CF_ACCESS_TEAM_DOMAIN}`;
+        evidence.last_origin_request_id = lastOriginRequestId;
+      } catch (err) {
+        checks.push({ name: "evidence_json", passed: false, details: (err as Error).message });
+      }
+    } else {
+      checks.push({ name: "evidence_pulled", passed: false, details: "could not pull cloudflare-gate.json" });
+    }
+
+    const passed = checks.length > 0 && checks.every((c) => c.passed);
+    status = passed ? "passed" : "failed";
+
+    await emit(buildResult(status, checks, evidence, startedAt, finishedAt));
+  } finally {
+    // Cleanup always runs, even if pull/emit throws.
+    killGroup(children.gradle, "SIGKILL");
+    killGroup(children.origin, "SIGKILL");
+    killGroup(children.cloudflared, "SIGKILL");
+    await rm(barrierLocal, { force: true });
+    await rm(gateLocal, { force: true });
   }
 
-  const passed = checks.length > 0 && checks.every((c) => c.passed);
-  const status: GateResult["status"] = passed ? "passed" : "failed";
-
-  await emit(buildResult(status, checks, evidence, startedAt, finishedAt));
-  // Clean local temp artifacts (evidence file remains authoritative).
-  await rm(barrierLocal, { force: true });
-  await rm(gateLocal, { force: true });
-
-  void hostname;
   process.stderr.write(`cloudflare gate: ${status}\n`);
   return 0;
 }
