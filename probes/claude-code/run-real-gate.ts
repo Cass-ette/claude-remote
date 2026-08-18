@@ -20,7 +20,11 @@ import { mkdtemp, mkdir, writeFile, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { synthesizeFailed, type GateResult } from "../run-phase0.js";
+import type { GateResult } from "../run-phase0.js";
+import { mapOutcomeToGateResult } from "./map-outcome.js";
+
+export { mapOutcomeToGateResult } from "./map-outcome.js";
+export type { Outcome, ChecksMap, MapOptions } from "./map-outcome.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const testFile = resolve(here, "test/compatibility.test.ts");
@@ -93,21 +97,9 @@ async function parseChecks(stdout: string): Promise<{ checks: CheckDetails; reas
   return { checks: parsed as CheckDetails };
 }
 
-function buildResult(
-  status: GateResult["status"],
-  checks: { name: string; passed: boolean; details?: string }[],
-  evidence: Record<string, string | number | boolean>,
-  startedAt: string,
-  finishedAt: string
-): GateResult {
-  return {
-    name: "claude",
-    status,
-    startedAt,
-    finishedAt,
-    checks,
-    evidence
-  };
+async function emit(result: GateResult): Promise<void> {
+  await mkdir(dirname(evidencePath), { recursive: true });
+  await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
 }
 
 async function main(): Promise<number> {
@@ -115,15 +107,11 @@ async function main(): Promise<number> {
   const prereq = await checkPrerequisites();
   if (!prereq.ok) {
     const finishedAt = new Date().toISOString();
-    const result = buildResult(
-      "not_run",
-      [{ name: "prerequisites", passed: false, details: prereq.reason }],
-      { prerequisite_ok: false },
-      startedAt,
-      finishedAt
+    const result = mapOutcomeToGateResult(
+      { kind: "missing_prereq", reason: prereq.reason },
+      { startedAt, finishedAt }
     );
-    await mkdir(dirname(evidencePath), { recursive: true });
-    await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
+    await emit(result);
     process.stderr.write(`claude gate: not_run — ${prereq.reason}\n`);
     return 0;
   }
@@ -169,90 +157,68 @@ async function main(): Promise<number> {
     }, 5000).unref();
   }, DEADLINE_MS);
 
-  const outcome = await exitPromise;
+  const exitOutcome = await exitPromise;
   clearTimeout(timer);
   const finishedAt = new Date().toISOString();
 
   if (timedOut) {
-    const result = buildResult(
-      "failed",
-      [{ name: "deadline", passed: false, details: `exceeded ${DEADLINE_MS}ms deadline` }],
-      { timed_out: true },
-      startedAt,
-      finishedAt
+    const result = mapOutcomeToGateResult(
+      { kind: "timeout", deadlineMs: DEADLINE_MS },
+      { startedAt, finishedAt }
     );
-    await mkdir(dirname(evidencePath), { recursive: true });
-    await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
+    await emit(result);
     process.stderr.write(`claude gate: failed — timed out\n`);
     return 0;
   }
 
-  if (outcome.signal) {
-    const result = buildResult(
-      "failed",
-      [{ name: "process", passed: false, details: `killed by signal ${outcome.signal}` }],
-      { signal: outcome.signal },
-      startedAt,
-      finishedAt
+  if (exitOutcome.signal) {
+    const result = mapOutcomeToGateResult(
+      { kind: "signal", signal: exitOutcome.signal },
+      { startedAt, finishedAt }
     );
-    await mkdir(dirname(evidencePath), { recursive: true });
-    await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
-    process.stderr.write(`claude gate: failed — signal ${outcome.signal}\n`);
+    await emit(result);
+    process.stderr.write(`claude gate: failed — signal ${exitOutcome.signal}\n`);
     return 0;
   }
 
-  if ((outcome.code ?? -1) !== 0) {
+  if ((exitOutcome.code ?? -1) !== 0) {
     // Vitest nonzero exit — assertion failure or crash.
-    const { reason } = await parseChecks(stdout).catch(() => ({
-      checks: {},
+    const { reason: parsedReason } = await parseChecks(stdout).catch(() => ({
+      checks: {} as CheckDetails,
       reason: "nonzero exit and no checks file"
     }));
     const tail = stderr.slice(-500);
-    const result = buildResult(
-      "failed",
-      [
-        { name: "vitest", passed: false, details: `exit=${outcome.code}; ${reason ?? tail}` }
-      ],
-      { exit_code: outcome.code ?? -1 },
-      startedAt,
-      finishedAt
+    const reason = parsedReason ?? tail;
+    const result = mapOutcomeToGateResult(
+      { kind: "nonzero", code: exitOutcome.code, reason },
+      { startedAt, finishedAt }
     );
-    await mkdir(dirname(evidencePath), { recursive: true });
-    await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
-    process.stderr.write(`claude gate: failed — vitest exit ${outcome.code}\n`);
+    await emit(result);
+    process.stderr.write(`claude gate: failed — vitest exit ${exitOutcome.code}\n`);
     return 0;
   }
 
   // Exit 0 — parse checks and verify all are true.
   const { checks, reason } = await parseChecks(stdout);
   if (Object.keys(checks).length === 0) {
-    const result = synthesizeFailed("claude", reason ?? "no checks emitted", finishedAt);
-    await mkdir(dirname(evidencePath), { recursive: true });
-    await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
+    // Preserve original behavior: a malformed/missing checks payload on a
+    // nominally-successful run collapses both timestamps to finishedAt
+    // (treat it as if the failure only became known at the end).
+    const r = mapOutcomeToGateResult(
+      { kind: "malformed", reason: reason ?? "no checks emitted" },
+      { startedAt: finishedAt, finishedAt }
+    );
+    await emit(r);
     process.stderr.write(`claude gate: failed — ${reason}\n`);
     return 0;
   }
 
-  const failedChecks = Object.entries(checks).filter(([, v]) => v !== true);
-  const allPass = failedChecks.length === 0;
-  const checkEntries: { name: string; passed: boolean; details?: string }[] = [];
-  for (const [k, v] of Object.entries(checks)) {
-    const entry: { name: string; passed: boolean; details?: string } = {
-      name: k,
-      passed: v === true
-    };
-    if (typeof v === "string") entry.details = v;
-    checkEntries.push(entry);
-  }
-  const result = buildResult(
-    allPass ? "passed" : "failed",
-    checkEntries,
-    { exit_code: 0 },
-    startedAt,
-    finishedAt
+  const result = mapOutcomeToGateResult(
+    { kind: "success", checks },
+    { startedAt, finishedAt }
   );
-  await mkdir(dirname(evidencePath), { recursive: true });
-  await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
+  await emit(result);
+  const allPass = result.status === "passed";
   process.stderr.write(
     `claude gate: ${allPass ? "passed" : "failed"} — ${Object.keys(checks).length} checks\n`
   );

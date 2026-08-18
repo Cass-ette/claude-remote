@@ -4,5 +4,11 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["probes/run-phase0.ts", "probes/run-phase0.test.ts"]
+  "include": [
+    "probes/run-phase0.ts",
+    "probes/run-phase0.test.ts",
+    "probes/cloudflare/run-real-gate.ts",
+    "probes/cloudflare/map-outcome.ts",
+    "probes/cloudflare/test/map-outcome.test.ts"
+  ]
 }

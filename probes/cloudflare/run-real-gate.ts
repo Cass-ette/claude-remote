@@ -45,6 +45,10 @@ import { writeFile, mkdir, readFile, access, rm } from "node:fs/promises";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GateResult } from "../run-phase0.js";
+import { mapOutcomeToGateResult, type DeviceGateEvidence } from "./map-outcome.js";
+
+export { mapOutcomeToGateResult } from "./map-outcome.js";
+export type { Outcome, DeviceGateEvidence, ChildExit, MapOptions } from "./map-outcome.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const evidencePath = resolve(here, "../../build/phase0/cloudflare.json");
@@ -73,23 +77,6 @@ interface Children {
 }
 
 const children: Children = { gradle: null, origin: null, cloudflared: null };
-
-function buildResult(
-  status: GateResult["status"],
-  checks: { name: string; passed: boolean; details?: string }[],
-  evidence: Record<string, string | number | boolean>,
-  startedAt: string,
-  finishedAt: string
-): GateResult {
-  return {
-    name: "cloudflare",
-    status,
-    startedAt,
-    finishedAt,
-    checks,
-    evidence
-  };
-}
 
 async function emit(result: GateResult): Promise<void> {
   await mkdir(dirname(evidencePath), { recursive: true });
@@ -170,21 +157,17 @@ async function main(): Promise<number> {
   const missing = REQUIRED_ENV.filter((k) => !process.env[k]);
   if (missing.length > 0 || process.env.RUN_REAL_CLOUDFLARE !== "1") {
     await emit(
-      buildResult(
-        "not_run",
-        [
-          {
-            name: "env",
-            passed: false,
-            details:
-              process.env.RUN_REAL_CLOUDFLARE !== "1"
-                ? "RUN_REAL_CLOUDFLARE=1 not set — opt-in gate skipped"
-                : `missing env vars: ${missing.join(", ")}`
-          }
-        ],
-        { env_complete: missing.length === 0 && process.env.RUN_REAL_CLOUDFLARE === "1" },
-        startedAt,
-        new Date().toISOString()
+      mapOutcomeToGateResult(
+        {
+          kind: "missing_env",
+          reason:
+            process.env.RUN_REAL_CLOUDFLARE !== "1"
+              ? "RUN_REAL_CLOUDFLARE=1 not set — opt-in gate skipped"
+              : `missing env vars: ${missing.join(", ")}`,
+          envComplete:
+            missing.length === 0 && process.env.RUN_REAL_CLOUDFLARE === "1"
+        },
+        { startedAt, finishedAt: new Date().toISOString() }
       )
     );
     process.stderr.write("cloudflare gate: not_run\n");
@@ -198,18 +181,9 @@ async function main(): Promise<number> {
   const verified = await verifyAppLinks(env.ANDROID_SERIAL, probeHost);
   if (!verified) {
     await emit(
-      buildResult(
-        "failed",
-        [
-          {
-            name: "app_link_verified",
-            passed: false,
-            details: `${probeHost} not in verified state per pm get-app-links`
-          }
-        ],
-        { app_link_verified: false },
-        startedAt,
-        new Date().toISOString()
+      mapOutcomeToGateResult(
+        { kind: "app_link_unverified", probeHost },
+        { startedAt, finishedAt: new Date().toISOString() }
       )
     );
     return 0;
@@ -270,18 +244,9 @@ async function main(): Promise<number> {
     killGroup(children.origin, "SIGTERM");
     setTimeout(() => killGroup(children.origin, "SIGKILL"), 5000).unref();
     await emit(
-      buildResult(
-        "failed",
-        [
-          {
-            name: "origin_handshake",
-            passed: false,
-            details: "origin did not emit ORIGIN_PORT / ORIGIN_EVIDENCE_FILE in time"
-          }
-        ],
-        { origin_started: false },
-        startedAt,
-        new Date().toISOString()
+      mapOutcomeToGateResult(
+        { kind: "origin_handshake_failed" },
+        { startedAt, finishedAt: new Date().toISOString() }
       )
     );
     process.stderr.write("cloudflare gate: failed (origin handshake)\n");
@@ -404,67 +369,50 @@ async function main(): Promise<number> {
     await forceStopApp(env.ANDROID_SERIAL);
 
     // 10. Pull final evidence + verify.
-    const pulled = await pullFile(
-      env.ANDROID_SERIAL,
-      "/data/data/dev.clauderemote.probe/files/cloudflare-gate.json",
-      gateLocal
-    );
+    const pulled =
+      (await pullFile(
+        env.ANDROID_SERIAL,
+        "/data/data/dev.clauderemote.probe/files/cloudflare-gate.json",
+        gateLocal
+      )) && (await pathReadable(gateLocal));
 
-    const checks: { name: string; passed: boolean; details?: string }[] = [];
-    const evidence: Record<string, string | number | boolean> = {
-      timed_out: timedOut,
-      barrier_seen: barrierSeen,
-      gradle_exit: outcome.code ?? -1
-    };
-
-    if (timedOut) {
-      checks.push({ name: "deadline", passed: false, details: `exceeded ${overallMs}ms` });
-    } else if (outcome.signal) {
-      checks.push({ name: "process", passed: false, details: `killed by signal ${outcome.signal}` });
-    } else if ((outcome.code ?? -1) !== 0) {
-      checks.push({ name: "gradle", passed: false, details: `exit=${outcome.code}` });
-    }
-
-    if (!barrierSeen) {
-      checks.push({ name: "barrier_seen", passed: false, details: "ready-for-tunnel-stop never appeared" });
-    }
-
-    if (pulled && (await pathReadable(gateLocal))) {
+    let deviceEvidence: DeviceGateEvidence | null = null;
+    let evidenceError: string | null = null;
+    if (pulled) {
       try {
         const text = await readFile(gateLocal, "utf8");
-        const gate = JSON.parse(text) as {
-          issuer: string;
-          audience: string;
-          subject: string;
-          expiredHttpRejected: boolean;
-          expiredWsRejected: boolean;
-          refreshedHttpOk: boolean;
-          lanUnreachable: boolean;
-          postTunnelHttpFailed: boolean;
-          postTunnelWsFailed: boolean;
-        };
-        checks.push({ name: "issuer_match", passed: gate.issuer === `https://${env.CF_ACCESS_TEAM_DOMAIN}` });
-        checks.push({ name: "audience_match", passed: gate.audience === env.CF_ACCESS_AUD });
-        checks.push({ name: "subject_match", passed: gate.subject === env.CF_EXPECTED_SUBJECT });
-        checks.push({ name: "expired_http_rejected", passed: gate.expiredHttpRejected });
-        checks.push({ name: "expired_ws_rejected", passed: gate.expiredWsRejected });
-        checks.push({ name: "refreshed_http_ok", passed: gate.refreshedHttpOk });
-        checks.push({ name: "lan_unreachable", passed: gate.lanUnreachable });
-        checks.push({ name: "post_tunnel_http_failed", passed: gate.postTunnelHttpFailed });
-        checks.push({ name: "post_tunnel_ws_failed", passed: gate.postTunnelWsFailed });
-        evidence.issuer_match = gate.issuer === `https://${env.CF_ACCESS_TEAM_DOMAIN}`;
-        evidence.last_origin_request_id = lastOriginRequestId;
+        deviceEvidence = JSON.parse(text) as DeviceGateEvidence;
       } catch (err) {
-        checks.push({ name: "evidence_json", passed: false, details: (err as Error).message });
+        evidenceError = (err as Error).message;
       }
-    } else {
-      checks.push({ name: "evidence_pulled", passed: false, details: "could not pull cloudflare-gate.json" });
     }
 
-    const passed = checks.length > 0 && checks.every((c) => c.passed);
-    status = passed ? "passed" : "failed";
+    const result = mapOutcomeToGateResult(
+      {
+        kind: "device_run",
+        exit: timedOut
+          ? { kind: "timeout" }
+          : outcome.signal
+            ? { kind: "signal", signal: outcome.signal }
+            : { kind: "exit", code: outcome.code },
+        barrierSeen,
+        evidencePulled: pulled,
+        deviceEvidence,
+        evidenceError,
+        expected: {
+          issuer: `https://${env.CF_ACCESS_TEAM_DOMAIN}`,
+          audience: env.CF_ACCESS_AUD,
+          subject: env.CF_EXPECTED_SUBJECT
+        },
+        overallTimeoutMs: overallMs,
+        lastOriginRequestId,
+        gradleExitCode: outcome.code
+      },
+      { startedAt, finishedAt }
+    );
+    status = result.status;
 
-    await emit(buildResult(status, checks, evidence, startedAt, finishedAt));
+    await emit(result);
   } finally {
     // Cleanup always runs, even if pull/emit throws.
     killGroup(children.gradle, "SIGKILL");

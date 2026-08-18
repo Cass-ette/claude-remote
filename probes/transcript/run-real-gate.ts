@@ -27,6 +27,10 @@ import { createHash } from "node:crypto";
 import { resolve, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GateResult } from "../run-phase0.js";
+import { mapOutcomeToGateResult, type RealChecksOutput } from "./map-outcome.js";
+
+export { mapOutcomeToGateResult, REQUIRED_COVERAGE_LABELS } from "./map-outcome.js";
+export type { Outcome, RealChecksOutput, MapOptions } from "./map-outcome.js";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const testFile = resolve(here, "test/adapter.test.ts");
@@ -51,26 +55,22 @@ async function pathReadable(p: string): Promise<boolean> {
   }
 }
 
-function buildResult(
-  status: GateResult["status"],
-  checks: { name: string; passed: boolean; details?: string }[],
-  evidence: Record<string, string | number | boolean>,
-  startedAt: string,
-  finishedAt: string
-): GateResult {
-  return {
-    name: "transcript",
-    status,
-    startedAt,
-    finishedAt,
-    checks,
-    evidence
-  };
-}
-
 async function emit(result: GateResult): Promise<void> {
   await mkdir(dirname(evidencePath), { recursive: true });
   await writeFile(evidencePath, JSON.stringify(result, null, 2) + "\n", "utf8");
+}
+
+function prereqNotRun(
+  checkName: string,
+  reason: string,
+  evidenceKey: string,
+  evidenceValue: string | number | boolean,
+  startedAt: string
+): GateResult {
+  return mapOutcomeToGateResult(
+    { kind: "missing_prereq", checkName, reason, evidenceKey, evidenceValue },
+    { startedAt, finishedAt: new Date().toISOString() }
+  );
 }
 
 async function main(): Promise<number> {
@@ -80,12 +80,12 @@ async function main(): Promise<number> {
   // 1. Prerequisites.
   if (!manifestPath) {
     await emit(
-      buildResult(
-        "not_run",
-        [{ name: "manifest_env", passed: false, details: "REAL_TRANSCRIPT_MANIFEST not set" }],
-        { manifest_set: false },
-        startedAt,
-        new Date().toISOString()
+      prereqNotRun(
+        "manifest_env",
+        "REAL_TRANSCRIPT_MANIFEST not set",
+        "manifest_set",
+        false,
+        startedAt
       )
     );
     process.stderr.write("transcript gate: not_run — REAL_TRANSCRIPT_MANIFEST not set\n");
@@ -93,18 +93,12 @@ async function main(): Promise<number> {
   }
   if (!manifestPath.startsWith("/")) {
     await emit(
-      buildResult(
-        "not_run",
-        [
-          {
-            name: "manifest_absolute",
-            passed: false,
-            details: "REAL_TRANSCRIPT_MANIFEST must be an absolute path"
-          }
-        ],
-        { manifest_absolute: false },
-        startedAt,
-        new Date().toISOString()
+      prereqNotRun(
+        "manifest_absolute",
+        "REAL_TRANSCRIPT_MANIFEST must be an absolute path",
+        "manifest_absolute",
+        false,
+        startedAt
       )
     );
     process.stderr.write("transcript gate: not_run — manifest path not absolute\n");
@@ -115,18 +109,12 @@ async function main(): Promise<number> {
     manifestText = await readFile(manifestPath, "utf8");
   } catch (err) {
     await emit(
-      buildResult(
-        "not_run",
-        [
-          {
-            name: "manifest_readable",
-            passed: false,
-            details: `cannot read manifest: ${(err as Error).message}`
-          }
-        ],
-        { manifest_readable: false },
-        startedAt,
-        new Date().toISOString()
+      prereqNotRun(
+        "manifest_readable",
+        `cannot read manifest: ${(err as Error).message}`,
+        "manifest_readable",
+        false,
+        startedAt
       )
     );
     process.stderr.write(`transcript gate: not_run — manifest unreadable\n`);
@@ -137,18 +125,12 @@ async function main(): Promise<number> {
     manifest = JSON.parse(manifestText);
   } catch (err) {
     await emit(
-      buildResult(
-        "not_run",
-        [
-          {
-            name: "manifest_json",
-            passed: false,
-            details: `manifest is not valid JSON: ${(err as Error).message}`
-          }
-        ],
-        { manifest_json: false },
-        startedAt,
-        new Date().toISOString()
+      prereqNotRun(
+        "manifest_json",
+        `manifest is not valid JSON: ${(err as Error).message}`,
+        "manifest_json",
+        false,
+        startedAt
       )
     );
     process.stderr.write(`transcript gate: not_run — manifest not JSON\n`);
@@ -156,18 +138,12 @@ async function main(): Promise<number> {
   }
   if (!Array.isArray(manifest) || manifest.length === 0) {
     await emit(
-      buildResult(
-        "not_run",
-        [
-          {
-            name: "manifest_entries",
-            passed: false,
-            details: "manifest must be a non-empty array"
-          }
-        ],
-        { manifest_entries: 0 },
-        startedAt,
-        new Date().toISOString()
+      prereqNotRun(
+        "manifest_entries",
+        "manifest must be a non-empty array",
+        "manifest_entries",
+        0,
+        startedAt
       )
     );
     process.stderr.write("transcript gate: not_run — manifest empty\n");
@@ -181,18 +157,12 @@ async function main(): Promise<number> {
       !Array.isArray(entry.expectedCoverage)
     ) {
       await emit(
-        buildResult(
-          "not_run",
-          [
-            {
-              name: "manifest_shape",
-              passed: false,
-              details: "manifest entry must have path:string and expectedCoverage:string[]"
-            }
-          ],
-          { manifest_shape: false },
-          startedAt,
-          new Date().toISOString()
+        prereqNotRun(
+          "manifest_shape",
+          "manifest entry must have path:string and expectedCoverage:string[]",
+          "manifest_shape",
+          false,
+          startedAt
         )
       );
       process.stderr.write("transcript gate: not_run — malformed manifest entry\n");
@@ -200,18 +170,12 @@ async function main(): Promise<number> {
     }
     if (!entry.path.startsWith("/")) {
       await emit(
-        buildResult(
-          "not_run",
-          [
-            {
-              name: "manifest_path_absolute",
-              passed: false,
-              details: `manifest path must be absolute: ${entry.path}`
-            }
-          ],
-          { manifest_path_absolute: false },
-          startedAt,
-          new Date().toISOString()
+        prereqNotRun(
+          "manifest_path_absolute",
+          `manifest path must be absolute: ${entry.path}`,
+          "manifest_path_absolute",
+          false,
+          startedAt
         )
       );
       process.stderr.write(`transcript gate: not_run — path not absolute: ${entry.path}\n`);
@@ -219,18 +183,12 @@ async function main(): Promise<number> {
     }
     if (!(await pathReadable(entry.path))) {
       await emit(
-        buildResult(
-          "not_run",
-          [
-            {
-              name: "manifest_path_readable",
-              passed: false,
-              details: `manifest path not readable: ${entry.path}`
-            }
-          ],
-          { manifest_path_readable: false },
-          startedAt,
-          new Date().toISOString()
+        prereqNotRun(
+          "manifest_path_readable",
+          `manifest path not readable: ${entry.path}`,
+          "manifest_path_readable",
+          false,
+          startedAt
         )
       );
       process.stderr.write(`transcript gate: not_run — path unreadable: ${entry.path}\n`);
@@ -239,9 +197,9 @@ async function main(): Promise<number> {
   }
 
   // 2. Hash every input BEFORE.
-  const before = new Map<string, string>();
+  const before: Record<string, string> = {};
   for (const entry of manifest) {
-    before.set(entry.path, await sha256(entry.path));
+    before[entry.path] = await sha256(entry.path);
   }
 
   // 3. Spawn focused vitest with REAL_TRANSCRIPT_MANIFEST exported.
@@ -285,56 +243,41 @@ async function main(): Promise<number> {
     }, 5000).unref();
   }, DEADLINE_MS);
 
-  const outcome = await exitPromise;
+  const exitOutcome = await exitPromise;
   clearTimeout(timer);
   const finishedAt = new Date().toISOString();
 
   if (timedOut) {
     await emit(
-      buildResult(
-        "failed",
-        [{ name: "deadline", passed: false, details: `exceeded ${DEADLINE_MS}ms deadline` }],
-        { timed_out: true },
-        startedAt,
-        finishedAt
+      mapOutcomeToGateResult(
+        { kind: "timeout", deadlineMs: DEADLINE_MS },
+        { startedAt, finishedAt }
       )
     );
     process.stderr.write("transcript gate: failed — timed out\n");
     return 0;
   }
 
-  if (outcome.signal) {
+  if (exitOutcome.signal) {
     await emit(
-      buildResult(
-        "failed",
-        [{ name: "process", passed: false, details: `killed by signal ${outcome.signal}` }],
-        { signal: outcome.signal },
-        startedAt,
-        finishedAt
+      mapOutcomeToGateResult(
+        { kind: "signal", signal: exitOutcome.signal },
+        { startedAt, finishedAt }
       )
     );
-    process.stderr.write(`transcript gate: failed — signal ${outcome.signal}\n`);
+    process.stderr.write(`transcript gate: failed — signal ${exitOutcome.signal}\n`);
     return 0;
   }
 
-  if ((outcome.code ?? -1) !== 0) {
+  if ((exitOutcome.code ?? -1) !== 0) {
     const tail = stderr.slice(-500);
     await emit(
-      buildResult(
-        "failed",
-        [
-          {
-            name: "vitest",
-            passed: false,
-            details: `exit=${outcome.code}; ${tail}`
-          }
-        ],
-        { exit_code: outcome.code ?? -1 },
-        startedAt,
-        finishedAt
+      mapOutcomeToGateResult(
+        { kind: "nonzero", code: exitOutcome.code, stderrTail: tail },
+        { startedAt, finishedAt }
       )
     );
-    process.stderr.write(`transcript gate: failed — vitest exit ${outcome.code}\n`);
+    process.stderr.write(`transcript gate: failed — vitest exit ${exitOutcome.code}\n`);
     return 0;
   }
 
@@ -342,12 +285,9 @@ async function main(): Promise<number> {
   const m = stdout.match(/CHECKS_PATH=(\S+)/);
   if (!m || !m[1]) {
     await emit(
-      buildResult(
-        "failed",
-        [{ name: "checks_emitted", passed: false, details: "test did not emit CHECKS_PATH" }],
-        { checks_emitted: false },
-        startedAt,
-        finishedAt
+      mapOutcomeToGateResult(
+        { kind: "checks_not_emitted", reason: "test did not emit CHECKS_PATH" },
+        { startedAt, finishedAt }
       )
     );
     process.stderr.write("transcript gate: failed — no CHECKS_PATH\n");
@@ -358,18 +298,9 @@ async function main(): Promise<number> {
     checksText = await readFile(m[1], "utf8");
   } catch (err) {
     await emit(
-      buildResult(
-        "failed",
-        [
-          {
-            name: "checks_readable",
-            passed: false,
-            details: `cannot read checks file: ${(err as Error).message}`
-          }
-        ],
-        { checks_readable: false },
-        startedAt,
-        finishedAt
+      mapOutcomeToGateResult(
+        { kind: "checks_unreadable", reason: `cannot read checks file: ${(err as Error).message}` },
+        { startedAt, finishedAt }
       )
     );
     process.stderr.write("transcript gate: failed — checks file unreadable\n");
@@ -380,111 +311,40 @@ async function main(): Promise<number> {
     checksParsed = JSON.parse(checksText);
   } catch (err) {
     await emit(
-      buildResult(
-        "failed",
-        [
-          {
-            name: "checks_json",
-            passed: false,
-            details: `malformed checks JSON: ${(err as Error).message}`
-          }
-        ],
-        { checks_json: false },
-        startedAt,
-        finishedAt
+      mapOutcomeToGateResult(
+        { kind: "checks_malformed_json", reason: `malformed checks JSON: ${(err as Error).message}` },
+        { startedAt, finishedAt }
       )
     );
     process.stderr.write("transcript gate: failed — checks JSON malformed\n");
     return 0;
   }
 
-  interface RealChecksOutput {
-    coverageUnion: string[];
-    perEntry: Array<{
-      path: string;
-      sha256Before: string;
-      sha256After: string;
-      unchanged: boolean;
-      observed: string[];
-      evidence?: string;
-    }>;
-  }
-  const checks = checksParsed as RealChecksOutput;
+  const checks = checksParsed as Partial<RealChecksOutput> | null;
   if (!checks || !Array.isArray(checks.coverageUnion) || !Array.isArray(checks.perEntry)) {
     await emit(
-      buildResult(
-        "failed",
-        [{ name: "checks_shape", passed: false, details: "checks file missing coverageUnion/perEntry" }],
-        { checks_shape: false },
-        startedAt,
-        finishedAt
+      mapOutcomeToGateResult(
+        { kind: "checks_bad_shape", reason: "checks file missing coverageUnion/perEntry" },
+        { startedAt, finishedAt }
       )
     );
     process.stderr.write("transcript gate: failed — checks shape\n");
     return 0;
   }
 
-  // 5. Hash every input AFTER. Mismatch -> failed.
-  const afterCheckEntries: { name: string; passed: boolean; details?: string }[] = [];
-  let allUnchanged = true;
-  for (const entry of checks.perEntry) {
-    const ok = entry.unchanged;
-    if (!ok) allUnchanged = false;
-    const e: { name: string; passed: boolean; details?: string } = {
-      name: `hash_unchanged:${entry.path}`,
-      passed: ok
-    };
-    if (!ok) {
-      e.details = `sha256 changed: before=${entry.sha256Before} after=${entry.sha256After}`;
-    }
-    afterCheckEntries.push(e);
-  }
-
-  // 6. Coverage union check.
-  const REQUIRED = ["user", "assistant", "tool", "completed", "failed", "interrupted"];
-  const union = new Set(checks.coverageUnion);
-  const missingLabels = REQUIRED.filter((l) => !union.has(l));
-  const coveragePassed = missingLabels.length === 0;
-
-  // 7. Independent re-hash to confirm the test's claim.
-  const independentRehash = new Map<string, string>();
+  // 5. Independent re-hash to confirm the test's claim.
+  const after: Record<string, string> = {};
   for (const entry of manifest) {
-    independentRehash.set(entry.path, await sha256(entry.path));
+    after[entry.path] = await sha256(entry.path);
   }
-  const independentUnchanged =
-    [...before.entries()].every(([p, h]) => independentRehash.get(p) === h) &&
-    [...before.entries()].every(([p, h]) => {
-      const entry = checks.perEntry.find((e) => e.path === p);
-      return entry?.sha256Before === h && entry?.sha256After === h;
-    });
 
-  const allPass = allUnchanged && coveragePassed && independentUnchanged;
-  const allChecks: { name: string; passed: boolean; details?: string }[] = [];
-  const coverageCheck: { name: string; passed: boolean; details?: string } = {
-    name: "coverage_union_complete",
-    passed: coveragePassed
-  };
-  if (!coveragePassed) {
-    coverageCheck.details = `missing: ${missingLabels.join(",")}`;
-  }
-  allChecks.push(coverageCheck);
-  allChecks.push({ name: "independent_rehash_matches", passed: independentUnchanged });
-  for (const e of afterCheckEntries) allChecks.push(e);
-
-  const result = buildResult(
-    allPass ? "passed" : "failed",
-    allChecks,
-    {
-      entry_count: manifest.length,
-      coverage_union_size: checks.coverageUnion.length,
-      independent_rehash: independentUnchanged
-    },
-    startedAt,
-    finishedAt
+  const result = mapOutcomeToGateResult(
+    { kind: "checks", checks: checks as RealChecksOutput, before, after },
+    { startedAt, finishedAt }
   );
   await emit(result);
   process.stderr.write(
-    `transcript gate: ${allPass ? "passed" : "failed"} — ${allChecks.length} checks\n`
+    `transcript gate: ${result.status} — ${result.checks.length} checks\n`
   );
   return 0;
 }

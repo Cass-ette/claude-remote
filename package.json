@@ -4,13 +4,16 @@
   "type": "module",
   "workspaces": ["probes/claude-code", "probes/transcript", "probes/cloudflare/origin"],
   "scripts": {
-    "test:root": "vitest run probes/run-phase0.test.ts",
+    "test:root": "vitest run probes/run-phase0.test.ts probes/cloudflare/test/map-outcome.test.ts",
     "test:workspaces": "npm run test --workspaces --if-present",
     "test": "npm run test:root && npm run test:workspaces",
     "typecheck:root": "tsc -p tsconfig.json --noEmit",
     "typecheck:workspaces": "npm run typecheck --workspaces --if-present",
     "typecheck": "npm run typecheck:root && npm run typecheck:workspaces",
-    "phase0": "tsx probes/run-phase0.ts"
+    "phase0": "tsx probes/run-phase0.ts",
+    "phase0:claude": "tsx probes/claude-code/run-real-gate.ts",
+    "phase0:transcript": "tsx probes/transcript/run-real-gate.ts",
+    "phase0:cloudflare": "tsx probes/cloudflare/run-real-gate.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

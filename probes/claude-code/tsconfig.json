@@ -4,5 +4,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "test/**/*.ts", "run-real-gate.ts"]
+  "include": ["src/**/*.ts", "test/**/*.ts", "run-real-gate.ts", "map-outcome.ts"]
 }
