@@ -248,7 +248,7 @@ it("every variant produces a transcript-named result", () => {
   }
 });
 
-it("never produces status 'passed' for an empty checks perEntry", () => {
+it("treats an empty perEntry as vacuously passed (documents the edge)", () => {
   const result = mapOutcomeToGateResult(
     {
       kind: "checks",
