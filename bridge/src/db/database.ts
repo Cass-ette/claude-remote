@@ -30,7 +30,8 @@ export interface DatabaseOptions {
 /**
  * Open (or create) the Bridge SQLite database.
  *
- * - The database file is created with owner-only permissions (0600).
+ * - The database file (and its WAL/SHM sidecars) are created with
+ *   owner-only permissions (0600).
  * - WAL journaling is enabled for concurrent readers during writes.
  * - Foreign keys are enforced; busy waits are bounded at 5s.
  */
@@ -44,8 +45,20 @@ export function openDatabase(path: string, options: DatabaseOptions = {}): Sqlit
   db.pragma("foreign_keys = ON");
   db.pragma("synchronous = NORMAL");
   db.pragma("busy_timeout = 5000");
-  chmodSync(path, 0o600);
+  chmodOwnerOnly(path);
+  chmodOwnerOnly(`${path}-wal`);
+  chmodOwnerOnly(`${path}-shm`);
   return db;
+}
+
+function chmodOwnerOnly(path: string): void {
+  try {
+    chmodSync(path, 0o600);
+  } catch (error) {
+    // Sidecar files may not exist yet on a fresh database; the main file
+    // is always expected to exist, so anything else is a real error.
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
 }
 
 function mkdirRecursive(dir: string): void {

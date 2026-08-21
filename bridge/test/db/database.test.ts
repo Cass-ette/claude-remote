@@ -24,6 +24,18 @@ function openAndMigrate(): SqliteDatabase {
   return db;
 }
 
+function insertProject(projectId: string, canonicalRealpath = `/tmp/${projectId}`): void {
+  db.prepare(
+    "INSERT INTO projects (projectId, canonicalRealpath, deviceNumber, inode, displayName, createdAt, authorizedAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+  ).run(projectId, canonicalRealpath, 1, 2, projectId, 3, 4);
+}
+
+function insertCommand(requestId: string, deviceId: string, idempotencyKey: string): void {
+  db.prepare(
+    "INSERT INTO commands (requestId, deviceId, sessionId, idempotencyKey, commandType, payloadHash, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+  ).run(requestId, deviceId, "s1", idempotencyKey, "prompt", "h", "accepted", 1, 1);
+}
+
 function tableColumns(database: SqliteDatabase, table: string): string[] {
   return (database.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[]).map(
     (row) => row.name,
@@ -31,11 +43,18 @@ function tableColumns(database: SqliteDatabase, table: string): string[] {
 }
 
 describe("openDatabase", () => {
-  it("creates the database file with mode 0600", () => {
+  it("creates the database file and WAL sidecars with mode 0600", () => {
     const path = join(dataDir, "bridge.db");
     openAndMigrate();
-    const mode = statSync(path).mode & 0o777;
-    expect(mode).toBe(0o600);
+    // Force WAL activity so the -wal and -shm sidecars exist on disk.
+    db.prepare(
+      "INSERT INTO projects (projectId, canonicalRealpath, deviceNumber, inode, displayName, createdAt, authorizedAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run("p1", "/tmp/p1", 1, 2, "P1", 3, 4);
+    db.pragma("wal_checkpoint(TRUNCATE)");
+    for (const suffix of ["", "-wal", "-shm"]) {
+      const mode = statSync(path + suffix).mode & 0o777;
+      expect(mode, `mode of ${suffix || "db"} file`).toBe(0o600);
+    }
   });
 
   it("enables WAL journal mode", () => {
@@ -99,11 +118,90 @@ describe("transaction", () => {
 describe("schema", () => {
   it("enforces CHECK constraints on sessions.status", () => {
     openAndMigrate();
+    insertProject("p1");
     expect(() =>
       db.prepare(
         "INSERT INTO sessions (sessionId, projectId, displayName, status, source, lastActivityAt, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
       ).run("s1", "p1", "S1", "bogus", "bridge", 1, 2),
     ).toThrow(/CHECK constraint/i);
+  });
+
+  it("enforces CHECK constraint on sessions.source", () => {
+    openAndMigrate();
+    insertProject("p1");
+    expect(() =>
+      db.prepare(
+        "INSERT INTO sessions (sessionId, projectId, displayName, status, source, lastActivityAt, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+      ).run("s1", "p1", "S1", "idle", "bogus", 1, 2),
+    ).toThrow(/CHECK constraint/i);
+  });
+
+  it("enforces CHECK constraint on commands.status", () => {
+    openAndMigrate();
+    expect(() =>
+      db.prepare(
+        "INSERT INTO commands (requestId, deviceId, sessionId, idempotencyKey, commandType, payloadHash, status, createdAt, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run("r1", "d1", "s1", "k1", "prompt", "h", "bogus", 1, 1),
+    ).toThrow(/CHECK constraint/i);
+  });
+
+  it("enforces CHECK constraint on history_snapshots.status", () => {
+    openAndMigrate();
+    expect(() =>
+      db.prepare(
+        "INSERT INTO history_snapshots (snapshotId, sessionId, deviceId, status, historyRevision, adapterVersion, transcriptPath, readByteLimit, deliveryBase, deliveryWatermark, sessionStatus, createdAt, expiresAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      ).run("snap1", "s1", "d1", "bogus", "rev1", "v1", "/tmp/t", 1024, 0, 0, "idle", 1, 2),
+    ).toThrow(/CHECK constraint/i);
+  });
+
+  it("enforces UNIQUE (deviceId, idempotencyKey) on commands", () => {
+    openAndMigrate();
+    insertCommand("r1", "d1", "k1");
+    expect(() => insertCommand("r2", "d1", "k1")).toThrow(/UNIQUE constraint/i);
+  });
+
+  it("enforces UNIQUE canonicalRealpath on projects", () => {
+    openAndMigrate();
+    insertProject("p1", "/tmp/p1");
+    expect(() => insertProject("p2", "/tmp/p1")).toThrow(/UNIQUE constraint/i);
+  });
+
+  it("enforces FK from history_snapshot_items to history_snapshots", () => {
+    openAndMigrate();
+    expect(() =>
+      db.prepare(
+        "INSERT INTO history_snapshot_items (snapshotId, ordinal, historyItemId, historyRevision, payloadJson) VALUES (?, ?, ?, ?, ?)",
+      ).run("missing", 0, "item1", "rev1", "{}"),
+    ).toThrow(/FOREIGN KEY constraint/i);
+  });
+
+  it("enforces FK from device_sessions to devices", () => {
+    openAndMigrate();
+    expect(() =>
+      db.prepare(
+        "INSERT INTO device_sessions (tokenHash, deviceId, accessSubject, expiresAt, createdAt) VALUES (?, ?, ?, ?, ?)",
+      ).run("t1", "missing-device", "subj", 1, 2),
+    ).toThrow(/FOREIGN KEY constraint/i);
+  });
+
+  it("applies DEFAULT 0 for sessions.lastEventId and device_delivery.deliveryCheckpointWatermark", () => {
+    openAndMigrate();
+    insertProject("p1");
+    db.prepare(
+      "INSERT INTO sessions (sessionId, projectId, displayName, status, source, lastActivityAt, createdAt) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    ).run("s1", "p1", "S1", "idle", "bridge", 1, 2);
+    db.prepare(
+      "INSERT INTO device_delivery (deviceId, sessionId, protocolVersion, deliveryBase, deliveryWatermark) VALUES (?, ?, ?, ?, ?)",
+    ).run("d1", "s1", "v1", 0, 0);
+    const session = db.prepare("SELECT lastEventId FROM sessions WHERE sessionId = ?").get("s1") as {
+      lastEventId: number;
+    };
+    const delivery = db
+      .prepare("SELECT deliveryCheckpointWatermark, pendingCheckpoint FROM device_delivery WHERE deviceId = ? AND sessionId = ?")
+      .get("d1", "s1") as { deliveryCheckpointWatermark: number; pendingCheckpoint: number };
+    expect(session.lastEventId).toBe(0);
+    expect(delivery.deliveryCheckpointWatermark).toBe(0);
+    expect(delivery.pendingCheckpoint).toBe(0);
   });
 
   it("embedded migration SQL matches 001_initial.sql", () => {
