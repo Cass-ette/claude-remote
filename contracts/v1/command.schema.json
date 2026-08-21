@@ -1,0 +1,241 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-remote.dev/contracts/v1/command.schema.json",
+  "title": "Protocol v1 command envelope",
+  "description": "Wire format for a command sent from Android to the bridge. The payload variant is discriminated on commandType via the allOf if/then chain below.",
+  "type": "object",
+  "required": [
+    "protocolVersion",
+    "requestId",
+    "idempotencyKey",
+    "commandType",
+    "sessionId",
+    "sentAt",
+    "payload"
+  ],
+  "properties": {
+    "protocolVersion": { "const": "claude-remote.v1" },
+    "requestId": { "type": "string", "format": "uuid" },
+    "idempotencyKey": { "type": "string", "minLength": 1 },
+    "commandType": {
+      "enum": [
+        "session.list",
+        "session.scan_imports",
+        "session.import",
+        "session.create",
+        "session.resume",
+        "session.stop",
+        "session.release",
+        "session.state.get",
+        "session.snapshot.begin",
+        "session.snapshot.page",
+        "session.snapshot.commit",
+        "message.send",
+        "command.cancel",
+        "command.retry_indeterminate",
+        "permission.resolve",
+        "events.ack"
+      ]
+    },
+    "sessionId": { "type": ["string", "null"], "format": "uuid" },
+    "sentAt": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "commandType": { "const": "session.list" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_list" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.scan_imports" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_scan_imports" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.import" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_import" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.create" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_create" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.resume" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_resume" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.stop" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_stop" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.release" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_release" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.state.get" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_state_get" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.snapshot.begin" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_snapshot_begin" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.snapshot.page" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_snapshot_page" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "session.snapshot.commit" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_snapshot_commit" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "message.send" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.message_send" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "command.cancel" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.command_cancel" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "command.retry_indeterminate" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.command_retry_indeterminate" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "permission.resolve" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.permission_resolve" } } }
+    },
+    {
+      "if": { "properties": { "commandType": { "const": "events.ack" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.events_ack" } } }
+    }
+  ],
+  "$defs": {
+    "uuid": { "type": "string", "format": "uuid" },
+    "uint64String": { "type": "string", "pattern": "^[0-9]{1,20}$" },
+    "payload.session_list": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "payload.session_scan_imports": {
+      "type": "object",
+      "required": ["projectId"],
+      "properties": { "projectId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.session_import": {
+      "type": "object",
+      "required": ["sessionId", "projectId"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "projectId": { "$ref": "#/$defs/uuid" }
+      },
+      "additionalProperties": false
+    },
+    "payload.session_create": {
+      "type": "object",
+      "required": ["projectId"],
+      "properties": {
+        "projectId": { "$ref": "#/$defs/uuid" },
+        "displayName": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "payload.session_resume": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": { "sessionId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.session_stop": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": { "sessionId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.session_release": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": { "sessionId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.session_state_get": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": { "sessionId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.session_snapshot_begin": {
+      "type": "object",
+      "required": ["sessionId"],
+      "properties": { "sessionId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.session_snapshot_page": {
+      "type": "object",
+      "required": ["sessionId", "cursor"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "cursor": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "payload.session_snapshot_commit": {
+      "type": "object",
+      "required": [
+        "sessionId",
+        "snapshotId",
+        "historyRevision",
+        "deliveryWatermark",
+        "idempotencyKey"
+      ],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "snapshotId": { "type": "string", "minLength": 1 },
+        "historyRevision": { "type": "string", "minLength": 1 },
+        "deliveryWatermark": { "$ref": "#/$defs/uint64String" },
+        "idempotencyKey": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "payload.message_send": {
+      "type": "object",
+      "required": ["sessionId", "text"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "text": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "payload.command_cancel": {
+      "type": "object",
+      "required": ["requestId"],
+      "properties": { "requestId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.command_retry_indeterminate": {
+      "type": "object",
+      "required": ["requestId"],
+      "properties": { "requestId": { "$ref": "#/$defs/uuid" } },
+      "additionalProperties": false
+    },
+    "payload.permission_resolve": {
+      "type": "object",
+      "required": ["permissionRequestId", "sessionId", "decision"],
+      "properties": {
+        "permissionRequestId": { "type": "string", "minLength": 1 },
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "decision": { "enum": ["allow", "deny"] }
+      },
+      "additionalProperties": false
+    },
+    "payload.events_ack": {
+      "type": "object",
+      "required": ["sessionId", "lastEventId"],
+      "properties": {
+        "sessionId": { "$ref": "#/$defs/uuid" },
+        "lastEventId": { "$ref": "#/$defs/uint64String" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

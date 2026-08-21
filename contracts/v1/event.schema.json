@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://claude-remote.dev/contracts/v1/event.schema.json",
+  "title": "Protocol v1 event envelope",
+  "description": "Event streamed from the bridge to Android over the event channel. eventId is a decimal-stringified unsigned 64-bit integer. Payload shapes are intentionally loose in v1 Chunk 2; per-eventType payload schemas land with Chunk 3.",
+  "type": "object",
+  "required": ["protocolVersion", "eventId", "sessionId", "eventType", "timestamp", "payload"],
+  "properties": {
+    "protocolVersion": { "const": "claude-remote.v1" },
+    "eventId": {
+      "type": "string",
+      "pattern": "^[0-9]{1,20}$",
+      "description": "Decimal-stringified unsigned 64-bit integer; uint64 max is 20 digits."
+    },
+    "sessionId": { "type": "string", "format": "uuid" },
+    "eventType": {
+      "enum": [
+        "session.state.changed",
+        "command.status.changed",
+        "assistant.message.delta",
+        "assistant.message.completed",
+        "tool.started",
+        "tool.output.delta",
+        "tool.completed",
+        "permission.requested",
+        "permission.resolved",
+        "process.stderr.summary",
+        "session.interrupted",
+        "session.failed"
+      ]
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "commandStatus": {
+      "enum": [
+        "accepted",
+        "dispatching",
+        "dispatched",
+        "indeterminate",
+        "interrupted",
+        "completed",
+        "failed"
+      ]
+    },
+    "payload.command_status_changed": {
+      "type": "object",
+      "required": ["requestId", "idempotencyKey", "commandType", "commandStatus"],
+      "properties": {
+        "requestId": { "type": "string", "format": "uuid" },
+        "idempotencyKey": { "type": "string", "minLength": 1 },
+        "commandType": { "type": "string", "minLength": 1 },
+        "commandStatus": { "$ref": "#/$defs/commandStatus" },
+        "result": true,
+        "error": {
+          "type": "object",
+          "required": ["code", "message"],
+          "properties": {
+            "code": { "type": "string", "minLength": 1 },
+            "message": { "type": "string", "minLength": 1 },
+            "retryable": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "eventType": { "const": "command.status.changed" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.command_status_changed" } } }
+    }
+  ]
+}
