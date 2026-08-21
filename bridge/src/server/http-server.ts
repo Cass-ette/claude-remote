@@ -81,7 +81,6 @@ const capabilitiesSchema = {
 } as const;
 
 const ajv = new Ajv2020({ allErrors: true, allowUnionTypes: true });
-// ajv-formats ships CJS with an esModule default; the callable is `.default`.
 addFormats(ajv);
 const validateHealth = ajv.compile<HealthResponse>(healthSchema);
 const validateCapabilities = ajv.compile<CapabilitiesResponse>(capabilitiesSchema);
