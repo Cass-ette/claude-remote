@@ -229,6 +229,24 @@ describe("inbound commands", () => {
     const close = await closed;
     expect(close.code).toBe(4500);
   });
+
+  it("does not close the socket when onCommand throws on a valid message", async () => {
+    const url = await startServer();
+    const { ws, opened, closed } = open(url, AUTH_HEADERS, V1);
+    onCommand = () => {
+      throw new Error("handler bug");
+    };
+    await opened;
+    await waitForConnection();
+    ws.send(JSON.stringify({ commandType: "session.list" }));
+    // Give the server a beat to (wrongly) close if the handler throw leaked.
+    const raced = await Promise.race([
+      closed.then(() => "closed"),
+      new Promise((resolve) => setTimeout(() => resolve("still-open"), 300)),
+    ]);
+    expect(raced).toBe("still-open");
+    ws.close();
+  });
 });
 
 describe("WS_CLOSE_CODES", () => {

@@ -187,10 +187,20 @@ export function registerWebSocket(
         socket.on("error", unregister);
 
         socket.on("message", (raw) => {
+          let parsed: unknown;
           try {
-            options.onCommand?.(connection, JSON.parse(String(raw)));
+            parsed = JSON.parse(String(raw));
           } catch {
             socket.close(CLOSE_CODE.INTERNAL_ERROR, "malformed message");
+            return;
+          }
+          try {
+            options.onCommand?.(connection, parsed);
+          } catch (error) {
+            request.log.warn(
+              { err: error },
+              "onCommand handler threw; message was valid JSON",
+            );
           }
         });
 
