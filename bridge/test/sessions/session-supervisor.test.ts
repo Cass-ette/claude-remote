@@ -330,6 +330,43 @@ describe("resumeSession", () => {
     expect(lockRow(sessionId)).toBeUndefined();
   });
 
+  it("resumes an idle session with a dead process via starting, back to idle", async () => {
+    // Idle with NO live handle (our process died) — seeded directly.
+    db.prepare(
+      `INSERT INTO sessions (sessionId, projectId, displayName, status, source, lastActivityAt, createdAt)
+       VALUES ('sess-idle-dead', 'proj-1', 's', 'idle', 'bridge', 0, 0)`,
+    ).run();
+    const supervisor = buildSupervisor();
+    await supervisor.resumeSession({ sessionId: "sess-idle-dead" });
+    expect(factory.starts.at(-1)).toMatchObject({
+      sessionId: "sess-idle-dead",
+      mode: "resume",
+      cwd: PROJECT_DIR,
+    });
+    expect(sessionStatus("sess-idle-dead")).toBe("idle");
+    const statuses = db
+      .prepare("SELECT payloadJson FROM pending_events WHERE sessionId = 'sess-idle-dead' ORDER BY eventId")
+      .all() as Array<{ payloadJson: string }>;
+    expect(
+      statuses.map((e) => (JSON.parse(e.payloadJson) as { status: string }).status),
+    ).toEqual(["starting", "idle"]);
+  });
+
+  it("fails an idle dead-process resume whose init reports a different session_id", async () => {
+    db.prepare(
+      `INSERT INTO sessions (sessionId, projectId, displayName, status, source, lastActivityAt, createdAt)
+       VALUES ('sess-idle-mm', 'proj-1', 's', 'idle', 'bridge', 0, 0)`,
+    ).run();
+    factory.onNextStart((opts) => ({ ...opts, initSessionId: "wrong-session-id" }));
+    const supervisor = buildSupervisor();
+    await expect(supervisor.resumeSession({ sessionId: "sess-idle-mm" })).rejects.toBeInstanceOf(
+      InitSessionMismatchError,
+    );
+    expect(sessionStatus("sess-idle-mm")).toBe("failed");
+    expect(lockRow("sess-idle-mm")).toBeUndefined();
+    expect(factory.handles[0]!.signals).toContain("SIGKILL");
+  });
+
   it("takes over a stale foreign lock", async () => {
     db.prepare(
       `INSERT INTO sessions (sessionId, projectId, displayName, status, source, lastActivityAt, createdAt)

@@ -14,6 +14,7 @@ const LEGAL: ReadonlySet<string> = new Set([
   "starting:failed",
   "idle:running",
   "idle:releasing",
+  "idle:starting",
   "running:idle",
   "running:waiting_permission",
   "running:interrupting",
@@ -77,6 +78,10 @@ describe("session state machine (§7.1, §7.5, §7.6)", () => {
         from === "idle" || from === "interrupted",
       );
     }
+  });
+
+  it("supports resume of a processless idle session via starting", () => {
+    expect(canTransition("idle", "starting")).toBe(true);
   });
 
   it("supports crash recovery into interrupted (§7.6)", () => {

@@ -27,18 +27,21 @@ export type TerminalSessionStatus = (typeof TERMINAL_SESSION_STATUSES)[number];
  * Legal transitions.
  *
  * - §7.1 baseline lifecycle: inactive→starting, starting→idle|failed,
- *   idle→running|releasing, running→idle|waiting_permission|interrupting|failed,
+ *   idle→running|releasing|starting, running→idle|waiting_permission|interrupting|failed,
  *   waiting_permission→running|interrupting, interrupting→interrupted|failed,
  *   interrupted→releasing|starting, releasing→inactive.
  * - §7.6 crash recovery: running|waiting_permission|interrupting → interrupted
  *   when the Bridge restarts (running passes through interrupting first).
  * - `failed` has no outgoing transitions. `inactive` is only left by an
- *   explicit resume (→ starting).
+ *   explicit resume (→ starting). `idle → starting` covers resume of an
+ *   idle session whose process has died: re-attaching a NEW process to a
+ *   processless idle session is "awaiting system/init" — same semantics as
+ *   `interrupted → starting`.
  */
 const LEGAL_TRANSITIONS: Readonly<Record<SessionStatus, readonly SessionStatus[]>> = {
   inactive: ["starting"],
   starting: ["idle", "failed"],
-  idle: ["running", "releasing"],
+  idle: ["running", "releasing", "starting"],
   running: ["idle", "waiting_permission", "interrupting", "failed"],
   waiting_permission: ["running", "interrupting", "interrupted"],
   interrupting: ["interrupted", "failed"],

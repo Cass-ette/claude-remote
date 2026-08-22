@@ -412,13 +412,10 @@ export function createSessionSupervisor(
       return;
     }
 
-    // A new --resume process must be spawned. From `interrupted` the session
-    // passes through `starting` (legal transition); from `idle` (our own
-    // process died) the session stays semantically idle and only the process
-    // is swapped — an init failure then takes idle → failed.
-    if (row.status === "interrupted") {
-      setStatus(input.sessionId, "starting");
-    }
+    // A new --resume process must be spawned: the session enters `starting`
+    // (awaiting system/init) — from both `interrupted` and `idle` (our own
+    // process died) — so an init failure correctly goes starting → failed.
+    setStatus(input.sessionId, "starting");
     let handle: ClaudeProcessHandle | undefined;
     try {
       handle = await options.processFactory.start({
