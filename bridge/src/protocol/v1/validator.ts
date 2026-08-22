@@ -7,6 +7,7 @@ import {
   COMMAND_TYPES,
   EVENT_TYPES,
   PROTOCOL_VERSION,
+  UINT64_STRING_PATTERN,
   type Command,
   type CommandType,
   type ProtocolEvent,
@@ -74,7 +75,8 @@ export function validateCommand(input: unknown): ValidationResult<Command> {
   if (input === null || typeof input !== "object") {
     return { ok: false, error: "command: expected an object" };
   }
-  const serializedLength = JSON.stringify(input)?.length ?? 0;
+  const serialized = JSON.stringify(input) ?? "";
+  const serializedLength = Buffer.byteLength(serialized, "utf8");
   if (serializedLength > MAX_COMMAND_BYTES) {
     return {
       ok: false,
@@ -110,12 +112,18 @@ export function validateEvent(input: unknown): ValidationResult<ValidatedEvent> 
     return failure(validateEventSchema, "event");
   }
   const event = input as ProtocolEvent;
-  return { ok: true, value: { event, eventId: parseEventId(event.eventId) } };
+  // The schema allows up to 20 digits but uint64 tops out lower; catch that
+  // here so validateEvent stays total (never throws).
+  try {
+    return { ok: true, value: { event, eventId: parseEventId(event.eventId) } };
+  } catch (err) {
+    return { ok: false, error: `event: ${(err as Error).message}` };
+  }
 }
 
 /** Parse a decimal-stringified uint64 to bigint. Throws on invalid input. */
 export function parseEventId(value: string): bigint {
-  if (!/^[0-9]{1,20}$/.test(value)) {
+  if (!new RegExp(UINT64_STRING_PATTERN).test(value)) {
     throw new Error(`eventId must be a decimal string of 1-20 digits, got: ${JSON.stringify(value)}`);
   }
   const parsed = BigInt(value);

@@ -110,6 +110,18 @@ describe("validateCommand", () => {
     const big = { sessionId: UUID, text: "x".repeat(256 * 1024 - envelopeOverhead - 4) };
     expect(validateCommand(command("message.send", big, UUID)).ok).toBe(true);
   });
+
+  it("rejects multibyte payloads whose UTF-8 size exceeds 256 KiB even when UTF-16 length does not", () => {
+    // 100_000 CJK chars = ~100_003 UTF-16 code units (< 256 KiB) but
+    // ~300_003 UTF-8 bytes (> 256 KiB).
+    const big = { sessionId: UUID, text: "世".repeat(100_000) };
+    const serialized = JSON.stringify(command("message.send", big, UUID));
+    expect(serialized.length).toBeLessThanOrEqual(256 * 1024);
+    expect(Buffer.byteLength(serialized, "utf8")).toBeGreaterThan(256 * 1024);
+    const res = validateCommand(command("message.send", big, UUID));
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toMatch(/256 KiB/);
+  });
 });
 
 describe("validateEvent", () => {
@@ -138,6 +150,16 @@ describe("validateEvent", () => {
 
   it("rejects eventId over 20 digits", () => {
     expect(validateEvent(event({ eventId: "123456789012345678901" })).ok).toBe(false);
+  });
+
+  it("returns a failure result (does not throw) for 20-digit eventId over uint64", () => {
+    // Schema-valid (20 decimal digits) but > 18446744073709551615.
+    let res: ReturnType<typeof validateEvent> | undefined;
+    expect(() => {
+      res = validateEvent(event({ eventId: "99999999999999999999" }));
+    }).not.toThrow();
+    expect(res?.ok).toBe(false);
+    if (res && !res.ok) expect(res.error).toMatch(/uint64 range/);
   });
 
   it("rejects unknown eventType and bad envelope", () => {

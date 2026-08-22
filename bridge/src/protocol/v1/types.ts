@@ -9,6 +9,13 @@ export const PROTOCOL_VERSION = "claude-remote.v1";
 /** Decimal-stringified unsigned 64-bit integer, e.g. "18446744073709551615". */
 export type Uint64String = string;
 
+/**
+ * Pattern for a decimal-stringified uint64. Must stay identical to the
+ * `uint64String` / eventId patterns in contracts/v1/*.schema.json; the
+ * schema-drift test enforces this.
+ */
+export const UINT64_STRING_PATTERN = "^[0-9]{1,20}$";
+
 export const COMMAND_TYPES = [
   "session.list",
   "session.scan_imports",
