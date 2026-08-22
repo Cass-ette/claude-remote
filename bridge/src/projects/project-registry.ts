@@ -95,7 +95,6 @@ export function createProjectRegistry(db: SqliteDatabase): ProjectRegistry {
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   const getById = db.prepare("SELECT * FROM projects WHERE projectId = ?");
-  const getByRealpath = db.prepare("SELECT * FROM projects WHERE canonicalRealpath = ?");
   const listStmt = db.prepare("SELECT * FROM projects ORDER BY createdAt, projectId");
   const deleteStmt = db.prepare("DELETE FROM projects WHERE projectId = ?");
 
