@@ -284,4 +284,28 @@ describe("transitionWithStatusEvent atomicity", () => {
       db.prepare("SELECT lastEventId FROM sessions WHERE sessionId = 'sess-1'").get(),
     ).toMatchObject({ lastEventId: 0 });
   });
+
+  it("rejects status-event transitions for session-less commands", async () => {
+    const globalEnv: Command = {
+      protocolVersion: "claude-remote.v1",
+      requestId: "1b6f4f02-6ac6-4a46-9fd5-681c9db4d552",
+      idempotencyKey: "global-key-1",
+      commandType: "session.list",
+      sessionId: null,
+      sentAt: "2026-08-01T00:00:00Z",
+      payload: {},
+    };
+    await ledger.accept(globalEnv, "device-1", computePayloadHash(globalEnv.payload), T0);
+    await expect(
+      ledger.transitionWithStatusEvent(globalEnv.requestId, "completed", {
+        now: T0 + 5,
+        buildEventPayload: (rec) => ({
+          requestId: rec.requestId,
+          commandStatus: "completed",
+        }),
+      }),
+    ).rejects.toThrow("no session");
+    const after = await ledger.get(globalEnv.requestId);
+    expect(after?.status).toBe("accepted");
+  });
 });

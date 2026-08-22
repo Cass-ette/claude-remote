@@ -47,7 +47,7 @@ export interface CommandRecord {
   readonly commandType: string;
   readonly payloadHash: string;
   readonly status: CommandStatus;
-  readonly resultJson: unknown | undefined;
+  readonly resultJson?: unknown;
   readonly createdAt: number;
   readonly updatedAt: number;
 }
@@ -65,10 +65,10 @@ export class ConflictError extends Error {
   }
 }
 
-/** requestId already recorded under a different idempotency key. */
+/** requestId already recorded under a different idempotency key, or reused with a different key than its original acceptance. */
 export class DuplicateRequestIdError extends Error {
   constructor(readonly requestId: string) {
-    super(`duplicate requestId ${requestId} under a different idempotency key`);
+    super(`requestId ${requestId} already recorded under a different idempotency key`);
     this.name = "DuplicateRequestIdError";
   }
 }
@@ -77,6 +77,17 @@ export class IllegalTransitionError extends Error {
   constructor(readonly from: CommandStatus, readonly to: CommandStatus) {
     super(`illegal command transition ${from} -> ${to}`);
     this.name = "IllegalTransitionError";
+  }
+}
+
+/** Stored value for commands that are not bound to a session (e.g. session.list). */
+export const NO_SESSION = "";
+
+/** A command.status.changed event requires a session to attach the event to. */
+export class SessionlessTransitionError extends Error {
+  constructor(readonly requestId: string) {
+    super(`command ${requestId} has no session; status events require a session-scoped command`);
+    this.name = "SessionlessTransitionError";
   }
 }
 
@@ -209,7 +220,7 @@ export function createCommandLedger(db: SqliteDatabase, journal: EventJournalPor
     if (getByRequest.get(envelope.requestId) !== undefined) {
       throw new DuplicateRequestIdError(envelope.requestId);
     }
-    const sessionId = envelope.sessionId ?? "";
+    const sessionId = envelope.sessionId ?? NO_SESSION;
     insertStmt.run(
       envelope.requestId,
       deviceId,
@@ -272,6 +283,9 @@ export function createCommandLedger(db: SqliteDatabase, journal: EventJournalPor
         try {
           const outcome = db.transaction(() => {
             const row = loadForTransition(requestId);
+            if (row.sessionId === NO_SESSION) {
+              throw new SessionlessTransitionError(requestId);
+            }
             const record = applyTransition(row, next, options.now);
             const event = journal.appendWithinTransaction({
               db,
