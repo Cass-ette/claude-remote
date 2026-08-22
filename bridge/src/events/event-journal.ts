@@ -16,6 +16,7 @@
 import { transaction } from "../db/database.js";
 import type { SqliteDatabase } from "../db/database.js";
 import { PROTOCOL_VERSION, type EventType } from "../protocol/v1/types.js";
+import type { EventPayload } from "../protocol/v1/types.js";
 import type { AppendEventArgs, EventJournalPort, PersistedEvent } from "./event-journal-types.js";
 
 export type { AppendEventArgs, PersistedEvent } from "./event-journal-types.js";
@@ -27,7 +28,7 @@ export interface AppendOptions {
   readonly category: EventCategory;
   readonly sessionId: string;
   readonly eventType: EventType;
-  readonly payload: unknown;
+  readonly payload: EventPayload;
   /** Epoch milliseconds. */
   readonly now: number;
 }
@@ -98,7 +99,11 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
     `SELECT sessionId, eventId, eventType, payloadJson, protocolVersion, createdAt
      FROM pending_events WHERE sessionId = ? AND eventId > ? ORDER BY eventId ASC`,
   );
-  const pendingBytesStmt = db.prepare("SELECT COALESCE(SUM(LENGTH(payloadJson)), 0) AS bytes FROM pending_events");
+  // CAST to BLOB: LENGTH() on TEXT returns characters, on BLOB returns bytes.
+  // CJK payloadJson would otherwise undercount the budget by up to 3x.
+  const pendingBytesStmt = db.prepare(
+    "SELECT COALESCE(SUM(LENGTH(CAST(payloadJson AS BLOB))), 0) AS bytes FROM pending_events",
+  );
   const scheduleDeletion = db.prepare(
     "UPDATE pending_events SET deleteAfter = ? WHERE sessionId = ? AND eventId <= ? AND deleteAfter IS NULL",
   );
@@ -137,15 +142,17 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
      * budget for user_command events BEFORE any allocation.
      */
     append({ category, sessionId, eventType, payload, now }): PersistedEvent {
+      // Sweep FIRST: rows whose deleteAfter has elapsed must not count
+      // against the byte budget (a sweep would have freed them).
+      this.sweep(now);
       if (category === "user_command") {
         const projected = currentPendingBytes() + Buffer.byteLength(JSON.stringify(payload), "utf8");
         if (projected > config.byteBudget) {
           throw new StoragePressureError(projected, config.byteBudget);
         }
       }
-      this.sweep(now);
       return transaction(db, () =>
-        this.appendWithinTransaction({ db, sessionId, eventType, payload: payload as never, now }),
+        this.appendWithinTransaction({ db, sessionId, eventType, payload, now }),
       );
     },
 
@@ -222,9 +229,13 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
  * Non-oversized payloads (and by policy any non-tool-output event) pass
  * through unchanged.
  */
+export const DEFAULT_TOOL_OUTPUT_LIMIT = 65536;
+/** Spec-mandated marker for the default limit (65536 bytes ≈ 65 KiB decimal). */
+const DEFAULT_LIMIT_MARKER = "65KiB";
+
 export function truncateLargeToolOutput(
   payload: unknown,
-  limit: number,
+  limit: number = DEFAULT_TOOL_OUTPUT_LIMIT,
   eventType?: EventType,
 ): { payload: unknown; truncated: boolean } {
   if (eventType !== undefined && eventType !== "tool.output.delta") {
@@ -233,7 +244,11 @@ export function truncateLargeToolOutput(
   const byteLength = Buffer.byteLength(JSON.stringify(payload), "utf8");
   if (byteLength <= limit) return { payload, truncated: false };
   return {
-    payload: { truncated: true, originalByteCount: byteLength, truncatedAt: "65KiB" },
+    payload: {
+      truncated: true,
+      originalByteCount: byteLength,
+      truncatedAt: limit === DEFAULT_TOOL_OUTPUT_LIMIT ? DEFAULT_LIMIT_MARKER : `${limit}B`,
+    },
     truncated: true,
   };
 }

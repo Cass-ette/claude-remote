@@ -187,6 +187,46 @@ describe("storage pressure", () => {
     ).toMatchObject({ lastEventId: 0 });
   });
 
+  it("counts bytes, not characters, for CJK payloads (char-count of 100 would pass a 250 budget)", () => {
+    const cjk = { text: "汉".repeat(100) }; // 100 chars = 300 UTF-8 bytes in the string alone
+    const tight = openJournal({ byteBudget: 250 });
+    expect(() =>
+      tight.append({
+        category: "user_command",
+        sessionId: "sess-1",
+        eventType: "assistant.message.delta",
+        payload: cjk,
+        now: T0,
+      }),
+    ).toThrow(StoragePressureError); // JSON payload > 250 bytes; a char count (100) would have passed
+  });
+
+  it("sweeps elapsed rows before the budget check so freed space allows appends", () => {
+    const first = appendUser(journal, "sess-1", { blob: "x".repeat(300) });
+    const firstBytes = Buffer.byteLength(
+      (db.prepare("SELECT payloadJson FROM pending_events WHERE eventId = ?").get(first.eventId) as {
+        payloadJson: string;
+      }).payloadJson,
+      "utf8",
+    );
+    // ACK event 1 with a deleteAfter already in the past (acknowledged long ago).
+    journal.acknowledge("sess-1", "device-1", 1n, T0 - RETENTION_MS - 1);
+    // Budget fits the new payload only if event 1 is swept first.
+    const tight = openJournal({ byteBudget: firstBytes - 1 });
+    expect(() =>
+      tight.append({
+        category: "user_command",
+        sessionId: "sess-1",
+        eventType: "assistant.message.delta",
+        payload: { n: 2 },
+        now: T0,
+      }),
+    ).not.toThrow();
+    expect(db.prepare("SELECT eventId FROM pending_events ORDER BY eventId").all()).toEqual([
+      { eventId: 2 },
+    ]);
+  });
+
   it("system-category appends bypass the byte-budget check", () => {
     const tight = openJournal({ byteBudget: 32 });
     for (const eventType of ["session.state.changed", "command.status.changed", "session.failed", "session.interrupted"] as const) {
@@ -210,6 +250,12 @@ describe("truncateLargeToolOutput", () => {
     const { payload: out, truncated } = truncateLargeToolOutput(payload, BYTE_LIMIT);
     expect(truncated).toBe(true);
     expect(out).toEqual({ truncated: true, originalByteCount: Buffer.byteLength(JSON.stringify(payload), "utf8"), truncatedAt: "65KiB" });
+  });
+
+  it("uses an exact byte marker for non-default limits", () => {
+    const payload = { delta: "x".repeat(2048) };
+    const { payload: out } = truncateLargeToolOutput(payload, 1024);
+    expect(out).toMatchObject({ truncated: true, truncatedAt: "1024B" });
   });
 
   it("passes non-tool-output and small payloads through unchanged", () => {
