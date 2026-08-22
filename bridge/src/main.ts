@@ -54,8 +54,11 @@ export async function startBridge(env: EnvSource): Promise<BridgeHandle> {
     // is the least-wrong documented code — the socket close is immediate
     // and the client is expected to reconnect and resync.
     wsService.closeAll(CLOSE_CODE.INTERNAL_ERROR, "bridge shutdown");
-    await app.close();
-    db.close();
+    try {
+      await app.close();
+    } finally {
+      db.close();
+    }
   };
 
   return { config, app, wsService, db, journal, ledger, close };
@@ -78,6 +81,8 @@ async function main(): Promise<void> {
     setTimeout(() => process.exit(0), SIGNAL_WAIT_SECONDS * 1000).unref();
   };
 
+  // process.once (not .on): a second signal falls through to the default
+  // hard-exit, which is the intended escape hatch during a hung graceful close.
   process.once("SIGTERM", () => shutdown("SIGTERM"));
   process.once("SIGINT", () => shutdown("SIGINT"));
 }
