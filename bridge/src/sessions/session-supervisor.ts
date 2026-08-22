@@ -610,7 +610,7 @@ export function createSessionSupervisor(
     for (const { requestId } of rows) {
       const record = await options.ledger.get(requestId);
       if (record === undefined) continue;
-      await moveToIndeterminate(record.requestId, record.sessionId);
+      await moveToIndeterminate(record.requestId);
       const evidence = await history.findTurnEvidence(record.sessionId, requestId);
       if (evidence.kind !== "turn") continue; // absent / unparseable: no guess
       await options.ledger.transitionWithStatusEvent(requestId, evidence.outcome, {
@@ -625,7 +625,7 @@ export function createSessionSupervisor(
     }
   }
 
-  async function moveToIndeterminate(requestId: string, sessionId: string): Promise<void> {
+  async function moveToIndeterminate(requestId: string): Promise<void> {
     try {
       await options.ledger.transitionWithStatusEvent(requestId, "indeterminate", {
         now: now(),
@@ -646,7 +646,6 @@ export function createSessionSupervisor(
       if ((error as Error).name === "IllegalTransitionError") return;
       throw error;
     }
-    void sessionId;
   }
 
   return {

@@ -469,7 +469,7 @@ describe("release", () => {
     const transcript = join(dir, "transcript.jsonl");
     writeFileSync(transcript, "line1\n");
     factory.onNextStart((opts) => ({ ...opts, transcriptPath: transcript, diesOn: ["SIGKILL"] }));
-    const supervisor = buildSupervisor();
+    const supervisor = buildSupervisor({ stabilizationTimeoutMs: 1500 });
     const { sessionId } = await supervisor.createSession({ projectId: "proj-1" });
     const handle = factory.handles[0]!;
 
