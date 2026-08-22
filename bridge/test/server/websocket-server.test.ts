@@ -219,6 +219,16 @@ describe("inbound commands", () => {
     await expect(command).resolves.toMatchObject({ requestId: "r1", commandType: "session.list" });
     ws.close();
   });
+
+  it("closes with 4500 on malformed inbound JSON", async () => {
+    const url = await startServer();
+    const { ws, opened, closed } = open(url, AUTH_HEADERS, V1);
+    await opened;
+    await waitForConnection();
+    ws.send("this is not json{");
+    const close = await closed;
+    expect(close.code).toBe(4500);
+  });
 });
 
 describe("WS_CLOSE_CODES", () => {
