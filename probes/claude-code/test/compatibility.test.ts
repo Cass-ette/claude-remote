@@ -77,13 +77,14 @@ async function writeMcpConfig(
     exitAfterPromptMs?: number;
   }
 ): Promise<string> {
-  const probeModule = resolve(import.meta.dirname, "../src/permission-probe-server.ts");
+  const probeModule = resolve(import.meta.dirname, "../src/permission-probe-server.mjs");
   const cfg = {
     mcpServers: {
       claude_remote_probe: {
-        command: "npx",
+        // Spawn via absolute node + plain ESM JS: Claude Code spawns stdio
+        // MCP servers with a restricted PATH where `npx`/`tsx` don't resolve.
+        command: process.execPath,
         args: [
-          "tsx",
           probeModule,
           "--role",
           "target",
@@ -98,9 +99,8 @@ async function writeMcpConfig(
         ]
       },
       claude_remote_permission: {
-        command: "npx",
+        command: process.execPath,
         args: [
-          "tsx",
           probeModule,
           "--role",
           "permission",

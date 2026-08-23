@@ -20,6 +20,10 @@
 // The two processes communicate through a shared JSON-lines event log file
 // (passed via `--event-log <path>`), not via the MCP transport. This keeps
 // the MCP contract clean and lets the gate assert ordered, observed events.
+//
+// This file is plain ESM JavaScript (no TypeScript, no tsx runner) so it can
+// be spawned directly as `<absolute node> <this file>` — Claude Code spawns
+// stdio MCP servers with a restricted PATH where `npx`/`tsx` do not resolve.
 
 import { open } from "node:fs/promises";
 import { resolve } from "node:path";
@@ -32,42 +36,8 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 
-export interface ProbeOptions {
-  role: "target" | "permission";
-  /** Target role only: randomized tool name (`echo_probe_<hex>`). */
-  toolName?: string | undefined;
-  /** Target role only: nonce the gate expects to see echoed back. */
-  nonce?: string | undefined;
-  /** Permission role only: decision to return. */
-  decision?: "allow" | "deny" | undefined;
-  /** Permission role only: when set, never respond (simulate a hung broker). */
-  hangMs?: number | undefined;
-  /**
-   * Permission role only: when set, exit the server cleanly (code 0) this many
-   * ms after recording `permission_prompted`. This closes the MCP stdio pipe
-   * from the server side — the observable Claude Code sees when its MCP
-   * adapter crashes mid-session.
-   */
-  exitAfterPromptMs?: number | undefined;
-  /** Shared event log path. */
-  eventLog: string;
-  /** Server name as it appears in mcp-config (e.g. `claude_remote_probe`). */
-  serverName: string;
-}
-
-interface ParsedArgs {
-  role: "target" | "permission";
-  toolName?: string | undefined;
-  nonce?: string | undefined;
-  decision?: "allow" | "deny" | undefined;
-  hangMs?: number | undefined;
-  exitAfterPromptMs?: number | undefined;
-  eventLog: string;
-  serverName: string;
-}
-
-export function parseProbeArgs(argv: readonly string[]): ParsedArgs {
-  const out: ParsedArgs = { role: "permission", eventLog: "", serverName: "" };
+export function parseProbeArgs(argv) {
+  const out = { role: "permission", eventLog: "", serverName: "" };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     const next = argv[i + 1];
@@ -123,7 +93,7 @@ export function parseProbeArgs(argv: readonly string[]): ParsedArgs {
   return out;
 }
 
-async function appendEvent(path: string, event: Record<string, unknown>): Promise<void> {
+async function appendEvent(path, event) {
   // O_APPEND is atomic for individual write() calls on most platforms for
   // small payloads; use a file handle and an explicit line to keep records
   // separable.
@@ -140,7 +110,7 @@ const PermissionInput = z.object({
   input: z.unknown().optional()
 });
 
-async function runTarget(opts: Required<Omit<ProbeOptions, "decision" | "hangMs" | "exitAfterPromptMs">>): Promise<void> {
+async function runTarget(opts) {
   const server = new Server(
     { name: opts.serverName, version: "0.0.0" },
     { capabilities: { tools: {} } }
@@ -191,15 +161,7 @@ async function runTarget(opts: Required<Omit<ProbeOptions, "decision" | "hangMs"
   });
 }
 
-async function runPermission(
-  opts: {
-    eventLog: string;
-    serverName: string;
-    decision?: "allow" | "deny" | undefined;
-    hangMs?: number | undefined;
-    exitAfterPromptMs?: number | undefined;
-  }
-): Promise<void> {
+async function runPermission(opts) {
   const server = new Server(
     { name: opts.serverName, version: "0.0.0" },
     { capabilities: { tools: {} } }
@@ -251,19 +213,18 @@ async function runPermission(
     if (opts.hangMs !== undefined && opts.hangMs > 0) {
       // Simulate a hung permission broker: never respond. The compatibility
       // gate's five-second timeout will fire and assert fail-closed.
-      await new Promise<void>(() => {
+      await new Promise(() => {
         // intentionally never resolves
       });
     }
 
     const behavior = opts.decision === "deny" ? "deny" : "allow";
-    const modifiedInput = parsed.success ? parsed.data.input : undefined;
     return {
       content: [
         {
           type: "text",
           text: JSON.stringify({
-            behavior,
+            behavior
           })
         }
       ]
@@ -281,7 +242,7 @@ async function runPermission(
   });
 }
 
-export async function runProbeServer(opts: ProbeOptions): Promise<void> {
+export async function runProbeServer(opts) {
   if (opts.role === "target") {
     if (!opts.toolName) throw new Error("target role requires --tool-name");
     if (!opts.nonce) throw new Error("target role requires --nonce");
@@ -314,7 +275,7 @@ const invokedDirectly = (() => {
 if (invokedDirectly) {
   const parsed = parseProbeArgs(process.argv.slice(2));
   runProbeServer(parsed).catch((err) => {
-    process.stderr.write(`probe-server: ${(err as Error).message}\n`);
+    process.stderr.write(`probe-server: ${err.message}\n`);
     process.exitCode = 1;
   });
 }
