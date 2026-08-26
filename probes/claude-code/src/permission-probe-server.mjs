@@ -107,7 +107,8 @@ async function appendEvent(path, event) {
 
 const PermissionInput = z.object({
   tool_name: z.string(),
-  input: z.unknown().optional()
+  input: z.unknown().optional(),
+  tool_use_id: z.string().optional()
 });
 
 async function runTarget(opts) {
@@ -204,10 +205,15 @@ async function runPermission(opts) {
 
     if (opts.exitAfterPromptMs !== undefined && opts.exitAfterPromptMs > 0) {
       // Simulate a mid-session MCP adapter crash: schedule a clean exit so the
-      // MCP stdio pipe closes from the server side. The compatibility gate
-      // asserts that Claude Code observes the closed pipe and fails closed,
-      // without ever invoking the target tool.
+      // MCP stdio pipe closes from the server side — BEFORE any response is
+      // sent (never resolving the handler is what makes this a true mid-call
+      // crash rather than an allow-then-exit). The compatibility gate asserts
+      // that Claude Code observes the closed pipe and fails closed, without
+      // ever invoking the target tool.
       setTimeout(() => process.exit(0), opts.exitAfterPromptMs);
+      await new Promise(() => {
+        // intentionally never resolves; the exit timer wins
+      });
     }
 
     if (opts.hangMs !== undefined && opts.hangMs > 0) {
@@ -218,14 +224,30 @@ async function runPermission(opts) {
       });
     }
 
-    const behavior = opts.decision === "deny" ? "deny" : "allow";
+    // §6.4 contract: allow must echo the original input as updatedInput
+    // (Claude Code executes the tool with it); deny must carry a message.
+    // toolUseID is included only when the request had tool_use_id.
+    const toolUseId = parsed.success ? parsed.data.tool_use_id : undefined;
+    const decision =
+      opts.decision === "deny"
+        ? {
+            behavior: "deny",
+            message: "probe deny",
+            interrupt: false
+          }
+        : {
+            behavior: "allow",
+            updatedInput:
+              parsed.success && parsed.data.input !== undefined
+                ? parsed.data.input
+                : {}
+          };
+    if (toolUseId !== undefined) decision.toolUseID = toolUseId;
     return {
       content: [
         {
           type: "text",
-          text: JSON.stringify({
-            behavior
-          })
+          text: JSON.stringify(decision)
         }
       ]
     };

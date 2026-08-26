@@ -298,7 +298,7 @@ describe.skipIf(!RUN)("claude code real CLI compatibility", () => {
       sessionId: randomUUID(),
       promptText: `Call the MCP tool named ${targetTool} exactly once.`,
       permissionTool: "mcp__claude_remote_permission__decide",
-      drainTimeoutMs: 10000
+      drainTimeoutMs: 30000
     });
     expect(timeoutRun.targetInvocations).toBe(0);
 
@@ -321,7 +321,7 @@ describe.skipIf(!RUN)("claude code real CLI compatibility", () => {
       sessionId: randomUUID(),
       promptText: `Call the MCP tool named ${targetTool} exactly once.`,
       permissionTool: "mcp__claude_remote_permission__decide",
-      drainTimeoutMs: 10000
+      drainTimeoutMs: 30000
     });
     expect(adapterExit.targetInvocations).toBe(0);
     expect(
@@ -358,8 +358,9 @@ describe.skipIf(!RUN)("claude code real CLI compatibility", () => {
       );
     }
 
-    // Write check details to a temp file for run-real-gate.ts to read.
-    const checkPath = join(cwd, "checks.json");
+    // Write check details for run-real-gate.ts. Lives OUTSIDE cwd: the cleanup
+    // below deletes cwd wholesale, and the wrapper reads this file after exit.
+    const checkPath = join(tmpdir(), `claude-checks-${randomUUID()}.json`);
     const checks = {
       candidate_input_supported: true,
       init_id_matches: initFrame?.session_id === sessionId,
