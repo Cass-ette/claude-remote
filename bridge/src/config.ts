@@ -22,6 +22,18 @@ export interface BridgeConfig {
   readonly auditLogPath: string;
   /** Byte budget for pending (undelivered) events per session fan-out. */
   readonly pendingEventsByteBudget: number;
+  /**
+   * Claude Code executable override (BRIDGE_CLAUDE_BIN). When unset, the
+   * process factory resolves `claude` from PATH at construction and stores
+   * the absolute path.
+   */
+  readonly claudeBin?: string | undefined;
+  /**
+   * Absolute path of the permission MCP adapter entry script
+   * (BRIDGE_PERMISSION_ADAPTER_ENTRY). Claude Code spawns it as the
+   * per-session MCP server via the `--strict-mcp-config` JSON.
+   */
+  readonly permissionAdapterEntry?: string | undefined;
 }
 
 /** Loopback hosts the Bridge is allowed to bind to. */
@@ -106,6 +118,15 @@ function parsePendingEventsByteBudget(env: EnvSource): number {
   return budget;
 }
 
+function parseOptionalAbsolutePath(env: EnvSource, key: string): string | undefined {
+  const value = readString(env, key);
+  if (value === undefined) return undefined;
+  if (!isAbsolute(value)) {
+    throw new Error(`${key} must be an absolute path; got ${JSON.stringify(value)}.`);
+  }
+  return value;
+}
+
 /**
  * Validate environment variables and produce an immutable
  * {@link BridgeConfig}. Creates {@link BRIDGE_DATA_DIR} recursively with
@@ -116,6 +137,8 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const port = parsePort(env);
   const dataDir = parseDataDir(env);
   const pendingEventsByteBudget = parsePendingEventsByteBudget(env);
+  const claudeBin = readString(env, "BRIDGE_CLAUDE_BIN");
+  const permissionAdapterEntry = parseOptionalAbsolutePath(env, "BRIDGE_PERMISSION_ADAPTER_ENTRY");
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
@@ -126,5 +149,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     databasePath: join(dataDir, "bridge.db"),
     auditLogPath: join(dataDir, "audit.jsonl"),
     pendingEventsByteBudget,
+    claudeBin,
+    permissionAdapterEntry,
   });
 }

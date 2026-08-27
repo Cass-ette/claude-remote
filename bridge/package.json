@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "main": "dist/src/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "tsc -p tsconfig.json && cp src/claude/lease-watcher.mjs dist/src/claude/lease-watcher.mjs",
     "start": "node dist/src/main.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
