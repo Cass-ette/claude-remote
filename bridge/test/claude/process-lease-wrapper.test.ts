@@ -22,7 +22,11 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { startProcessLeaseWrapper, type ProcessLease } from "../../src/claude/process-lease-wrapper.js";
+import {
+  resolveMkfifoPath,
+  startProcessLeaseWrapper,
+  type ProcessLease,
+} from "../../src/claude/process-lease-wrapper.js";
 import {
   ENV_REDACT_KEYS,
   createRealProcessFactory,
@@ -35,6 +39,7 @@ import type { ClaudeProcessHandle } from "../../src/sessions/session-supervisor.
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const fakeClaudePath = join(here, "../fixtures/fake-claude.mjs");
+const pidLoggingSleeperPath = join(here, "pid-logging-sleeper.mjs");
 
 const WATCH_MS = 100;
 
@@ -257,6 +262,27 @@ describe("resolveExecutableFromPath", () => {
   });
 });
 
+describe("resolveMkfifoPath", () => {
+  let workdir: string;
+
+  beforeEach(() => {
+    workdir = mkdtempSync(join(tmpdir(), "bridge-mkfifo-resolve-test-"));
+  });
+
+  afterEach(() => {
+    rmSync(workdir, { recursive: true, force: true });
+  });
+
+  it("resolves mkfifo from PATH, falling back to the absolute default", () => {
+    // NixOS/Alpine footgun: mkfifo is not guaranteed to live at /usr/bin.
+    const fakeMkfifo = join(workdir, "mkfifo");
+    writeFileSync(fakeMkfifo, "#!/bin/sh\n", "utf8");
+    chmodSync(fakeMkfifo, 0o755);
+    expect(resolveMkfifoPath({ PATH: workdir })).toBe(fakeMkfifo);
+    expect(resolveMkfifoPath({ PATH: "/definitely/not/here" })).toBe("/usr/bin/mkfifo");
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Real factory integration (fake-claude binary, real lease + watcher)
 // ---------------------------------------------------------------------------
@@ -391,6 +417,82 @@ describe("createRealProcessFactory (fake-claude end to end)", () => {
       // Exactly one signal: the one WE sent. The lease watcher observed the
       // already-dead pid and sent nothing.
       expect(readFileSync(signalsLog, "utf8").trim()).toBe("SIGINT");
+    },
+    15_000,
+  );
+
+  it(
+    "lease setup failure (failing mkfifo) kills the spawned child — no orphan",
+    async () => {
+      const sessionId = randomUUID();
+      const pidLog = join(workdir, `${sessionId}.pid`);
+      const fakeAdapter = join(workdir, "fake-permission-adapter.mjs");
+      writeFileSync(fakeAdapter, "// tiny fake MCP adapter entry\nexport {};\n", "utf8");
+      // A mkfifo stand-in that FAILS (exit 1) after a short delay: the delay
+      // lets the child boot far enough to log its pid, so the test can watch
+      // THAT exact pid die — a deterministic orphan check, no ps needed.
+      const failingMkfifo = join(workdir, "failing-mkfifo.sh");
+      writeFileSync(failingMkfifo, "#!/bin/sh\nsleep 1\nexit 1\n", "utf8");
+      chmodSync(failingMkfifo, 0o755);
+      const factory = createRealProcessFactory({
+        dataDir: workdir,
+        claudeBin: process.execPath,
+        claudeBinArgs: [pidLoggingSleeperPath, pidLog],
+        permissionAdapterEntry: fakeAdapter,
+        permissionSocketPath: join(workdir, "permission.sock"),
+        leaseWaitMs: WATCH_MS,
+        mkfifoPath: failingMkfifo,
+      });
+
+      await expect(factory.start({ sessionId, mode: "create", cwd: workdir })).rejects.toThrow(
+        /Command failed/,
+      );
+
+      // The child really did run before the failure...
+      await waitFor(() => existsSync(pidLog), "child pid log");
+      const pid = Number.parseInt(readFileSync(pidLog, "utf8").trim(), 10);
+      expect(pid).toBeGreaterThan(0);
+      // ...and the failed lease setup left it DEAD (ESRCH when probed), not
+      // orphaned waiting on a stdin that will never close.
+      await waitFor(
+        () => {
+          try {
+            process.kill(pid, 0);
+            return false;
+          } catch {
+            return true;
+          }
+        },
+        "orphaned child to die after lease-setup failure",
+        2000,
+      );
+      // The FIFO was never created, so nothing else leaked either.
+      expect(existsSync(join(workdir, "leases", `${sessionId}.fifo`))).toBe(false);
+    },
+    15_000,
+  );
+
+  it(
+    "lease setup failure (missing mkfifo binary) throws without an orphan",
+    async () => {
+      const sessionId = randomUUID();
+      const fakeAdapter = join(workdir, "fake-permission-adapter.mjs");
+      writeFileSync(fakeAdapter, "// tiny fake MCP adapter entry\nexport {};\n", "utf8");
+      const factory = createRealProcessFactory({
+        dataDir: workdir,
+        claudeBin: process.execPath,
+        claudeBinArgs: [pidLoggingSleeperPath, join(workdir, `${sessionId}.pid`)],
+        permissionAdapterEntry: fakeAdapter,
+        permissionSocketPath: join(workdir, "permission.sock"),
+        leaseWaitMs: WATCH_MS,
+        mkfifoPath: join(workdir, "definitely-not-mkfifo"),
+      });
+
+      // Same teardown path as above with the other failure kind: ENOENT.
+      await expect(factory.start({ sessionId, mode: "create", cwd: workdir })).rejects.toThrow(
+        /ENOENT/,
+      );
+      expect(existsSync(join(workdir, "leases", `${sessionId}.fifo`))).toBe(false);
     },
     15_000,
   );

@@ -249,6 +249,43 @@ describe("ClaudeStreamJsonProcess (fake child process)", () => {
   );
 
   it(
+    "sendUser racing a child-group SIGKILL never crashes the process (stdin EPIPE)",
+    async () => {
+      const h = startFake();
+      await h.proc.awaitInit(5000);
+      expect(h.proc.pid).toBeDefined();
+
+      // The race window: the group dies while writes are still flowing —
+      // before the adapter's exit hook has flipped `exited`, the guard
+      // passes and the write lands on a pipe whose reader is gone. This is
+      // the reviewer's stress scenario: a write barrage across the kill, so
+      // flushes keep being attempted after the kernel closes the read end
+      // (a lone write can still fit the pipe buffer and never EPIPE).
+      h.proc.signal("SIGKILL");
+      for (let i = 0; i < 200; i++) {
+        try {
+          h.proc.sendUser(randomUUID(), h.sessionId, "x".repeat(4096));
+        } catch {
+          // The exit hook caught up: sendUser's own `exited` guard threw a
+          // normal typed error. The barrage has crossed the window.
+          break;
+        }
+        if (i % 10 === 0) await sleep(1); // let the kernel catch up mid-barrage
+      }
+      // Give any asynchronous EPIPE time to surface INSIDE this test;
+      // without the constructor's stdin error handler, the unhandled
+      // 'error' event tears this worker down right here.
+      await sleep(150);
+
+      // Post-mortem, deterministic: once exit is fully observed, sendUser
+      // throws the typed error instead of writing to the dead pipe.
+      await waitFor(() => !h.proc.alive(), "process exit after SIGKILL");
+      expect(() => h.proc.sendUser(randomUUID(), h.sessionId, "after exit")).toThrow(/exited/);
+    },
+    10_000,
+  );
+
+  it(
     "create mode spawns the exact Phase 0 arg order and never --resume",
     async () => {
       const h = startFake();

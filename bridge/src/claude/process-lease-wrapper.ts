@@ -20,8 +20,21 @@ import { execFileSync, spawn } from "node:child_process";
 import { closeSync, constants as fsConstants, mkdirSync, openSync, rmSync } from "node:fs";
 import { dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveExecutableFromPath } from "./process-factory.js";
 
 const DEFAULT_MKFIFO_PATH = "/usr/bin/mkfifo";
+
+/**
+ * Resolve `mkfifo` from PATH the same way the factory resolves `claude`
+ * (`resolveExecutableFromPath`): NixOS/Alpine do not guarantee
+ * `/usr/bin/mkfifo`. Falls back to the historical absolute default only
+ * when PATH has no match.
+ */
+export function resolveMkfifoPath(
+  env: Record<string, string | undefined> = process.env,
+): string {
+  return resolveExecutableFromPath("mkfifo", env) ?? DEFAULT_MKFIFO_PATH;
+}
 
 export interface ProcessLeaseOptions {
   /** FIFO path, conventionally `<dataDir>/leases/<sessionId>.fifo`. */
@@ -32,7 +45,7 @@ export interface ProcessLeaseOptions {
   readonly waitMs?: number;
   /** Override for tests; defaults to the sibling lease-watcher.mjs. */
   readonly watcherScriptPath?: string;
-  /** Override for tests; defaults to /usr/bin/mkfifo. */
+  /** Override for tests; defaults to PATH-resolved mkfifo. */
   readonly mkfifoPath?: string;
 }
 
@@ -59,7 +72,7 @@ function defaultWatcherScriptPath(): string {
 export function startProcessLeaseWrapper(options: ProcessLeaseOptions): ProcessLease {
   const waitMs = options.waitMs ?? 5000;
   const watcherScriptPath = options.watcherScriptPath ?? defaultWatcherScriptPath();
-  const mkfifoPath = options.mkfifoPath ?? DEFAULT_MKFIFO_PATH;
+  const mkfifoPath = options.mkfifoPath ?? resolveMkfifoPath();
 
   mkdirSync(dirname(options.fifoPath), { recursive: true, mode: 0o700 });
   // Remove a stale entry from a previous (crashed) run; an existing open fd
@@ -76,14 +89,19 @@ export function startProcessLeaseWrapper(options: ProcessLeaseOptions): ProcessL
     fsConstants.O_RDWR | fsConstants.O_NONBLOCK,
   );
 
-  const watcher = spawn(
-    process.execPath,
-    [watcherScriptPath, "--fifo", options.fifoPath, "--pid", String(options.claudePid), "--wait-ms", String(waitMs)],
-    {
-      stdio: "ignore",
-      detached: true, // survives Bridge death — that is its whole purpose
-    },
-  );
+  const watcherArgs = [
+    watcherScriptPath,
+    "--fifo",
+    options.fifoPath,
+    "--pid",
+    String(options.claudePid),
+    "--wait-ms",
+    String(waitMs),
+  ];
+  const watcher = spawn(process.execPath, watcherArgs, {
+    stdio: "ignore",
+    detached: true, // survives Bridge death — that is its whole purpose
+  });
   watcher.unref();
 
   let closed = false;

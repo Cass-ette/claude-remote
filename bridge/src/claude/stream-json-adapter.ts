@@ -248,6 +248,11 @@ export class ClaudeStreamJsonProcess {
       this.drainEnd();
     });
     child.stdout?.on("error", (err) => this.handleExit(err));
+    child.stdin?.on("error", () => {
+      // Child died mid-write (EPIPE when its group is SIGKILLed/OOM-killed
+      // between sendUser's `exited` guard and the write flush). The exit hook
+      // owns teardown; an unhandled 'error' here would crash the whole Bridge.
+    });
     // stderr is swallowed: it can echo transcript content and the stream-json
     // contract never uses it for frames.
     child.stderr?.resume();

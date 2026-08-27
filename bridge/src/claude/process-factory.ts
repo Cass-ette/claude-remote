@@ -144,6 +144,7 @@ export interface RealProcessFactoryOptions {
   readonly leaseWaitMs?: number;
   /** Override for tests; defaults to the sibling lease-watcher.mjs. */
   readonly watcherScriptPath?: string;
+  /** Override for tests; defaults to PATH-resolved mkfifo. */
   readonly mkfifoPath?: string;
 }
 
@@ -190,22 +191,35 @@ export function createRealProcessFactory(options: RealProcessFactoryOptions): Cl
         detached: true, // own process group: group-scoped stop + lease target
       });
       if (process_.pid === undefined) {
-        // Spawn failure (e.g. ENOENT); awaitInit rejects via the error hook,
-        // but fail fast so the supervisor's failStartup has no pid to leak.
-        process_.signal("SIGKILL");
+        // Spawn failure (e.g. ENOENT): no pid exists, so there is nothing to
+        // signal or leak — awaitInit also rejects via the error hook. Fail
+        // fast so the supervisor's failStartup never sees a half-started child.
         throw new Error(`failed to start claude process for session ${sessionId}`);
       }
 
       const fifoPath = join(options.dataDir, "leases", `${sessionId}.fifo`);
-      const lease: ProcessLease = startProcessLeaseWrapper({
-        fifoPath,
-        claudePid: process_.pid,
-        waitMs: leaseWaitMs,
-        ...(options.watcherScriptPath !== undefined
-          ? { watcherScriptPath: options.watcherScriptPath }
-          : {}),
-        ...(options.mkfifoPath !== undefined ? { mkfifoPath: options.mkfifoPath } : {}),
-      });
+      let lease: ProcessLease;
+      try {
+        lease = startProcessLeaseWrapper({
+          fifoPath,
+          claudePid: process_.pid,
+          waitMs: leaseWaitMs,
+          ...(options.watcherScriptPath !== undefined
+            ? { watcherScriptPath: options.watcherScriptPath }
+            : {}),
+          ...(options.mkfifoPath !== undefined ? { mkfifoPath: options.mkfifoPath } : {}),
+        });
+      } catch (error) {
+        // The child is spawned but has no lease, no watcher, and no onExit
+        // teardown registered. Kill its process group now and wait for the
+        // exit hook before rethrowing, or it leaks as an orphaned Claude.
+        process_.signal("SIGKILL");
+        await new Promise<void>((resolve) => {
+          process_.onExit(resolve);
+          setTimeout(resolve, SIGNAL_WAIT_SECONDS * 1000);
+        });
+        throw error;
+      }
 
       // When the child exits (graceful stdin close, supervisor stop, crash),
       // end the lease and remove the FIFO. The watcher sees EOF, observes a
