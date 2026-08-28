@@ -693,6 +693,14 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
             type: "error",
             code: error instanceof PermissionRequestValidationError ? "invalid_request" : "internal",
             message: (error as Error).message,
+            // Correlate the rejection with the affected request so the
+            // adapter can settle its pending call as denied (fail closed).
+            // Only an id the frame actually carried is echoed — including
+            // one the broker would have generated is pointless, that id was
+            // never sent anywhere.
+            ...(typeof raw.permissionRequestId === "string" && raw.permissionRequestId !== ""
+              ? { permissionRequestId: raw.permissionRequestId }
+              : {}),
           });
         }
         return;
@@ -705,6 +713,8 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
             type: "error",
             code: "unknown_permission_request",
             message: `no pending permission request ${JSON.stringify(id)} on this connection`,
+            // Correlate the rejection with the abort's (invalid) request id.
+            ...(typeof id === "string" && id !== "" ? { permissionRequestId: id } : {}),
           });
           return;
         }

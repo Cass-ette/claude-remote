@@ -712,6 +712,45 @@ describe("permission broker", () => {
     expect(await adapter.waitClosed()).toBe(true);
   });
 
+  it("correlates error frames with the offending frame's permissionRequestId", async () => {
+    await makeBroker();
+    broker!.registerLease(SECRET_A, SESSION_A);
+    const adapter = await openAdapter(SECRET_A, SESSION_A);
+
+    // Rejected permission_request carrying an id: the error frame echoes it
+    // so the adapter can settle its pending call as denied (fail closed).
+    adapter.send({ type: "permission_request", permissionRequestId: "perm-echo", toolName: "", input: {} });
+    const err1 = (await adapter.nextFrame()) as { type: string; code: string; permissionRequestId?: string };
+    expect(err1.type).toBe("error");
+    expect(err1.code).toBe("invalid_request");
+    expect(err1.permissionRequestId).toBe("perm-echo");
+
+    // Abort of an id this connection does not own: the error carries that id.
+    adapter.send({ type: "abort", permissionRequestId: "perm-nope" });
+    const err2 = (await adapter.nextFrame()) as { type: string; code: string; permissionRequestId?: string };
+    expect(err2.type).toBe("error");
+    expect(err2.code).toBe("unknown_permission_request");
+    expect(err2.permissionRequestId).toBe("perm-nope");
+
+    // Frames that identify no request omit the id entirely.
+    adapter.send({ type: "permission_request", toolName: "", input: {} });
+    const err3 = (await adapter.nextFrame()) as { type: string; code: string; permissionRequestId?: string };
+    expect(err3.type).toBe("error");
+    expect(err3.code).toBe("invalid_request");
+    expect(err3.permissionRequestId).toBeUndefined();
+    adapter.send({ type: "definitely_not_a_frame" });
+    const err4 = (await adapter.nextFrame()) as { type: string; code: string; permissionRequestId?: string };
+    expect(err4.type).toBe("error");
+    expect(err4.permissionRequestId).toBeUndefined();
+
+    // Nothing was registered and nothing was terminated; the connection
+    // stayed usable throughout (correlated errors deny requests, not links).
+    expect(journalPayloads("permission.requested")).toHaveLength(0);
+    expect(terminated).toEqual([]);
+    const id = await submit(adapter, { toolName: "Bash", input: { command: "still-alive" } });
+    expect(id).toMatch(/^perm-/);
+  });
+
   // -- async-error / sync-throw hardening -----------------------------------
 
   it("rejects (never throws synchronously) on invalid direct input or lease", async () => {

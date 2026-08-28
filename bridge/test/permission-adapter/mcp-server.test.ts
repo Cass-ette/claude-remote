@@ -15,10 +15,14 @@
  *  3. includes toolUseID only when the original request had tool_use_id
  *  4. lease secret failures close stdio without any MCP result
  *  5. unreachable bridge socket: deny "bridge_unavailable" + nonzero exit
- * plus the adapter-side hard timeout guard (broker silent past its wait).
+ * plus the adapter-side hard timeout guard (broker silent past its wait),
+ * concurrent decide calls sharing ONE broker connection (the single-use
+ * lease forbids a second one), and correlated broker error frames denying
+ * the affected pending call.
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
+import net from "node:net";
 import { createInterface } from "node:readline";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -31,6 +35,11 @@ import {
   type EventJournal,
 } from "../../src/events/event-journal.js";
 import { createPermissionBroker, type PermissionBroker } from "../../src/permissions/permission-broker.js";
+import {
+  createFrameDecoder,
+  encodeFrame,
+  isPlainObject,
+} from "../../src/permissions/socket-protocol.js";
 
 const ADAPTER_MAIN = fileURLToPath(
   new URL("../../src/permission-adapter/main.mjs", import.meta.url),
@@ -132,6 +141,8 @@ let journal: Pick<EventJournal, "append">;
 let appended: AppendOptions[];
 let broker: PermissionBroker | undefined;
 let procs: ChildProcess[];
+/** Raw test-side socket servers replacing the real broker in one test. */
+let servers: net.Server[];
 
 async function startBroker(timeoutMs = 60_000): Promise<PermissionBroker> {
   const started = createPermissionBroker({
@@ -247,6 +258,7 @@ beforeEach(() => {
   };
   broker = undefined;
   procs = [];
+  servers = [];
 });
 
 afterEach(async () => {
@@ -255,6 +267,9 @@ afterEach(async () => {
       proc.kill("SIGKILL");
       await waitForExit(proc, 5_000).catch(() => undefined);
     }
+  }
+  for (const server of servers) {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
   await broker?.close();
   db.close();
@@ -437,6 +452,125 @@ describe("permission-adapter main.mjs as a stdio MCP server", () => {
       });
       const exit = await waitForExit(proc);
       expect(exit.code).toBe(1);
+    } finally {
+      client.close();
+    }
+  }, 30_000);
+
+  it("answers two CONCURRENT decide calls through one broker connection (single-use lease)", async () => {
+    const activeBroker = await startBroker();
+    const proc = spawnAdapter();
+    const client = new McpStdioClient(proc);
+    try {
+      await client.initialize();
+
+      // Both tools/call requests are written back-to-back BEFORE either
+      // response is awaited: the MCP SDK dispatches them concurrently, so the
+      // adapter's lazy broker connect must be serialized. The lease secret is
+      // SINGLE-USE — two racing connections would both hello with it, the
+      // broker would consume it on the first and destroy the second, losing a
+      // healthy in-flight call (and quite possibly the process).
+      const callA = client.request(2, "tools/call", {
+        name: "decide",
+        arguments: { tool_name: "Bash", input: { command: "ls a" }, tool_use_id: "toolu_AA" },
+      });
+      const callB = client.request(3, "tools/call", {
+        name: "decide",
+        arguments: { tool_name: "Write", input: { file_path: "/tmp/b", content: "x" } },
+      });
+
+      const requestA = await waitFor(() => requestedPayloadFor("Bash"));
+      const requestB = await waitFor(() => requestedPayloadFor("Write"));
+      await activeBroker.resolve({
+        permissionRequestId: requestA.permissionRequestId as string,
+        sessionId: SESSION_ID,
+        deviceId: DEVICE_ID,
+        decision: { behavior: "allow" },
+      });
+      await activeBroker.resolve({
+        permissionRequestId: requestB.permissionRequestId as string,
+        sessionId: SESSION_ID,
+        deviceId: DEVICE_ID,
+        decision: { behavior: "deny", message: "no writing" },
+      });
+
+      expect(decisionJson(await callA)).toEqual({
+        behavior: "allow",
+        updatedInput: { command: "ls a" },
+        toolUseID: "toolu_AA",
+      });
+      expect(decisionJson(await callB)).toEqual({
+        behavior: "deny",
+        message: "no writing",
+        interrupt: false,
+      });
+
+      // Both answered AND the adapter survived: a destroyed duplicate
+      // connection would have scheduled a fatal exit (250 ms timer).
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(client.receivedIds.has(2)).toBe(true);
+      expect(client.receivedIds.has(3)).toBe(true);
+      expect(proc.exitCode).toBeNull();
+    } finally {
+      client.close();
+    }
+  }, 30_000);
+
+  it("answers deny bridge_error when the broker sends an error frame correlated to the pending call", async () => {
+    // The real broker only sends error frames for frames the adapter never
+    // sends (the adapter validates §6.4 input locally, so its permission_
+    // requests always pass broker validation, and it only aborts at teardown)
+    // — but the protocol promises correlated error frames deny the affected
+    // request (socket-protocol.ts), and the broker now populates
+    // permissionRequestId where one is identifiable (tested in
+    // permission-broker.test.ts). Exercise the adapter's side against a
+    // minimal raw broker speaking the real frame protocol.
+    const server = net.createServer((socket) => {
+      const decoder = createFrameDecoder();
+      socket.on("data", (chunk: Buffer) => {
+        let frames: unknown[];
+        try {
+          frames = decoder.push(chunk);
+        } catch {
+          socket.destroy();
+          return;
+        }
+        for (const frame of frames) {
+          if (!isPlainObject(frame) || frame.type !== "permission_request") continue;
+          // Reject the request the adapter just forwarded, correlated by id.
+          socket.write(
+            encodeFrame({
+              type: "error",
+              code: "invalid_request",
+              message: "boom",
+              permissionRequestId: frame.permissionRequestId,
+            }),
+          );
+        }
+      });
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(socketPath, resolve));
+
+    const proc = spawnAdapter();
+    const client = new McpStdioClient(proc);
+    try {
+      await client.initialize();
+      const res = await client.request(2, "tools/call", {
+        name: "decide",
+        arguments: { tool_name: "Bash", input: { command: "ls" }, tool_use_id: "toolu_E" },
+      });
+      expect(decisionJson(res)).toEqual({
+        behavior: "deny",
+        message: "bridge_error: invalid_request: boom",
+        interrupt: false,
+        toolUseID: "toolu_E",
+      });
+
+      // A correlated error denies ONE call; the connection stays open and
+      // the adapter keeps serving (no fatal exit was scheduled: 250 ms timer).
+      await new Promise((resolve) => setTimeout(resolve, 500));
+      expect(proc.exitCode).toBeNull();
     } finally {
       client.close();
     }

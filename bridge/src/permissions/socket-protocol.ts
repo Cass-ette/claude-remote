@@ -36,7 +36,14 @@
  *                     first version never carries updatedPermissions.
  *   error             { type, code, message, permissionRequestId? }
  *                     Malformed or semantically invalid frame; the
- *                     connection stays open, affected requests are denied.
+ *                     connection stays open. permissionRequestId is present
+ *                     exactly when the offending frame identified a request:
+ *                     invalid_request echoes the adapter-supplied id of the
+ *                     rejected permission_request, unknown_permission_request
+ *                     carries the abort's id. The adapter settles that
+ *                     pending call as denied (fail closed); frames that
+ *                     identify no request (invalid_frame, unknown_frame)
+ *                     omit the id.
  */
 
 /** Upper bound for a single frame payload (guards against runaway peers). */

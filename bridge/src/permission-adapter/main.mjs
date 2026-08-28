@@ -129,6 +129,17 @@ function isPlainObject(value) {
 const pendingDecisions = new Map();
 
 let brokerSocket = undefined;
+/**
+ * Memoized connectBroker() promise. The MCP SDK dispatches tools/call
+ * handlers CONCURRENTLY, so the lazy connect must be serialized: two pipelined
+ * decide calls both seeing `brokerSocket === undefined` would both connect,
+ * and two hello frames carry the same SINGLE-USE lease — the broker consumes
+ * it on the first connection and destroys the second, killing a healthy
+ * in-flight call. The memo is kept for the whole process lifetime (rejection
+ * included): the lease makes any reconnect impossible, so a failed connect
+ * must stay failed instead of retrying into a reconnect storm.
+ */
+let brokerConnectPromise = undefined;
 /** True once the connection is gone for good — the consumed lease makes any
  * reconnection impossible, so every later call fails closed. */
 let brokerDead = false;
@@ -172,9 +183,12 @@ function handleBrokerFrame(raw) {
     return;
   }
   if (raw.type === "error" && pendingDecisions.has(id)) {
-    // Broker-side rejection of this request: deny it (fail closed).
+    // Broker-side rejection of this request, correlated by id: deny it
+    // (fail closed), surfacing the broker's code and message for diagnosis.
+    // The connection stays open — only this call is settled.
+    const code = typeof raw.code === "string" ? raw.code : "error";
     const message = typeof raw.message === "string" ? raw.message : "permission broker error";
-    settlePending(id, { kind: "deny", message });
+    settlePending(id, { kind: "deny", message: `bridge_error: ${code}: ${message}` });
   }
   // request_registered needs no adapter action; the decision settles the call.
 }
@@ -259,11 +273,15 @@ async function decide(argumentsRaw) {
     return denyResult("bridge_unavailable", toolUseId);
   }
   if (brokerSocket === undefined) {
+    if (brokerConnectPromise === undefined) {
+      brokerConnectPromise = connectBroker();
+    }
     try {
-      brokerSocket = await connectBroker();
+      brokerSocket = await brokerConnectPromise;
     } catch {
       // Unreachable bridge (ENOENT/ECONNREFUSED): deny so the model sees a
-      // clean refusal, then bring the process down (fail closed).
+      // clean refusal, then bring the process down (fail closed). Concurrent
+      // callers awaiting the same memoized rejection each get this deny.
       scheduleFatalExit();
       return denyResult("bridge_unavailable", toolUseId);
     }
