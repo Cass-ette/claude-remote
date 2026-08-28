@@ -74,4 +74,23 @@ describe("loadConfig", () => {
     });
     expect(custom.pendingEventsByteBudget).toBe(1024);
   });
+
+  it("exposes the permission timeout with a 300 s default (spec §6.4)", () => {
+    const cfg = loadConfig({ BRIDGE_HOST: "127.0.0.1", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: dataDir() });
+    expect(cfg.permissionTimeoutSeconds).toBe(300);
+
+    const custom = loadConfig({
+      BRIDGE_HOST: "127.0.0.1",
+      BRIDGE_PORT: "43111",
+      BRIDGE_DATA_DIR: dataDir(),
+      BRIDGE_PERMISSION_TIMEOUT_SECONDS: "30",
+    });
+    expect(custom.permissionTimeoutSeconds).toBe(30);
+
+    for (const bad of ["0", "-5", "1.5", "soon"]) {
+      expect(() =>
+        loadConfig({ BRIDGE_HOST: "127.0.0.1", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: dataDir(), BRIDGE_PERMISSION_TIMEOUT_SECONDS: bad }),
+      ).toThrow(/PERMISSION_TIMEOUT/);
+    }
+  });
 });

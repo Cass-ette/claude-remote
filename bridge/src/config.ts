@@ -34,6 +34,11 @@ export interface BridgeConfig {
    * per-session MCP server via the `--strict-mcp-config` JSON.
    */
   readonly permissionAdapterEntry?: string | undefined;
+  /**
+   * Seconds a permission request may stay pending before the broker
+   * auto-denies it (spec §6.4: at most five minutes).
+   */
+  readonly permissionTimeoutSeconds: number;
 }
 
 /** Loopback hosts the Bridge is allowed to bind to. */
@@ -62,6 +67,13 @@ export const PENDING_EVENTS_BYTE_BUDGET_DEFAULT = 64 * 1024 * 1024;
  * before forcing shutdown. Used by main.ts and the session supervisor.
  */
 export const SIGNAL_WAIT_SECONDS = 5;
+
+/**
+ * Default permission wait before auto-deny (spec §6.4: at most five
+ * minutes). Configurable via BRIDGE_PERMISSION_TIMEOUT_SECONDS; used by
+ * the permission broker (Task 17).
+ */
+export const DEFAULT_PERMISSION_TIMEOUT_SECONDS = 300;
 
 export type EnvSource = Record<string, string | undefined>;
 
@@ -127,6 +139,18 @@ function parseOptionalAbsolutePath(env: EnvSource, key: string): string | undefi
   return value;
 }
 
+function parsePermissionTimeoutSeconds(env: EnvSource): number {
+  const raw = readString(env, "BRIDGE_PERMISSION_TIMEOUT_SECONDS");
+  if (raw === undefined) return DEFAULT_PERMISSION_TIMEOUT_SECONDS;
+  const seconds = Number(raw);
+  if (!Number.isInteger(seconds) || seconds <= 0) {
+    throw new Error(
+      `BRIDGE_PERMISSION_TIMEOUT_SECONDS must be a positive integer (seconds); got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return seconds;
+}
+
 /**
  * Validate environment variables and produce an immutable
  * {@link BridgeConfig}. Creates {@link BRIDGE_DATA_DIR} recursively with
@@ -139,6 +163,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const pendingEventsByteBudget = parsePendingEventsByteBudget(env);
   const claudeBin = readString(env, "BRIDGE_CLAUDE_BIN");
   const permissionAdapterEntry = parseOptionalAbsolutePath(env, "BRIDGE_PERMISSION_ADAPTER_ENTRY");
+  const permissionTimeoutSeconds = parsePermissionTimeoutSeconds(env);
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
@@ -151,5 +176,6 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     pendingEventsByteBudget,
     claudeBin,
     permissionAdapterEntry,
+    permissionTimeoutSeconds,
   });
 }
