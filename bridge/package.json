@@ -5,12 +5,13 @@
   "version": "0.1.0",
   "main": "dist/src/main.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && cp src/claude/lease-watcher.mjs dist/src/claude/lease-watcher.mjs",
+    "build": "tsc -p tsconfig.json && cp src/claude/lease-watcher.mjs dist/src/claude/lease-watcher.mjs && mkdir -p dist/permission-adapter && cp src/permission-adapter/main.mjs dist/permission-adapter/main.mjs",
     "start": "node dist/src/main.js",
     "test": "vitest run",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "better-sqlite3": "^11.3.0",
     "canonicalize": "^2.0.0",
     "fastify": "^5.0.0",
