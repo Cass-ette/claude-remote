@@ -23,7 +23,10 @@
  *     device revocation, adapter crash, invalid decision schema. When a
  *     decision cannot be delivered to the adapter the broker asks the
  *     injected `terminateSessionProcess` callback to kill the bound Claude
- *     process group — the broker never owns process control itself.
+ *     process group — the broker never owns process control itself. Sole
+ *     exception: a deny rendered undeliverable by ADAPTER REPLACEMENT —
+ *     the terminate hook is keyed by sessionId, which by then belongs to
+ *     the fresh process, so the deny is journaled and the hook is skipped.
  *
  * DEVICE OWNERSHIP: pending requests belong to a session, and spec §11.5
  * denies pending permissions on device revocation. The broker deliberately
@@ -96,17 +99,21 @@ export interface PermissionBroker {
   registerLease(leaseSecret: string, sessionId: string): void;
   /**
    * Validate a presented (leaseSecret, sessionId) pair, consume the secret
-   * and return the connection handle. Called by the socket listener on
-   * `hello`; rejecting destroys the socket without a response. Direct calls
-   * create a socket-less (in-process) connection — decisions for it are
-   * undeliverable by construction, exercising the fail-closed path.
+   * and return the connection handle. Rejects with InvalidLeaseError on an
+   * unknown/consumed secret or a session mismatch. Called by the socket
+   * listener on `hello`; there a rejection destroys the socket without a
+   * response. Direct calls create a socket-less (in-process) connection —
+   * decisions for it are undeliverable by construction, exercising the
+   * fail-closed path.
    */
   registerAdapter(leaseSecret: string, sessionId: string): Promise<AdapterConnection>;
   /**
    * Register a pending permission request: journal `permission.requested`,
    * start the wait timer, reply `request_registered` to the session's bound
-   * adapter. The promise resolves with the final decision (it never
-   * rejects — every failure mode IS a deny decision).
+   * adapter. The promise resolves with the final decision — every
+   * protocol-level failure mode (timeout, disconnect, shutdown, abort,
+   * invalid decision) IS a deny decision, not a rejection. Only input
+   * validation errors reject (PermissionRequestValidationError).
    */
   request(input: PermissionRequestInput): Promise<PermissionDecision>;
   resolve(input: PermissionResolveInput): Promise<void>;
@@ -229,14 +236,21 @@ export interface PermissionBrokerOptions {
   readonly socketPath: string;
   /** Wait before auto-deny. Default: DEFAULT_PERMISSION_TIMEOUT_SECONDS (§6.4). */
   readonly timeoutMs?: number;
-  /** Sessions bound to a device (revocation fan-out); unwired → no-op. */
-  readonly sessionsForDevice?: (deviceId: string) => readonly string[];
   /**
-   * Current writer device of a session (resolve authorization); when the
-   * lookup is absent or returns undefined the device check is skipped
-   * (Task 24 wires the real registry).
+   * Sessions bound to a device (revocation fan-out, spec §11.5). REQUIRED —
+   * an unwired lookup would silently turn device revocation into a no-op
+   * (fail open). Task 24 passes the real device registry; tests pass stubs.
    */
-  readonly activeDeviceForSession?: (sessionId: string) => string | undefined;
+  readonly sessionsForDevice: (deviceId: string) => readonly string[];
+  /**
+   * Current writer device of a session (resolve authorization, spec §9).
+   * REQUIRED — the broker must not silently skip the device check just
+   * because wiring was forgotten. A LOOKUP RESULT of undefined still means
+   * "session has no active writer yet" and skips the per-resolve device
+   * comparison. Task 24 passes the real registry; tests pass stubs
+   * (`() => undefined` when they do not care).
+   */
+  readonly activeDeviceForSession: (sessionId: string) => string | undefined;
   /**
    * Fail-closed hook: kill the bound Claude subprocess group when a decision
    * cannot be delivered. The broker never owns process control.
@@ -283,13 +297,32 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
 
   // -- transport helpers ---------------------------------------------------
 
+  /**
+   * Queue one encoded frame on the connection's socket.
+   *
+   * Delivery semantics: `true` means the payload was QUEUED, not
+   * acknowledged — `socket.write()` returning false (backpressure) only
+   * means Node buffers it, and the kernel may still fail the write after
+   * the call returns. Asynchronous write errors surface through the
+   * completion callback below and route into the same undeliverable path
+   * as a dead socket: the connection is closed, its pending requests are
+   * denied and — when it is still the session's current connection — the
+   * bound process is terminated.
+   */
   function sendToConnection(connection: ConnectionImpl, frame: unknown): boolean {
     const socket = connection.socket;
     if (connection.closedFlag || socket === undefined || socket.destroyed || !socket.writable) {
       return false;
     }
     try {
-      socket.write(encodeFrame(frame));
+      socket.write(encodeFrame(frame), (error) => {
+        if (error !== null && error !== undefined && !connection.closedFlag) {
+          // write() accepted the payload but it will never arrive (e.g.
+          // EPIPE after the peer vanished): fail closed exactly like a
+          // synchronous write failure or a socket close event.
+          closeConnection(connection, "permission adapter write failed");
+        }
+      });
       return true;
     } catch {
       return false;
@@ -339,7 +372,16 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
 
     if (!delivered) {
       // Fail closed (spec §6.4): the adapter can never receive the decision,
-      // so the Claude subprocess behind it must not keep running.
+      // so the Claude subprocess behind it must not keep running — UNLESS the
+      // connection that lost the decision was REPLACED by a fresh adapter for
+      // the same session: terminateSessionProcess only knows the sessionId,
+      // and by then it maps to the fresh process, which must survive.
+      const owner = pending.connection;
+      if (owner !== undefined && sessionConnections.get(pending.sessionId) !== owner) {
+        // Replaced: the deny is journaled above; the arrival of the
+        // replacement already implies the old process is gone.
+        return;
+      }
       options.terminateSessionProcess?.(
         pending.sessionId,
         `undeliverable permission decision (${reason}) for ${pending.permissionRequestId}`,
@@ -357,13 +399,23 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
     if (connection.closedFlag) return;
     connection.closedFlag = true;
     connection.socket?.destroy();
-    if (sessionConnections.get(connection.sessionId) === connection) {
-      sessionConnections.delete(connection.sessionId);
-    }
+    // Drop all broker-side references: without this, every adapter
+    // connection ever accepted would stay reachable (and pin its socket fd)
+    // until broker close.
+    connection.socket = undefined;
+    connections.delete(connection);
+    // Settle this connection's pendings BEFORE dropping the session mapping:
+    // the undeliverable-deny path must still see this connection as the
+    // session's current one (a mapping that already points at a DIFFERENT
+    // connection is exactly the "replaced adapter" case it must not
+    // terminate for).
     for (const pending of [...pendingByRequest.values()]) {
       if (pending.connection === connection) {
         settleAsDenied(pending, reason, "adapter_disconnected");
       }
+    }
+    if (sessionConnections.get(connection.sessionId) === connection) {
+      sessionConnections.delete(connection.sessionId);
     }
   }
 
@@ -406,9 +458,12 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
     connections.add(connection);
     sessionConnections.set(sessionId, connection);
     // A fresh process started for the session: the old adapter's pending
-    // requests fail closed before the new one takes over.
+    // requests fail closed (denied + journaled) before the new one takes
+    // over. Their denies are undeliverable, but the undeliverable path
+    // detects the replacement and does NOT terminate — that hook is keyed
+    // by sessionId, which now belongs to the fresh process.
     if (previous !== undefined && previous !== connection) {
-      closeConnection(previous, "permission adapter replaced");
+      closeConnection(previous, "session adapter replaced");
     }
     return connection;
   }
@@ -433,7 +488,11 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
     }
   }
 
-  function request(input: PermissionRequestInput): Promise<PermissionDecision> {
+  // async so that validation errors REJECT instead of throwing synchronously
+  // — callers holding only the returned promise must never crash on one.
+  // The body stays synchronous up to the returned promise, preserving the
+  // journal-before-request_registered ordering.
+  async function request(input: PermissionRequestInput): Promise<PermissionDecision> {
     validateRequestInput(input);
     const connection = sessionConnections.get(input.sessionId);
     const permissionRequestId = input.permissionRequestId ?? generateId();
@@ -479,7 +538,7 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
       pending.timer = setTimeout(() => {
         settleAsDenied(pending, "permission timeout", "timeout");
       }, timeoutMs);
-      pending.timer.unref?.();
+      pending.timer.unref();
       if (connection !== undefined) {
         sendToConnection(connection, { type: "request_registered", permissionRequestId });
       }
@@ -500,7 +559,7 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
         input.sessionId,
       );
     }
-    const activeDeviceId = options.activeDeviceForSession?.(pending.sessionId);
+    const activeDeviceId = options.activeDeviceForSession(pending.sessionId);
     if (activeDeviceId !== undefined && input.deviceId !== activeDeviceId) {
       throw new PermissionDeviceMismatchError(
         input.permissionRequestId,
@@ -550,7 +609,7 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
   }
 
   async function denyAllForDevice(deviceId: string, reason: string): Promise<void> {
-    const sessions = new Set(options.sessionsForDevice?.(deviceId) ?? []);
+    const sessions = new Set(options.sessionsForDevice(deviceId));
     if (sessions.size === 0) return;
     for (const pending of [...pendingByRequest.values()]) {
       if (sessions.has(pending.sessionId)) {
@@ -577,9 +636,8 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
       let frames: unknown[];
       try {
         frames = decoder.push(chunk);
-      } catch (error) {
+      } catch {
         // Oversize / non-JSON stream: protocol abuse, destroy silently.
-        void error;
         socket.destroy();
         return;
       }
@@ -627,8 +685,9 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
             toolUseId: raw.toolUseId as unknown,
             permissionRequestId: raw.permissionRequestId as unknown,
           } as PermissionRequestInput);
-          // The decision promise never rejects; it is awaited by the adapter
-          // via the decision frame this broker writes on settle.
+          // Protocol-level outcomes resolve as decisions (delivered to the
+          // adapter as decision frames by settlePending); only validation
+          // errors reject, answered by the error frame below.
         } catch (error) {
           sendError(socket, {
             type: "error",
@@ -666,8 +725,10 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
     if (brokerClosed) throw new Error("permission broker is closed");
     if (listening) return;
     const socketServer = net.createServer(handleSocket);
-    // Stale socket file from a crashed run: an existing OPEN server would
-    // refuse the bind anyway, so removing the entry is always safe.
+    // Stale socket file from a crashed run. This unlink is safe because the
+    // Bridge enforces single-instance elsewhere: a live broker listening on
+    // this path must not exist by the time we get here — relying on that
+    // enforcement, not on this call, for exclusion.
     rmSync(options.socketPath, { force: true });
     await new Promise<void>((resolve, reject) => {
       socketServer.once("error", reject);
@@ -704,9 +765,10 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
     registerLease(leaseSecret: string, sessionId: string): void {
       leases.set(leaseSecret, sessionId);
     },
-    registerAdapter(leaseSecret: string, sessionId: string): Promise<AdapterConnection> {
-      const connection = acceptAdapter(leaseSecret, sessionId, undefined);
-      return Promise.resolve(connection);
+    // async so an InvalidLeaseError from acceptAdapter REJECTS the returned
+    // promise instead of throwing synchronously under a .catch-less caller.
+    async registerAdapter(leaseSecret: string, sessionId: string): Promise<AdapterConnection> {
+      return acceptAdapter(leaseSecret, sessionId, undefined);
     },
     request,
     resolve,

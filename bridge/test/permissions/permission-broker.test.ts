@@ -28,6 +28,7 @@ import { migrate, openDatabase, type SqliteDatabase } from "../../src/db/databas
 import { createEventJournal, type EventJournal } from "../../src/events/event-journal.js";
 import {
   createPermissionBroker,
+  InvalidLeaseError,
   type PermissionBroker,
 } from "../../src/permissions/permission-broker.js";
 import {
@@ -710,4 +711,153 @@ describe("permission broker", () => {
     adapter.sendRaw(garbage);
     expect(await adapter.waitClosed()).toBe(true);
   });
+
+  // -- async-error / sync-throw hardening -----------------------------------
+
+  it("rejects (never throws synchronously) on invalid direct input or lease", async () => {
+    await makeBroker();
+    broker!.registerLease(SECRET_A, SESSION_A);
+
+    // request() validation errors must surface as rejections so that
+    // `broker.request(...).catch(...)` callers never crash.
+    await expect(
+      broker!.request({ sessionId: "", toolName: "Bash", input: {} }),
+    ).rejects.toThrow(/sessionId/);
+    await expect(
+      broker!.request({
+        sessionId: SESSION_A,
+        toolName: "Bash",
+        input: "ls" as unknown as Record<string, unknown>,
+      }),
+    ).rejects.toThrow(/input/);
+
+    // registerAdapter() lease failures likewise reject.
+    await expect(broker!.registerAdapter(BAD_SECRET, SESSION_A)).rejects.toThrow(
+      InvalidLeaseError,
+    );
+  });
+
+  // -- abort frames ----------------------------------------------------------
+
+  it("resolves the adapter's own abort as a denied decision and journals it", async () => {
+    await makeBroker();
+    broker!.registerLease(SECRET_A, SESSION_A);
+    const adapter = await openAdapter(SECRET_A, SESSION_A);
+    const id = await submit(adapter, { toolName: "Bash", input: { command: "x" } });
+
+    adapter.send({ type: "abort", permissionRequestId: id });
+
+    const frame = await decisionFrameOf(adapter);
+    expect(frame.behavior).toBe("deny");
+    expect(frame).toMatchObject({
+      permissionRequestId: id,
+      message: "aborted by permission adapter",
+      interrupt: false,
+    });
+    expect(journalPayloads("permission.resolved")).toMatchObject([
+      { permissionRequestId: id, behavior: "deny", reason: "aborted" },
+    ]);
+    // The deny was delivered to the (still open) adapter: no termination.
+    expect(terminated).toEqual([]);
+  });
+
+  it("answers an abort for ANOTHER connection's request with unknown_permission_request", async () => {
+    await makeBroker();
+    broker!.registerLease(SECRET_A, SESSION_A);
+    broker!.registerLease(SECRET_B, SESSION_B);
+    const adapterA = await openAdapter(SECRET_A, SESSION_A);
+    const adapterB = await openAdapter(SECRET_B, SESSION_B);
+    const idB = await submit(adapterB, { toolName: "Bash", input: { command: "b" } });
+
+    // Adapter A tries to abort adapter B's request.
+    adapterA.send({ type: "abort", permissionRequestId: idB });
+    const err = (await adapterA.nextFrame()) as { type: string; code: string };
+    expect(err.type).toBe("error");
+    expect(err.code).toBe("unknown_permission_request");
+
+    // B's pending was untouched: still resolvable and deliverable.
+    await broker!.resolve({
+      permissionRequestId: idB,
+      sessionId: SESSION_B,
+      deviceId: DEVICE,
+      decision: { behavior: "allow" },
+    });
+    expect((await decisionFrameOf(adapterB)).behavior).toBe("allow");
+    expect(terminated).toEqual([]);
+  });
+
+  it("answers an abort for a nonexistent request id with unknown_permission_request", async () => {
+    await makeBroker();
+    broker!.registerLease(SECRET_A, SESSION_A);
+    const adapter = await openAdapter(SECRET_A, SESSION_A);
+
+    adapter.send({ type: "abort", permissionRequestId: "never-existed" });
+    const err = (await adapter.nextFrame()) as { type: string; code: string };
+    expect(err.type).toBe("error");
+    expect(err.code).toBe("unknown_permission_request");
+    expect(terminated).toEqual([]);
+  });
+
+  // -- adapter replacement -----------------------------------------------------
+
+  it("denies the replaced adapter's pending WITHOUT terminating; the new adapter is unaffected", async () => {
+    await makeBroker();
+    broker!.registerLease(SECRET_A, SESSION_A);
+    const adapter1 = await openAdapter(SECRET_A, SESSION_A);
+
+    const decisionPromise = broker!.request({
+      sessionId: SESSION_A,
+      toolName: "Bash",
+      input: { command: "old-process" },
+    });
+    await adapter1.nextFrame(); // request_registered
+
+    // A fresh process (new lease, same session) takes over the connection.
+    broker!.registerLease(SECRET_B, SESSION_A);
+    const adapter2 = await openAdapter(SECRET_B, SESSION_A);
+
+    const decision = await decisionPromise;
+    expect(decision).toEqual({
+      behavior: "deny",
+      message: "session adapter replaced",
+      interrupt: false,
+    });
+
+    // THE regression this guards: terminateSessionProcess is keyed by
+    // sessionId only, which by now belongs to the FRESH process — the
+    // replacement must not kill it.
+    expect(terminated).toEqual([]);
+
+    const replaced = journalPayloads("permission.resolved").find(
+      (p) => p.permissionRequestId === "perm-1",
+    );
+    expect(replaced).toMatchObject({
+      behavior: "deny",
+      reason: "adapter_disconnected",
+      message: "session adapter replaced",
+    });
+
+    // Old socket reclaimed; the new adapter works end to end.
+    expect(await adapter1.waitClosed()).toBe(true);
+    const id2 = await submit(adapter2, { toolName: "Read", input: { file_path: "/tmp/new" } });
+    await broker!.resolve({
+      permissionRequestId: id2,
+      sessionId: SESSION_A,
+      deviceId: DEVICE,
+      decision: { behavior: "allow" },
+    });
+    expect((await decisionFrameOf(adapter2)).behavior).toBe("allow");
+    expect(terminated).toEqual([]);
+  });
+
+  // NOTE (socket.write async-error path): sendToConnection routes write
+  // COMPLETION errors into closeConnection (deny-pending +
+  // terminate-if-current), but that path is not deterministically testable
+  // here: the broker-side socket is never handed out to tests, and with real
+  // Unix sockets the kernel surfaces peer death via the socket 'close' event
+  // before (and indistinguishably from) any pending write callback, so a test
+  // would race rather than assert. The synchronous guards (destroyed /
+  // non-writable / write-throw) and the close-event fail-closed path are
+  // covered by the adapter-crash tests above; the callback shares their
+  // closeConnection code path.
 });
