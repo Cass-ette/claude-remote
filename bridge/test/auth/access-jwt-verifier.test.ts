@@ -146,6 +146,18 @@ describe("AccessJwtVerifier — valid assertions", () => {
     ).resolves.toBeDefined();
   });
 
+  it("rejects an array-valued Cf-Access-Jwt-Assertion header as malformed", async () => {
+    const { verifier } = makeVerifier([jwksWithKids(KID)]);
+    const assertion = await signAccessJwt();
+    const rejection = verifier.verifyRequest({
+      "cf-access-jwt-assertion": [assertion, assertion],
+    } as unknown as Record<string, string>);
+    await expect(rejection).rejects.toMatchObject({
+      code: "INVALID_ASSERTION",
+      reason: "malformed",
+    });
+  });
+
   it("ignores the common_name claim; sub is the identity (spec §10.3)", async () => {
     const { verifier } = makeVerifier([jwksWithKids(KID)]);
     const assertion = await signAccessJwt({
