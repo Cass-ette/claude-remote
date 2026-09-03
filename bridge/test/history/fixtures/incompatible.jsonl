@@ -1,0 +1,2 @@
+{"parentUuid":null,"isSidechain":false,"userType":"external","cwd":"/fake/project/demo","sessionId":"eeeeeeee-0000-4000-8000-000000000099","version":"2.1.133","gitBranch":"main","type":"user","message":{"role":"user","content":[{"type":"text","text":"Before corruption"}]},"uuid":"eeeeeeee-0000-4000-8000-000000000001","timestamp":"2026-08-01T14:00:00.000Z","isMeta":false}
+garbage{not json

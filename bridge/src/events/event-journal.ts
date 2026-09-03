@@ -17,6 +17,7 @@ import { transaction } from "../db/database.js";
 import type { SqliteDatabase } from "../db/database.js";
 import { PROTOCOL_VERSION, type EventType } from "../protocol/v1/types.js";
 import type { EventPayload } from "../protocol/v1/types.js";
+import { CheckpointCommitRequiredError } from "../snapshots/snapshot-errors.js";
 import type { AppendEventArgs, EventJournalPort, PersistedEvent } from "./event-journal-types.js";
 
 export type { AppendEventArgs, PersistedEvent } from "./event-journal-types.js";
@@ -86,6 +87,7 @@ interface DeliveryRow {
   readonly protocolVersion: string;
   readonly deliveryBase: number;
   readonly deliveryWatermark: number;
+  readonly pendingCheckpoint: number;
 }
 
 export function createEventJournal(db: SqliteDatabase, config: EventJournalConfig): EventJournal {
@@ -109,7 +111,7 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
   );
   const sweepStmt = db.prepare("DELETE FROM pending_events WHERE deleteAfter IS NOT NULL AND deleteAfter <= ?");
   const selectDelivery = db.prepare(
-    "SELECT deviceId, sessionId, protocolVersion, deliveryBase, deliveryWatermark FROM device_delivery WHERE deviceId = ? AND sessionId = ?",
+    "SELECT deviceId, sessionId, protocolVersion, deliveryBase, deliveryWatermark, pendingCheckpoint FROM device_delivery WHERE deviceId = ? AND sessionId = ?",
   );
   const insertDelivery = db.prepare(
     `INSERT INTO device_delivery (deviceId, sessionId, protocolVersion, deliveryBase, deliveryWatermark)
@@ -197,6 +199,12 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
         insertDelivery.run(deviceId, sessionId, PROTOCOL_VERSION, 0, Number(eventId));
       } else if (Number(eventId) < existing.deliveryWatermark) {
         throw new BackwardAckError(deviceId, sessionId, eventId, existing.deliveryWatermark);
+      } else if (existing.pendingCheckpoint === 1 && Number(eventId) > existing.deliveryBase) {
+        // §6.7 (5): while a prepared snapshot exists for this device, an
+        // ordinary ACK may not move delivery past the snapshot's
+        // deliveryBase. The snapshot service sets pendingCheckpoint (and the
+        // base ceiling) on begin and clears it on commit/expiry.
+        throw new CheckpointCommitRequiredError(deviceId, sessionId, eventId, existing.deliveryBase);
       } else {
         advanceWatermark.run(Number(eventId), deviceId, sessionId);
       }
