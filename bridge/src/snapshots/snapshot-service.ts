@@ -20,9 +20,9 @@
  *     watermark.
  *
  * `page` serves only from the materialized items; cursors are opaque random
- * tokens bound to (snapshotId, position) in memory — a retry of the same
- * token replays the same page, and tokens do not survive a Bridge restart
- * (an unknown cursor is 410, the correct recovery: Android re-begins).
+ * single-use tokens bound to (snapshotId, position) in memory — serving a
+ * page consumes its token (a retry yields 410, the correct recovery: Android
+ * re-begins), and tokens do not survive a Bridge restart.
  *
  * `commit` atomically validates prepared status + device ownership + all
  * three commit fields, flips the snapshot to `committed`, persists the
@@ -428,7 +428,8 @@ export function createSnapshotService(options: SnapshotServiceOptions): Snapshot
         throw new SnapshotExpiredError(`snapshot ${binding.snapshotId} is no longer prepared`);
       }
       // Serve ONLY from materialized items; the live transcript is never
-      // re-read here. Retrying the same token replays the same page.
+      // re-read here. The token is single-use (consumed below); a retry
+      // yields 410 and the client re-begins.
       const total = (countItems.get(binding.snapshotId) as { n: number }).n;
       const rows = getItemsPage.all(
         binding.snapshotId,

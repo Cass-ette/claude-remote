@@ -127,14 +127,16 @@ export class InvalidByteLimitError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// Project ↔ transcript-directory mapping (verified against the real
-// ~/.claude/projects layout on this machine: /Users/chenzilve/Projects/animation
-// → -Users-chenzilve-Projects-animation)
+// Project ↔ transcript-directory mapping. Verified against every real
+// project dir on this machine (24 cwd→dir pairs, zero mismatches): Claude
+// Code encodes EVERY character outside [a-zA-Z0-9-] as "-", not just "/" —
+// e.g. "apt- refactor" → "apt--refactor", "devmac++" → "devmac--",
+// "BlueLotus_XSSReceiver" → "BlueLotus-XSSReceiver".
 // ---------------------------------------------------------------------------
 
 /** Encode a canonical project path to its Claude transcript directory name. */
 export function encodeProjectPath(projectRoot: string): string {
-  return projectRoot.replaceAll("/", "-");
+  return projectRoot.replace(/[^a-zA-Z0-9-]/g, "-");
 }
 
 /** Transcript directory holding a project's `<session-uuid>.jsonl` files. */

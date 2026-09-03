@@ -58,9 +58,21 @@ afterEach(() => {
 });
 
 describe("path helpers", () => {
-  it("encodes the project root by replacing every / with - (verified against real ~/.claude/projects layout)", () => {
+  it("encodes every non-[a-zA-Z0-9-] char as - (verified against 24 real ~/.claude/projects dir names)", () => {
     expect(encodeProjectPath("/Users/chenzilve/Projects/animation")).toBe(
       "-Users-chenzilve-Projects-animation",
+    );
+    expect(encodeProjectPath("/Users/chenzilve/Projects/apt- refactor")).toBe(
+      "-Users-chenzilve-Projects-apt--refactor",
+    );
+    expect(encodeProjectPath("/Users/chenzilve/Projects/devmac++")).toBe(
+      "-Users-chenzilve-Projects-devmac--",
+    );
+    expect(encodeProjectPath("/Users/chenzilve/Projects/BlueLotus_XSSReceiver")).toBe(
+      "-Users-chenzilve-Projects-BlueLotus-XSSReceiver",
+    );
+    expect(encodeProjectPath("/private/var/folders/c9/nh__f38j111_x")).toBe(
+      "-private-var-folders-c9-nh--f38j111-x",
     );
     expect(encodeProjectPath("/private/tmp/claude-gate-diag")).toBe(
       "-private-tmp-claude-gate-diag",
