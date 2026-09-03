@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
+import { normalizeTeamDomain } from "./auth/access-jwt-verifier.js";
 
 /**
  * Bridge configuration.
@@ -39,6 +40,20 @@ export interface BridgeConfig {
    * auto-denies it (spec §6.4: at most five minutes).
    */
   readonly permissionTimeoutSeconds: number;
+  /**
+   * Cloudflare Access team domain (BRIDGE_CLOUDFLARE_TEAM_DOMAIN), e.g.
+   * `myteam.cloudflareaccess.com`. Optional: local-only operation boots
+   * without it. An `https://` scheme prefix is accepted and normalized away;
+   * required together with {@link BridgeConfig.cloudflareAud} when the
+   * Access JWT verifier is constructed (remote access, Task 24).
+   */
+  readonly cloudflareTeamDomain?: string | undefined;
+  /**
+   * Cloudflare Access application audience tag (BRIDGE_CLOUDFLARE_AUD).
+   * Optional; required together with {@link BridgeConfig.cloudflareTeamDomain}
+   * when the Access JWT verifier is constructed (remote access, Task 24).
+   */
+  readonly cloudflareAud?: string | undefined;
 }
 
 /** Loopback hosts the Bridge is allowed to bind to. */
@@ -152,6 +167,26 @@ function parsePermissionTimeoutSeconds(env: EnvSource): number {
 }
 
 /**
+ * Optional Cloudflare Access team domain. When present it must form a valid
+ * team domain (with or without an `https://` scheme, which is normalized
+ * away). Deliberately NOT paired with BRIDGE_CLOUDFLARE_AUD at load time:
+ * the verifier requires both at construction, and Task 24 fails startup when
+ * remote access is enabled without a complete pair.
+ */
+function parseCloudflareTeamDomain(env: EnvSource): string | undefined {
+  const raw = readString(env, "BRIDGE_CLOUDFLARE_TEAM_DOMAIN");
+  if (raw === undefined) return undefined;
+  const normalized = normalizeTeamDomain(raw);
+  if (normalized === undefined) {
+    throw new Error(
+      `BRIDGE_CLOUDFLARE_TEAM_DOMAIN must be a Cloudflare Access team domain such as ` +
+        `"myteam.cloudflareaccess.com" (optionally prefixed with "https://"); got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return normalized;
+}
+
+/**
  * Validate environment variables and produce an immutable
  * {@link BridgeConfig}. Creates {@link BRIDGE_DATA_DIR} recursively with
  * owner-only permissions after validation succeeds.
@@ -164,6 +199,8 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const claudeBin = readString(env, "BRIDGE_CLAUDE_BIN");
   const permissionAdapterEntry = parseOptionalAbsolutePath(env, "BRIDGE_PERMISSION_ADAPTER_ENTRY");
   const permissionTimeoutSeconds = parsePermissionTimeoutSeconds(env);
+  const cloudflareTeamDomain = parseCloudflareTeamDomain(env);
+  const cloudflareAud = readString(env, "BRIDGE_CLOUDFLARE_AUD");
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
@@ -177,5 +214,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     claudeBin,
     permissionAdapterEntry,
     permissionTimeoutSeconds,
+    cloudflareTeamDomain,
+    cloudflareAud,
   });
 }

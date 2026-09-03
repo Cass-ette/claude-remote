@@ -93,4 +93,49 @@ describe("loadConfig", () => {
       ).toThrow(/PERMISSION_TIMEOUT/);
     }
   });
+
+  it("exposes optional Cloudflare Access knobs (undefined by default)", () => {
+    const cfg = loadConfig({ BRIDGE_HOST: "127.0.0.1", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: dataDir() });
+    expect(cfg.cloudflareTeamDomain).toBeUndefined();
+    expect(cfg.cloudflareAud).toBeUndefined();
+  });
+
+  it("normalizes BRIDGE_CLOUDFLARE_TEAM_DOMAIN (scheme prefix, case, trailing slash)", () => {
+    const cfg = loadConfig({
+      BRIDGE_HOST: "127.0.0.1",
+      BRIDGE_PORT: "43111",
+      BRIDGE_DATA_DIR: dataDir(),
+      BRIDGE_CLOUDFLARE_TEAM_DOMAIN: "https://MyTeam.cloudflareaccess.com/",
+      BRIDGE_CLOUDFLARE_AUD: "0e9a5b2f7dbf4e1b9a17d8e0c3f2a1b0",
+    });
+    expect(cfg.cloudflareTeamDomain).toBe("myteam.cloudflareaccess.com");
+    expect(cfg.cloudflareAud).toBe("0e9a5b2f7dbf4e1b9a17d8e0c3f2a1b0");
+  });
+
+  it("rejects malformed team domains but leaves the knobs optional", () => {
+    const bad = [
+      "https://", // scheme only
+      "team.cloudflareaccess.com/app", // path
+      "team.cloudflareaccess.com?x=1", // query
+      "my team.cloudflareaccess.com", // space
+      "team", // no dot: not a team domain
+      "https://user@team.cloudflareaccess.com", // userinfo
+      "team.cloudflareaccess.com:8443", // port
+    ];
+    for (const value of bad) {
+      expect(() =>
+        loadConfig({ BRIDGE_HOST: "127.0.0.1", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: dataDir(), BRIDGE_CLOUDFLARE_TEAM_DOMAIN: value }),
+      ).toThrow(/BRIDGE_CLOUDFLARE_TEAM_DOMAIN/);
+    }
+    // Audience alone (without team domain) stays loadable: the pairing is
+    // enforced at verifier construction / remote-access startup (Task 24),
+    // not at config load.
+    const audOnly = loadConfig({
+      BRIDGE_HOST: "127.0.0.1",
+      BRIDGE_PORT: "43111",
+      BRIDGE_DATA_DIR: dataDir(),
+      BRIDGE_CLOUDFLARE_AUD: "some-aud",
+    });
+    expect(audOnly.cloudflareAud).toBe("some-aud");
+  });
 });
