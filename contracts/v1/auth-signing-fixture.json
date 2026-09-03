@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "description": "Shared device-auth signing fixture for the TypeScript Bridge and the Android app (spec 10.3). Generated once by bridge/scripts/gen-auth-fixture.ts; NEVER regenerate — the signature depends on the ECDSA nonce, so a rerun yields a different signature while both implementations may have pinned this one. Both sides must construct the signing content from the fields below and verify signatureDerB64u over exactly signingContentHex.",
+  "algorithm": "ECDSA P-256 (secp256r1) with SHA-256; signature is ASN.1 DER SEQUENCE(INTEGER r, INTEGER s); transport encoding is unpadded base64url",
+  "signingContext": "CLAUDE-REMOTE-DEVICE-AUTH-V1",
+  "hostUrl": "https://Bridge.Example.COM./",
+  "hostAscii": "bridge.example.com",
+  "accessSubject": "user@example.com",
+  "publicKeySpkiB64u": "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExzIW0WldfEfnwdMCBupVENTfbQXtQcIbix5as6aeU-yWvf0xURIoJ22VGvfiiufjfknivW27IoznwAa1qj7bpg",
+  "deviceId": "KjVbothn5-YdD0dYvw2tYPajriqsu6us7d5v8BLSH8U",
+  "challengeId": "4b3d0fd9-765d-4065-be00-6fc7ff075b05",
+  "challengeRawHex": "4da015cb3bcdb1f193949c49dd45e31e1c3e494646dd1bc847f0588642af383c",
+  "challengeRawB64u": "TaAVyzvNsfGTlJxJ3UXjHhw-SUZG3RvIR_BYhkKvODw",
+  "signingContentHex": "434c415544452d52454d4f54452d4445564943452d415554482d56310000126272696467652e6578616d706c652e636f6d002b4b6a56626f74686e352d596444306459767732745950616a72697173753675733764357638424c53483855002434623364306664392d373635642d343036352d626530302d3666633766663037356230350000001075736572406578616d706c652e636f6d4da015cb3bcdb1f193949c49dd45e31e1c3e494646dd1bc847f0588642af383c",
+  "signatureDerB64u": "MEQCIAG8jXKR65OTjcnyUBv45I6d_sSwWRsumtWoJ8Un9n0iAiBP5ZFbh4ELxmXLWzS4xlRAYNxNp1-cTN-sK07AAW39pQ"
+}

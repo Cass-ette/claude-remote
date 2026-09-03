@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { normalizeTeamDomain } from "./auth/access-jwt-verifier.js";
+import { DEFAULT_DEVICE_SESSION_TTL_SECONDS } from "./auth/device-auth.js";
 
 /**
  * Bridge configuration.
@@ -54,6 +55,12 @@ export interface BridgeConfig {
    * when the Access JWT verifier is constructed (remote access, Task 24).
    */
   readonly cloudflareAud?: string | undefined;
+  /**
+   * Device session token lifetime in seconds
+   * (BRIDGE_DEVICE_SESSION_TTL_SECONDS; spec §10.3: fifteen minutes).
+   * Used by the device-auth registry.
+   */
+  readonly deviceSessionTtlSeconds: number;
 }
 
 /** Loopback hosts the Bridge is allowed to bind to. */
@@ -166,6 +173,18 @@ function parsePermissionTimeoutSeconds(env: EnvSource): number {
   return seconds;
 }
 
+function parseDeviceSessionTtlSeconds(env: EnvSource): number {
+  const raw = readString(env, "BRIDGE_DEVICE_SESSION_TTL_SECONDS");
+  if (raw === undefined) return DEFAULT_DEVICE_SESSION_TTL_SECONDS;
+  const seconds = Number(raw);
+  if (!Number.isInteger(seconds) || seconds <= 0) {
+    throw new Error(
+      `BRIDGE_DEVICE_SESSION_TTL_SECONDS must be a positive integer (seconds); got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return seconds;
+}
+
 /**
  * Optional Cloudflare Access team domain. When present it must form a valid
  * team domain (with or without an `https://` scheme, which is normalized
@@ -201,6 +220,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const permissionTimeoutSeconds = parsePermissionTimeoutSeconds(env);
   const cloudflareTeamDomain = parseCloudflareTeamDomain(env);
   const cloudflareAud = readString(env, "BRIDGE_CLOUDFLARE_AUD");
+  const deviceSessionTtlSeconds = parseDeviceSessionTtlSeconds(env);
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
@@ -216,5 +236,6 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     permissionTimeoutSeconds,
     cloudflareTeamDomain,
     cloudflareAud,
+    deviceSessionTtlSeconds,
   });
 }

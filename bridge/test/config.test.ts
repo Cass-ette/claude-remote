@@ -94,6 +94,30 @@ describe("loadConfig", () => {
     }
   });
 
+  it("exposes the device session TTL with a 900 s default (spec §10.3)", () => {
+    const cfg = loadConfig({ BRIDGE_HOST: "127.0.0.1", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: dataDir() });
+    expect(cfg.deviceSessionTtlSeconds).toBe(900);
+
+    const custom = loadConfig({
+      BRIDGE_HOST: "127.0.0.1",
+      BRIDGE_PORT: "43111",
+      BRIDGE_DATA_DIR: dataDir(),
+      BRIDGE_DEVICE_SESSION_TTL_SECONDS: "60",
+    });
+    expect(custom.deviceSessionTtlSeconds).toBe(60);
+
+    for (const bad of ["0", "-5", "1.5", "later"]) {
+      expect(() =>
+        loadConfig({
+          BRIDGE_HOST: "127.0.0.1",
+          BRIDGE_PORT: "43111",
+          BRIDGE_DATA_DIR: dataDir(),
+          BRIDGE_DEVICE_SESSION_TTL_SECONDS: bad,
+        }),
+      ).toThrow(/BRIDGE_DEVICE_SESSION_TTL_SECONDS/);
+    }
+  });
+
   it("exposes optional Cloudflare Access knobs (undefined by default)", () => {
     const cfg = loadConfig({ BRIDGE_HOST: "127.0.0.1", BRIDGE_PORT: "43111", BRIDGE_DATA_DIR: dataDir() });
     expect(cfg.cloudflareTeamDomain).toBeUndefined();
