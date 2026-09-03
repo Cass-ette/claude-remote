@@ -261,7 +261,7 @@ export function createSnapshotService(options: SnapshotServiceOptions): Snapshot
   const advanceDeliveryStmt = db.prepare(
     `UPDATE device_delivery
      SET deliveryWatermark = MAX(deliveryWatermark, ?),
-         deliveryCheckpointWatermark = ?,
+         deliveryCheckpointWatermark = MAX(deliveryCheckpointWatermark, ?),
          pendingCheckpoint =
            CASE WHEN EXISTS (
              SELECT 1 FROM history_snapshots h
@@ -421,8 +421,10 @@ export function createSnapshotService(options: SnapshotServiceOptions): Snapshot
       const row = getSnapshot.get(binding.snapshotId) as SnapshotRow | undefined;
       if (row === undefined || row.status !== "prepared" || row.expiresAt <= now) {
         if (row !== undefined && row.status === "prepared") {
-          markSnapshot.run("expired", row.snapshotId);
-          recomputeGuard.run();
+          transaction(db, () => {
+            markSnapshot.run("expired", row.snapshotId);
+            recomputeGuard.run();
+          });
         }
         cursors.delete(cursor);
         throw new SnapshotExpiredError(`snapshot ${binding.snapshotId} is no longer prepared`);

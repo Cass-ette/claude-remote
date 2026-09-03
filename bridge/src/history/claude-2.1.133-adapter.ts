@@ -629,7 +629,6 @@ function findFirstMalformed(lines: readonly ParsedLine[]): number | null {
 }
 
 async function readFileRange(path: string, start: number, end: number): Promise<Buffer> {
-  const { open } = await import("node:fs/promises");
   const fh = await open(path, "r");
   try {
     const len = Math.max(0, end - start);

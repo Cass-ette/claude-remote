@@ -172,8 +172,8 @@ export function createSessionImporter(db: SqliteDatabase, options: SessionImport
           continue;
         }
         const transcriptPath = join(dir, `${sessionId}.jsonl`);
-        const stats = statSync(transcriptPath);
         try {
+          const stats = statSync(transcriptPath);
           const meta = await adapter.readMetadata(transcriptPath, Number.MAX_SAFE_INTEGER);
           candidates.push({
             sessionId,
@@ -189,13 +189,14 @@ export function createSessionImporter(db: SqliteDatabase, options: SessionImport
                 }),
           });
         } catch (error) {
-          // §6.6 step 4: one bad file never interrupts the other results.
+          // §6.6 step 4: one bad file (deleted mid-scan, unreadable, or
+          // unparseable) never interrupts the other results.
           candidates.push({
             sessionId,
             transcriptPath,
             title: null,
-            lastModified: Math.round(stats.mtimeMs),
-            size: stats.size,
+            lastModified: 0,
+            size: 0,
             importable: false,
             reason: `unreadable transcript: ${(error as Error).message}`,
           });
