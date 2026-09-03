@@ -36,16 +36,37 @@ export type ContentBlock =
 
 /**
  * Per-turn evidence, keyed by a user-message UUID. Implements the
- * reconciliation contract from the design spec §7.4.
+ * reconciliation contract from the design spec §7.4, against the REAL stored
+ * transcript vocabulary (Claude Code 2.1.133 `.jsonl` session files contain
+ * NO `result` records — those exist only in `--output-format stream-json`
+ * stdout).
  *
- *   * `complete` + `completed` — the UUID exists and a terminal success
- *     `result` record follows it in the same transcript.
- *   * `complete` + `failed` — the UUID exists and a terminal failure
- *     `result` record follows it.
- *   * `interrupted` — the UUID exists but no terminal `result` follows it.
+ * Real turn signals, verified against 20+ real stored transcripts:
+ *   * a turn that ran normally ends with a `system` record with
+ *     `subtype:"turn_duration"` (its `parentUuid` points at the turn's last
+ *     `assistant` record);
+ *   * an API failure surfaces as a `system` record with `subtype:"api_error"`
+ *     between the user message and the turn's boundary;
+ *   * a NEW top-level `user` record (not a tool-result wrapper) bounds the
+ *     previous turn even when no `turn_duration` was written.
+ *
+ *   * `complete` + `completed` — the UUID exists, at least one top-level
+ *     `assistant` record follows it, and the turn ends normally (a
+ *     `system/turn_duration` record or the next top-level user record).
+ *   * `complete` + `failed` — the UUID exists and a `system/api_error`
+ *     record appears between it and the turn's boundary.
+ *   * `interrupted` — the UUID exists but NO top-level `assistant` record
+ *     follows it (the next top-level record is another user record, or the
+ *     file ends), or an assistant responded but the file ends with no
+ *     boundary evidence (`turn_duration` or next user) proving a normal end.
  *   * `absent` — the UUID is not present as a complete `user` record.
  *   * `incompatible` — at least one COMPLETE line in the transcript is not
  *     valid JSON. Partial trailing lines never count as incompatible.
+ *
+ * Records with `isSidechain === true` are ignored entirely when resolving
+ * boundaries. Bookkeeping records (`queue-operation`, `last-prompt`,
+ * `permission-mode`, `attachment`, `file-history-snapshot`, `ai-title`,
+ * `agent-name`, `pr-link`) are ignored for evidence.
  */
 export type TurnEvidence =
   | { kind: "complete"; outcome: "completed" | "failed" }
@@ -65,6 +86,19 @@ export interface TranscriptMetadata {
   readonly allLinesParseable: boolean;
   /** First malformed line offset, when `allLinesParseable === false`. */
   readonly firstMalformedOffset: number | null;
+  /**
+   * Session title from the LAST `ai-title` record within the read window
+   * (field name `aiTitle`, verified against real transcripts), or `null`
+   * when no `ai-title` record is present. Claude Code rewrites the title as
+   * a session evolves, so the last one is the current title.
+   */
+  readonly title: string | null;
+  /**
+   * Sorted set of observed record kinds within the read window. Each kind is
+   * `"<type>"` or `"<type>/<subtype>"` (e.g. `"user"`, `"system/turn_duration"`).
+   * Sorted lexicographically for deterministic comparison.
+   */
+  readonly recordKinds: readonly string[];
 }
 
 /**

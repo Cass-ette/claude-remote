@@ -198,9 +198,14 @@ function toHistoryItems(rec: ParsedRecord): HistoryItem[] {
       });
     }
   } else if (obj.type === "system") {
+    // Real stored transcripts carry turn/system lifecycle as `system` records
+    // with a `subtype` (turn_duration, api_error, compact_boundary, ...).
+    // The subtype IS the signal, so it leads the note text; `content` (a
+    // human-readable string on some subtypes, e.g. compact_boundary) is the
+    // fallback when no subtype is present.
     const text =
-      asString((rec.json as { content?: unknown }).content) ??
       asString((rec.json as { subtype?: unknown }).subtype) ??
+      asString((rec.json as { content?: unknown }).content) ??
       "";
     if (text) {
       items.push({
@@ -211,26 +216,6 @@ function toHistoryItems(rec: ParsedRecord): HistoryItem[] {
         sourceTranscriptOffset: baseOffset
       });
     }
-  } else if (obj.type === "result") {
-    // Materialize the terminal `result` record as a `system` item so snapshot
-    // consumers get a turn-completion marker. The text summarizes `subtype`
-    // (e.g. "success", "error", "failure_max_turns") and notes `is_error` when
-    // present. This is a real history item, NOT a tool-result wrapper, and
-    // must not be filtered by `isToolResultWrapper`-style checks (which only
-    // apply to `user` records).
-    const subtype = asString((rec.json as { subtype?: unknown }).subtype);
-    const isError = (rec.json as { is_error?: unknown }).is_error === true;
-    const parts: string[] = ["result"];
-    if (subtype) parts.push(subtype);
-    if (isError) parts.push("is_error");
-    const text = parts.join(": ");
-    items.push({
-      historyItemId: `offset-${baseOffset}`,
-      role: "system",
-      contentBlocks: [{ kind: "system_note", text }],
-      createdAt,
-      sourceTranscriptOffset: baseOffset
-    });
   }
   return items;
 }
@@ -311,6 +296,17 @@ function isToolResultWrapper(json: unknown): boolean {
 }
 
 /**
+ * Canonical kind name for a parsed record: `"<type>"`, or `"<type>/<subtype>"`
+ * when a string `subtype` is present (e.g. `system/turn_duration`).
+ */
+function recordKindOf(json: unknown): string {
+  const obj = json as { type?: unknown; subtype?: unknown };
+  const type = asString(obj.type) ?? "unknown";
+  const subtype = asString(obj.subtype);
+  return subtype ? `${type}/${subtype}` : type;
+}
+
+/**
  * Find the byte offset of the FIRST complete malformed line in `lines`, or
  * `null` if every complete line parses. Partial trailing lines do not count.
  */
@@ -383,12 +379,28 @@ export const transcriptAdapter: TranscriptAdapter = {
     );
     const lines = splitIntoLines(bytes);
     const firstMalformedOffset = findFirstMalformed(lines);
+    // Title comes from the LAST `ai-title` record within the read window
+    // (real field name is `aiTitle`, verified against real transcripts).
+    let title: string | null = null;
+    const kinds = new Set<string>();
+    for (const line of lines) {
+      const parsed = tryParse(line);
+      if (!parsed) continue;
+      kinds.add(recordKindOf(parsed.json));
+      const obj = parsed.json as { type?: unknown; aiTitle?: unknown };
+      if (obj.type === "ai-title") {
+        const t = asString(obj.aiTitle);
+        if (t !== undefined) title = t;
+      }
+    }
     return {
       byteEnd,
       totalBytes,
       trailingPartialIgnored,
       allLinesParseable: firstMalformedOffset === null,
-      firstMalformedOffset
+      firstMalformedOffset,
+      title,
+      recordKinds: [...kinds].sort()
     };
   },
 
@@ -435,31 +447,64 @@ export const transcriptAdapter: TranscriptAdapter = {
     if (userFoundAt === -1) {
       return { kind: "absent" };
     }
-    // 3. Walk forward from the user record looking for a terminal `result`.
-    //    A `result` record terminates the turn it follows. A NEW user turn
-    //    (one whose content is NOT just tool_result wrappers — those are part
-    //    of the same turn) appearing before any `result` means the original
-    //    turn was interrupted before producing a terminal result.
+    // 3. Walk forward from the user record resolving REAL turn signals.
+    //    Stored transcripts have no `result` records; a turn's health is
+    //    evidenced by:
+    //      * `assistant` records        — the model responded
+    //      * `system/turn_duration`     — the turn ended normally (its
+    //                                     parentUuid is the turn's last
+    //                                     assistant record); TERMINATES the
+    //                                     turn scan
+    //      * `system/api_error`         — an API failure inside the turn
+    //      * next top-level `user`      — a new user message bounds the
+    //        (non-wrapper) record         previous turn; TERMINATES the scan
+    //    Records with `isSidechain === true` are ignored entirely, and
+    //    bookkeeping records (queue-operation, last-prompt, permission-mode,
+    //    attachment, file-history-snapshot, ai-title, agent-name, pr-link)
+    //    are transparent — they never bound a turn nor count as responses.
+    let sawAssistant = false;
+    let sawApiError = false;
+    let endedNormally = false;
     for (let j = userFoundAt + 1; j < lines.length; j++) {
       const line = lines[j]!;
       if (!line.complete) continue;
       const parsed = tryParse(line);
       if (!parsed) continue;
-      const obj = parsed.json as { type?: unknown };
-      if (obj.type === "result") {
-        const isError =
-          (parsed.json as { is_error?: unknown }).is_error === true ||
-          (parsed.json as { subtype?: unknown }).subtype === "error" ||
-          (parsed.json as { subtype?: unknown }).subtype === "failure_max_turns";
-        return {
-          kind: "complete",
-          outcome: isError ? "failed" : "completed"
-        };
+      const obj = parsed.json as {
+        type?: unknown;
+        subtype?: unknown;
+        isSidechain?: unknown;
+      };
+      if (obj.isSidechain === true) continue;
+      if (obj.type === "assistant") {
+        sawAssistant = true;
+      } else if (obj.type === "system") {
+        const subtype = asString(obj.subtype);
+        if (subtype === "turn_duration") {
+          endedNormally = true;
+          break;
+        }
+        if (subtype === "api_error") {
+          sawApiError = true;
+        }
+        // Other system subtypes (away_summary, stop_hook_summary,
+        // compact_boundary, ...) are transparent for boundaries.
+      } else if (obj.type === "user" && !isToolResultWrapper(parsed.json)) {
+        // A genuine new user turn bounds the previous turn.
+        endedNormally = true;
+        break;
       }
-      if (obj.type === "user" && !isToolResultWrapper(parsed.json)) {
-        // A genuine new user turn started without a result for our UUID.
-        return { kind: "interrupted" };
-      }
+    }
+    // Precedence: an API error inside the turn wins; otherwise the turn is
+    // completed only when the model responded AND a boundary evidences a
+    // normal end. An assistant record followed by end-of-file with NO
+    // boundary evidence cannot be proven to have completed normally, so it
+    // falls back to `interrupted`.
+    if (sawApiError) {
+      return { kind: "complete", outcome: "failed" };
+    }
+    if (sawAssistant && endedNormally) {
+      return { kind: "complete", outcome: "completed" };
     }
     return { kind: "interrupted" };
   }

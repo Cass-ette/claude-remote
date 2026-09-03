@@ -21,7 +21,9 @@ describe("transcript adapter — deterministic fixtures", () => {
         bytes.length // read whole file
       );
 
-      // 1 user, 1 assistant(+tool_use), 1 tool_result, 1 assistant final, 1 result(system)
+      // Real-vocabulary shape: user, assistant(+tool_use), tool_result
+      // wrapper, assistant final, system/turn_duration, bookkeeping noise
+      // (ai-title, queue-operation, permission-mode, last-prompt), more turns.
       const roles = items.map((i) => i.role);
       expect(roles).toContain("user");
       expect(roles).toContain("assistant");
@@ -99,18 +101,19 @@ describe("transcript adapter — deterministic fixtures", () => {
       );
       expect(sawPartial).toBe(false);
 
-      // The result record must be materialized as a `system` item. The
-      // trailing partial assistant line is excluded by the byte-boundary
-      // trim, but the result record (which precedes it) must be present.
-      const resultSystem = fullItems.find(
+      // The system/turn_duration record must be materialized as a `system`
+      // item carrying the subtype as its note text. The trailing partial
+      // assistant line is excluded by the byte-boundary trim, but the
+      // turn_duration record (which precedes it) must be present.
+      const durationSystem = fullItems.find(
         (i) =>
           i.role === "system" &&
           i.contentBlocks.some(
-            (b) => b.kind === "system_note" && b.text.includes("success")
+            (b) => b.kind === "system_note" && b.text === "turn_duration"
           )
       );
-      expect(resultSystem).toBeDefined();
-      expect(resultSystem!.sourceTranscriptOffset).toBeGreaterThan(0);
+      expect(durationSystem).toBeDefined();
+      expect(durationSystem!.sourceTranscriptOffset).toBeGreaterThan(0);
 
       // No empty-content user items may leak through (tool-result wrappers
       // must be filtered).
@@ -161,8 +164,10 @@ describe("transcript adapter — deterministic fixtures", () => {
     });
   });
 
-  describe("findTurnEvidence — full union", () => {
-    it("returns complete+completed for a UUID followed by a success result", async () => {
+  describe("findTurnEvidence — full union over the real record vocabulary", () => {
+    it("returns complete+completed when a system/turn_duration record ends the turn", async () => {
+      // Turn 1 of complete.jsonl: user -> assistant(+tool_use) ->
+      // tool_result wrapper -> assistant -> system/turn_duration.
       const ev = await transcriptAdapter.findTurnEvidence(
         FIXTURE("complete.jsonl"),
         "aaaaaaaa-0000-4000-8000-000000000001"
@@ -170,7 +175,18 @@ describe("transcript adapter — deterministic fixtures", () => {
       expect(ev).toEqual({ kind: "complete", outcome: "completed" });
     });
 
-    it("returns complete+failed for a UUID followed by an error result", async () => {
+    it("returns complete+completed when the next top-level user record bounds the turn (no turn_duration)", async () => {
+      // Turn 2 of complete.jsonl ends without a turn_duration record —
+      // the following user message (turn 3) bounds it. Bookkeeping noise
+      // (ai-title, permission-mode) between them must be ignored.
+      const ev = await transcriptAdapter.findTurnEvidence(
+        FIXTURE("complete.jsonl"),
+        "aaaaaaaa-0000-4000-8000-000000000011"
+      );
+      expect(ev).toEqual({ kind: "complete", outcome: "completed" });
+    });
+
+    it("returns complete+failed when a system/api_error record appears inside the turn", async () => {
       const ev = await transcriptAdapter.findTurnEvidence(
         FIXTURE("failed.jsonl"),
         "bbbbbbbb-0000-4000-8000-000000000001"
@@ -178,10 +194,23 @@ describe("transcript adapter — deterministic fixtures", () => {
       expect(ev).toEqual({ kind: "complete", outcome: "failed" });
     });
 
-    it("returns interrupted when UUID exists but no terminal result follows", async () => {
+    it("returns interrupted when the next top-level user record arrives before any assistant reply", async () => {
+      // Turn 1 of interrupted.jsonl: user -> (last-prompt, permission-mode
+      // noise) -> next user record. No assistant ever responded.
       const ev = await transcriptAdapter.findTurnEvidence(
         FIXTURE("interrupted.jsonl"),
         "cccccccc-0000-4000-8000-000000000001"
+      );
+      expect(ev).toEqual({ kind: "interrupted" });
+    });
+
+    it("returns interrupted when an assistant replied but the file ends without boundary evidence", async () => {
+      // Turn 2 of interrupted.jsonl: user -> assistant -> EOF with no
+      // system/turn_duration and no next user record. A normal end cannot
+      // be proven, so the turn is NOT completed.
+      const ev = await transcriptAdapter.findTurnEvidence(
+        FIXTURE("interrupted.jsonl"),
+        "cccccccc-0000-4000-8000-000000000011"
       );
       expect(ev).toEqual({ kind: "interrupted" });
     });
@@ -224,25 +253,121 @@ describe("transcript adapter — deterministic fixtures", () => {
     });
   });
 
-  describe("result records materialize as system items; tool-result wrappers are filtered", () => {
-    it("materializes a success `result` record as a `system` item summarizing subtype", async () => {
+  describe("readMetadata reports real-vocabulary title and recordKinds", () => {
+    it("returns the LAST ai-title record's aiTitle as title", async () => {
+      const path = FIXTURE("complete.jsonl");
+      const bytes = await readFixture("complete.jsonl");
+      const meta = await transcriptAdapter.readMetadata(path, bytes.length);
+      // complete.jsonl has two ai-title records ("Demo fixture session" then
+      // "Final session title"); the last one wins.
+      expect(meta.title).toBe("Final session title");
+    });
+
+    it("returns title=null when no ai-title record exists", async () => {
+      const path = FIXTURE("interrupted.jsonl");
+      const bytes = await readFixture("interrupted.jsonl");
+      const meta = await transcriptAdapter.readMetadata(path, bytes.length);
+      expect(meta.title).toBeNull();
+    });
+
+    it("returns the sorted set of observed type/subtype combos", async () => {
+      const path = FIXTURE("complete.jsonl");
+      const bytes = await readFixture("complete.jsonl");
+      const meta = await transcriptAdapter.readMetadata(path, bytes.length);
+      expect(meta.recordKinds).toEqual([
+        "ai-title",
+        "assistant",
+        "last-prompt",
+        "permission-mode",
+        "queue-operation",
+        "system/turn_duration",
+        "user"
+      ]);
+    });
+
+    it("includes system/api_error in recordKinds for the failed fixture", async () => {
+      const path = FIXTURE("failed.jsonl");
+      const bytes = await readFixture("failed.jsonl");
+      const meta = await transcriptAdapter.readMetadata(path, bytes.length);
+      expect(meta.recordKinds).toContain("system/api_error");
+      expect(meta.recordKinds).not.toContain("system/turn_duration");
+    });
+
+    it("excludes the trailing partial line's kind from recordKinds", async () => {
+      const path = FIXTURE("partial-tail.jsonl");
+      const bytes = await readFixture("partial-tail.jsonl");
+      const meta = await transcriptAdapter.readMetadata(path, bytes.length);
+      // The partial assistant line is ignored entirely — the only assistant
+      // kinds come from complete lines. partial-tail has exactly one complete
+      // assistant record; kinds are: ai-title, assistant, system/turn_duration, user.
+      expect(meta.recordKinds).toEqual([
+        "ai-title",
+        "assistant",
+        "system/turn_duration",
+        "user"
+      ]);
+    });
+  });
+
+  describe("system records materialize as system items; tool-result wrappers are filtered", () => {
+    it("materializes a system/turn_duration record as a `system` item carrying the subtype", async () => {
       const path = FIXTURE("complete.jsonl");
       const bytes = await readFixture("complete.jsonl");
       const items = await transcriptAdapter.readSnapshot(path, bytes.length);
-      const resultSystem = items.find(
+      const durationItems = items.filter(
         (i) =>
           i.role === "system" &&
           i.contentBlocks.some(
-            (b) => b.kind === "system_note" && /^result: success/.test(b.text)
+            (b) => b.kind === "system_note" && b.text === "turn_duration"
           )
       );
-      expect(resultSystem, "result-derived system item must be present").toBeDefined();
-      // The result record is the last line of complete.jsonl — its offset must
-      // be greater than every prior record's offset.
-      expect(resultSystem!.sourceTranscriptOffset).toBeGreaterThan(0);
+      // complete.jsonl has three turns that end with turn_duration.
+      expect(durationItems.length).toBe(3);
+      for (const item of durationItems) {
+        expect(item.sourceTranscriptOffset).toBeGreaterThan(0);
+      }
       // Sanity: a `tool` item from the wrapper's tool_result IS still present.
       const tool = items.find((i) => i.role === "tool");
       expect(tool).toBeDefined();
+    });
+
+    it("materializes a system/api_error record as a `system` item carrying the subtype", async () => {
+      const path = FIXTURE("failed.jsonl");
+      const bytes = await readFixture("failed.jsonl");
+      const items = await transcriptAdapter.readSnapshot(path, bytes.length);
+      const errorSystems = items.filter(
+        (i) =>
+          i.role === "system" &&
+          i.contentBlocks.some(
+            (b) => b.kind === "system_note" && b.text === "api_error"
+          )
+      );
+      // failed.jsonl has two api_error records (a real retry burst).
+      expect(errorSystems.length).toBe(2);
+    });
+
+    it("does not materialize bookkeeping records (ai-title etc.) as any history item", async () => {
+      const path = FIXTURE("complete.jsonl");
+      const bytes = await readFixture("complete.jsonl");
+      const items = await transcriptAdapter.readSnapshot(path, bytes.length);
+      // Bookkeeping records (ai-title, queue-operation, permission-mode,
+      // last-prompt) must produce NO history items. The only system items
+      // are the three turn_duration records; no note text may name a
+      // bookkeeping type.
+      const systemTexts = items
+        .filter((i) => i.role === "system")
+        .flatMap((i) =>
+          i.contentBlocks
+            .filter((b) => b.kind === "system_note")
+            .map((b) => (b as { kind: "system_note"; text: string }).text)
+        );
+      expect(systemTexts).toEqual([
+        "turn_duration",
+        "turn_duration",
+        "turn_duration"
+      ]);
+      const roles = new Set(items.map((i) => i.role));
+      expect([...roles].sort()).toEqual(["assistant", "system", "tool", "user"]);
     });
 
     it("filters tool-result-wrapper `user` records so no empty-content user item leaks into the snapshot", async () => {
