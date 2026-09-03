@@ -18,6 +18,7 @@ import { migrate, openDatabase, type SqliteDatabase } from "../../src/db/databas
 import { createEventJournal, type EventJournal } from "../../src/events/event-journal.js";
 import {
   createClaudeTranscriptAdapter,
+  encodeProjectPath,
   type ClaudeTranscriptAdapter,
   type HistoryItem,
 } from "../../src/history/claude-2.1.133-adapter.js";
@@ -53,7 +54,7 @@ beforeEach(() => {
   const projectDir = join(dir, "proj");
   mkdirSync(projectDir);
   const canonical = realpathSync(projectDir);
-  const transcriptDir = join(configDir, "projects", canonical.replaceAll("/", "-"));
+  const transcriptDir = join(configDir, "projects", encodeProjectPath(canonical));
   mkdirSync(transcriptDir, { recursive: true });
   transcriptPath = join(transcriptDir, `${SESSION}.jsonl`);
   copyFileSync(FIXTURE("complete.jsonl"), transcriptPath);

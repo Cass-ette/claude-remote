@@ -14,7 +14,7 @@ import { realpathSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { migrate, openDatabase, type SqliteDatabase } from "../../src/db/database.js";
 import { createProjectRegistry, ProjectIdentityError } from "../../src/projects/project-registry.js";
-import { createClaudeTranscriptAdapter } from "../../src/history/claude-2.1.133-adapter.js";
+import { createClaudeTranscriptAdapter, encodeProjectPath } from "../../src/history/claude-2.1.133-adapter.js";
 import {
   createSessionImporter,
   InvalidSessionIdError,
@@ -58,7 +58,7 @@ beforeEach(() => {
   projectDir = join(dir, "proj");
   mkdirSync(projectDir);
   const canonical = realpathSync(projectDir);
-  transcriptDir = join(configDir, "projects", canonical.replaceAll("/", "-"));
+  transcriptDir = join(configDir, "projects", encodeProjectPath(canonical));
   mkdirSync(transcriptDir, { recursive: true });
 
   const registry = createProjectRegistry(db);
