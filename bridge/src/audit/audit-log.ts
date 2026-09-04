@@ -327,7 +327,10 @@ export function createAuditLog(options: AuditLogOptions): AuditLog {
       ...persisted,
       occurredAtIso: new Date(occurredAt).toISOString(),
     });
-    appendFileSync(filePath, `${line}\n`);
+    // mode applies whenever appendFileSync must CREATE the file (e.g. the
+    // first append after a rotation renamed the current file away) — without
+    // it the recreated file gets the umask default (typically 0644).
+    appendFileSync(filePath, `${line}\n`, { mode: 0o600 });
     return persisted;
   }
 

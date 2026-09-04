@@ -257,6 +257,12 @@ describe("audit log file lifecycle", () => {
       expect(lines.length).toBeGreaterThan(0);
       for (const line of lines) expect(line.operationType).toBe("device.session.renew");
     }
+    // The recreated current file AND every rotated file stay owner-only:
+    // rotation renames the current away and the next append recreates it.
+    expect(statSync(logPath()).mode & 0o777).toBe(0o600);
+    for (let i = 1; i <= 5; i += 1) {
+      expect(statSync(rotatedPath(i)).mode & 0o777, `rotated .${i} mode`).toBe(0o600);
+    }
   });
 
   it("rotates at least twice and shifts .1 to .2", () => {
