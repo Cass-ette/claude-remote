@@ -423,7 +423,6 @@ interface ChallengeRow {
   hostAscii: string;
   challengeRaw: Buffer;
   expiresAt: number;
-  consumedAt: number | null;
 }
 
 export function createDeviceAuth(db: SqliteDatabase, options: DeviceAuthOptions = {}): DeviceAuth {
@@ -451,11 +450,19 @@ export function createDeviceAuth(db: SqliteDatabase, options: DeviceAuthOptions 
     `INSERT INTO auth_challenges (challengeId, deviceId, accessSubject, hostAscii, challengeRaw, expiresAt, consumedAt, createdAt)
      VALUES (?, ?, ?, ?, ?, ?, NULL, ?)`,
   );
-  const getChallenge = db.prepare("SELECT * FROM auth_challenges WHERE challengeId = ?");
+  const getChallenge = db.prepare(
+    "SELECT challengeId, deviceId, accessSubject, hostAscii, challengeRaw, expiresAt FROM auth_challenges WHERE challengeId = ?",
+  );
   const deleteChallengeForConsume = db.prepare(
     "DELETE FROM auth_challenges WHERE challengeId = ? AND consumedAt IS NULL",
   );
   const deleteExpiredChallenges = db.prepare("DELETE FROM auth_challenges WHERE expiresAt <= ?");
+  const deleteExpiredPairingTokens = db.prepare(
+    "DELETE FROM pairing_tokens WHERE expiresAt <= ?",
+  );
+  const deleteExpiredDeviceSessions = db.prepare(
+    "DELETE FROM device_sessions WHERE expiresAt <= ?",
+  );
   const deleteDeviceChallenges = db.prepare("DELETE FROM auth_challenges WHERE deviceId = ?");
   const insertDeviceSession = db.prepare(
     "INSERT INTO device_sessions (tokenHash, deviceId, accessSubject, expiresAt, revokedAt, createdAt) VALUES (?, ?, ?, ?, NULL, ?)",
@@ -468,7 +475,7 @@ export function createDeviceAuth(db: SqliteDatabase, options: DeviceAuthOptions 
   );
   const deleteDeviceSessions = db.prepare("DELETE FROM device_sessions WHERE deviceId = ?");
 
-  const tx = runInTransaction.bind(null, db) as <T>(fn: () => T) => T;
+  const tx = <T>(fn: () => T): T => runInTransaction(db, fn);
 
   return {
     mintPairingToken(now) {
@@ -522,6 +529,8 @@ export function createDeviceAuth(db: SqliteDatabase, options: DeviceAuthOptions 
       }
       const hostAscii = normalizeHost(input.hostAscii);
       deleteExpiredChallenges.run(input.now);
+      deleteExpiredPairingTokens.run(input.now);
+      deleteExpiredDeviceSessions.run(input.now);
       const challengeId = randomUUID();
       const challengeRaw = randomBytes(32);
       const expiresAt = input.now + CHALLENGE_TTL_SECONDS * 1000;
@@ -549,9 +558,6 @@ export function createDeviceAuth(db: SqliteDatabase, options: DeviceAuthOptions 
       const challenge = getChallenge.get(input.challengeId) as ChallengeRow | undefined;
       if (challenge === undefined) {
         // Also covers replay: rows are deleted on successful consumption.
-        throw new ChallengeError();
-      }
-      if (challenge.consumedAt !== null) {
         throw new ChallengeError();
       }
       if (challenge.expiresAt <= input.now) {
