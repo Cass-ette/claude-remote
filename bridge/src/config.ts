@@ -61,6 +61,13 @@ export interface BridgeConfig {
    * Used by the device-auth registry.
    */
   readonly deviceSessionTtlSeconds: number;
+  /**
+   * Public hostname devices use to reach the Bridge through the Cloudflare
+   * Tunnel (BRIDGE_PUBLIC_HOST), e.g. `bridge.example.com`. Optional: the
+   * admin CLI requires it to build the `claude-remote://pair` payload for
+   * pairing QR codes; the server itself does not use it.
+   */
+  readonly publicHost?: string | undefined;
 }
 
 /** Loopback hosts the Bridge is allowed to bind to. */
@@ -221,6 +228,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const cloudflareTeamDomain = parseCloudflareTeamDomain(env);
   const cloudflareAud = readString(env, "BRIDGE_CLOUDFLARE_AUD");
   const deviceSessionTtlSeconds = parseDeviceSessionTtlSeconds(env);
+  const publicHost = readString(env, "BRIDGE_PUBLIC_HOST");
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
@@ -237,5 +245,6 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     cloudflareTeamDomain,
     cloudflareAud,
     deviceSessionTtlSeconds,
+    publicHost,
   });
 }
