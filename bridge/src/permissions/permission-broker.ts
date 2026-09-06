@@ -119,6 +119,13 @@ export interface PermissionBroker {
   resolve(input: PermissionResolveInput): Promise<void>;
   denyAllForSession(sessionId: string, reason: string): Promise<void>;
   denyAllForDevice(deviceId: string, reason: string): Promise<void>;
+  /**
+   * The session's oldest still-pending permission request (snapshot begin
+   * embeds it so a resyncing device can re-render the prompt), or null.
+   * Returns the journaled `permission.requested` payload plus its epoch-ms
+   * auto-deny deadline.
+   */
+  pendingForSession(sessionId: string): { payload: Record<string, unknown>; expiresAt: number } | null;
   /** Start listening on the Unix socket (mode 0600). */
   listen(): Promise<void>;
   /**
@@ -608,6 +615,26 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
     }
   }
 
+  function pendingForSession(sessionId: string): { payload: Record<string, unknown>; expiresAt: number } | null {
+    for (const pending of pendingByRequest.values()) {
+      if (pending.sessionId !== sessionId || pending.resolved) continue;
+      const createdAt = pending.createdAt;
+      return {
+        payload: {
+          permissionRequestId: pending.permissionRequestId,
+          toolName: pending.toolName,
+          input: pending.input,
+          ...(pending.toolUseId !== undefined ? { toolUseId: pending.toolUseId } : {}),
+          requestedAt: new Date(createdAt).toISOString(),
+          expiresAt: new Date(createdAt + timeoutMs).toISOString(),
+          displayCategory: categorizeToolForDisplay(pending.toolName),
+        },
+        expiresAt: createdAt + timeoutMs,
+      };
+    }
+    return null;
+  }
+
   async function denyAllForDevice(deviceId: string, reason: string): Promise<void> {
     const sessions = new Set(options.sessionsForDevice(deviceId));
     if (sessions.size === 0) return;
@@ -784,6 +811,7 @@ export function createPermissionBroker(options: PermissionBrokerOptions): Permis
     resolve,
     denyAllForSession,
     denyAllForDevice,
+    pendingForSession,
     listen,
     close,
   };

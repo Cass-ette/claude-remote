@@ -1,4 +1,5 @@
 import { mkdirSync } from "node:fs";
+import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { normalizeTeamDomain } from "./auth/access-jwt-verifier.js";
 import { DEFAULT_DEVICE_SESSION_TTL_SECONDS } from "./auth/device-auth.js";
@@ -68,6 +69,13 @@ export interface BridgeConfig {
    * pairing QR codes; the server itself does not use it.
    */
   readonly publicHost?: string | undefined;
+  /**
+   * Claude Code configuration directory (CLAUDE_CONFIG_DIR). The spawned
+   * CLI processes inherit it via the environment, and the history layer
+   * reads transcripts from `<claudeConfigDir>/projects/<encoded-project>/`.
+   * Default: `~/.claude`.
+   */
+  readonly claudeConfigDir: string;
 }
 
 /** Loopback hosts the Bridge is allowed to bind to. */
@@ -192,6 +200,15 @@ function parseDeviceSessionTtlSeconds(env: EnvSource): number {
   return seconds;
 }
 
+function parseClaudeConfigDir(env: EnvSource): string {
+  const raw = readString(env, "CLAUDE_CONFIG_DIR");
+  if (raw === undefined) return join(homedir(), ".claude");
+  if (!isAbsolute(raw)) {
+    throw new Error(`CLAUDE_CONFIG_DIR must be an absolute path; got ${JSON.stringify(raw)}.`);
+  }
+  return raw;
+}
+
 /**
  * Optional Cloudflare Access team domain. When present it must form a valid
  * team domain (with or without an `https://` scheme, which is normalized
@@ -229,6 +246,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const cloudflareAud = readString(env, "BRIDGE_CLOUDFLARE_AUD");
   const deviceSessionTtlSeconds = parseDeviceSessionTtlSeconds(env);
   const publicHost = readString(env, "BRIDGE_PUBLIC_HOST");
+  const claudeConfigDir = parseClaudeConfigDir(env);
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 
@@ -246,5 +264,6 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     cloudflareAud,
     deviceSessionTtlSeconds,
     publicHost,
+    claudeConfigDir,
   });
 }

@@ -88,17 +88,17 @@ describe("main smoke (Task 12)", () => {
     expect(typeof body.bridgeVersion).toBe("string");
   });
 
-  it("accepts a WebSocket with stub auth and correct headers", async () => {
+  it("closes WebSocket upgrades with 4401 when no Access verifier is configured (fail-closed)", async () => {
+    // Task 24 wiring: the runtime always injects the real two-layer WS
+    // authenticator. A local-only boot (no BRIDGE_CLOUDFLARE_TEAM_DOMAIN/AUD)
+    // has no verifier, so NO credential combination is accepted — mirroring
+    // the HTTP routes, which return 401 for every authenticated route in the
+    // same situation. The legacy stub auth (any Bearer + device-session
+    // header) only survives as a websocket-server unit-test seam.
     const { wsUrl } = await boot();
     const ws = new WebSocket(wsUrl, [V1], { headers: AUTH_HEADERS });
-    const opened = new Promise<void>((resolve, reject) => {
-      ws.once("open", resolve);
-      ws.once("error", reject);
-    });
-    await opened;
-    expect(ws.protocol).toBe(V1);
-    ws.close();
-    await new Promise<void>((resolve) => ws.once("close", () => resolve()));
+    const closed = new Promise<number>((resolve) => ws.once("close", (code) => resolve(code)));
+    expect(await closed).toBe(4401);
   });
 
   it("closes with 4401 when the device-session header is missing", async () => {
@@ -134,22 +134,19 @@ describe("main smoke (Task 12)", () => {
   });
 
   it("close() shuts down everything within 2 seconds", async () => {
-    const { wsUrl } = await boot();
-    const ws = new WebSocket(wsUrl, [V1], { headers: AUTH_HEADERS });
-    await new Promise<void>((resolve) => ws.once("open", resolve));
-    const closed = new Promise<{ code: number; reason: string }>((resolve) =>
-      ws.once("close", (code, reason) => resolve({ code, reason: reason.toString() })),
-    );
+    // Without an Access verifier no WS survives authentication (fail-closed
+    // above), so this asserts the shutdown path itself: close() resolves
+    // promptly and the HTTP server stops accepting. The authenticated-socket
+    // shutdown close (4500 "bridge shutdown") is covered end-to-end by
+    // runtime.integration.test.ts's graceful-shutdown case.
+    const { baseUrl } = await boot();
     const handle = bridge!;
     bridge = undefined; // afterEach must not double-close
     const start = Date.now();
     await handle.close();
-    const { code, reason } = await closed;
     expect(Date.now() - start).toBeLessThan(2000);
-    expect(code).toBe(4500);
-    expect(reason).toContain("shutdown");
     // Subsequent requests fail: server is closed.
-    await expect(fetch(`http://127.0.0.1:${handle.config.port}/api/v1/health`)).rejects.toThrow();
+    await expect(fetch(`${baseUrl}/api/v1/health`)).rejects.toThrow();
     dataDir = handle.config.dataDir; // keep afterEach cleanup
   });
 });

@@ -48,6 +48,13 @@ export interface ClaudeProcessHandle {
   alive(): boolean;
   /** Resolves with the first `system/init` payload or rejects on timeout. */
   awaitInit(timeoutMs: number): Promise<{ session_id: string }>;
+  /**
+   * Async iterator over the child's classified stream-json stdout events.
+   * Optional: the real factory (Task 16 wiring) provides it; the runtime's
+   * event pump consumes it to journal assistant deltas/completions and to
+   * complete dispatched message.send commands on `result` records.
+   */
+  events?(): AsyncIterableIterator<import("../claude/stream-json-adapter.js").ClaudeStreamEvent>;
 }
 
 export interface ClaudeProcessFactory {
@@ -142,6 +149,37 @@ export interface SessionSupervisor {
   stop(input: { sessionId: string }): Promise<void>;
   release(input: { sessionId: string }): Promise<void>;
   cancel(input: { requestId: string }): Promise<void>;
+  /**
+   * Dispatch one user turn into a local idle session (Task 24 wiring):
+   * flips idle → running (session.state.changed) and writes the user record
+   * to the child's stdin. Ledger command transitions stay with the caller
+   * (the command dispatcher) per §8.3.
+   */
+  sendMessage(input: { sessionId: string; requestId: string; text: string }): Promise<void>;
+  /**
+   * Complete the active turn after its `result` record: transitions the
+   * dispatched command to `completed`/`failed` WITH a command.status.changed
+   * event, then flips the session running → idle.
+   */
+  completeMessage(input: {
+    sessionId: string;
+    requestId: string;
+    outcome: "completed" | "failed";
+    result?: unknown;
+  }): Promise<void>;
+  /** Guarded running → waiting_permission flip (permission.requested). */
+  markPermissionWait(sessionId: string): void;
+  /** Guarded waiting_permission → running flip (permission.resolved). */
+  markPermissionResume(sessionId: string): void;
+  /** Current session status; throws UnknownSessionError for unknown ids. */
+  sessionStatus(sessionId: string): SessionStatus;
+  /**
+   * Graceful shutdown fan-out (§11.5): stop sessions whose persisted status
+   * is running/waiting_permission/interrupting (deny-first stop order), and
+   * terminate any remaining local child processes without further status
+   * changes (idle sessions keep their status; their locks are released).
+   */
+  shutdownAll(): Promise<void>;
   recoverOnStartup(): Promise<void>;
   reconcileIndeterminateCommands(history: {
     findTurnEvidence(sessionId: string, uuid: string): Promise<TurnEvidence>;
@@ -173,6 +211,12 @@ export interface SessionSupervisorOptions {
   readonly permissionBroker?: PermissionDenier;
   readonly processController?: ProcessController;
   readonly now?: () => number;
+  /**
+   * Called after a successful create/resume once the child process handle is
+   * ready and the session is idle. The runtime wires the session event pump
+   * here so it consumes the child's stdout from the very first event.
+   */
+  readonly onProcessStarted?: (sessionId: string, handle: ClaudeProcessHandle) => void;
   /** Default: SIGNAL_WAIT_SECONDS from config.ts (5 s). */
   readonly signalWaitMs?: number;
   /** Default: 10 s. */
@@ -383,6 +427,7 @@ export function createSessionSupervisor(
     processes.set(sessionId, handle);
     recordProcessInLock(handle);
     setStatus(sessionId, "idle");
+    options.onProcessStarted?.(sessionId, handle);
     return { sessionId };
   }
 
@@ -434,6 +479,7 @@ export function createSessionSupervisor(
     processes.set(input.sessionId, handle);
     recordProcessInLock(handle);
     setStatus(input.sessionId, "idle");
+    options.onProcessStarted?.(input.sessionId, handle);
   }
 
   // -------------------------------------------------------------------------
@@ -522,6 +568,113 @@ export function createSessionSupervisor(
         result: { cancelled: true },
       }),
     });
+  }
+
+  // -------------------------------------------------------------------------
+  // sendMessage / completeMessage / permission-wait flips (Task 24 wiring)
+  // -------------------------------------------------------------------------
+
+  async function sendMessage(input: { sessionId: string; requestId: string; text: string }): Promise<void> {
+    const row = getSession(input.sessionId);
+    if (row.status !== "idle") {
+      throw new InvalidSessionStateError(input.sessionId, "sendMessage", row.status, ["idle"]);
+    }
+    const handle = processes.get(input.sessionId);
+    if (handle === undefined) {
+      throw new InvalidSessionStateError(input.sessionId, "sendMessage", "not-local", ["idle"]);
+    }
+    setStatus(input.sessionId, "running");
+    try {
+      handle.sendUser(input.requestId, input.text);
+    } catch (error) {
+      // The write failed before the turn existed: revert to idle and rethrow
+      // (the dispatcher classifies the command as indeterminate per §7.4).
+      setStatus(input.sessionId, "idle");
+      throw error;
+    }
+  }
+
+  async function completeMessage(input: {
+    sessionId: string;
+    requestId: string;
+    outcome: "completed" | "failed";
+    result?: unknown;
+  }): Promise<void> {
+    await options.ledger.transitionWithStatusEvent(input.requestId, input.outcome, {
+      now: now(),
+      buildEventPayload: (record) => ({
+        requestId: record.requestId,
+        idempotencyKey: record.idempotencyKey,
+        commandType: record.commandType,
+        ...(input.result !== undefined ? { result: input.result } : {}),
+      }),
+    });
+    const row = getSession(input.sessionId);
+    if (row.status === "running") {
+      setStatus(input.sessionId, "idle");
+    }
+  }
+
+  function markPermissionWait(sessionId: string): void {
+    try {
+      const row = getSession(sessionId);
+      if (row.status === "running") setStatus(sessionId, "waiting_permission");
+    } catch {
+      // unknown session (event raced a release): nothing to flip
+    }
+  }
+
+  function markPermissionResume(sessionId: string): void {
+    try {
+      const row = getSession(sessionId);
+      if (row.status === "waiting_permission") setStatus(sessionId, "running");
+    } catch {
+      // unknown session (event raced a release): nothing to flip
+    }
+  }
+
+  function sessionStatus(sessionId: string): SessionStatus {
+    return getSession(sessionId).status;
+  }
+
+  // -------------------------------------------------------------------------
+  // shutdownAll (§11.5 graceful shutdown fan-out)
+  // -------------------------------------------------------------------------
+
+  async function shutdownAll(): Promise<void> {
+    const localSessionIds = [...processes.keys()];
+    for (const sessionId of localSessionIds) {
+      let status: SessionStatus;
+      try {
+        status = getSession(sessionId).status;
+      } catch {
+        status = "idle";
+      }
+      if (status === "running" || status === "waiting_permission" || status === "interrupting") {
+        // deny-first stop order; ends interrupted.
+        try {
+          await stop({ sessionId });
+        } catch {
+          // fall through to the raw teardown below
+        }
+      }
+      const handle = processes.get(sessionId);
+      if (handle !== undefined) {
+        try {
+          await terminateProcess(handle);
+        } catch {
+          // signal delivery failures must not block the rest of shutdown
+        }
+        processes.delete(sessionId);
+        transaction(db, () => {
+          try {
+            locks.delete(sessionId);
+          } catch {
+            // already gone
+          }
+        });
+      }
+    }
   }
 
   // -------------------------------------------------------------------------
@@ -654,6 +807,12 @@ export function createSessionSupervisor(
     stop,
     release,
     cancel,
+    sendMessage,
+    completeMessage,
+    markPermissionWait,
+    markPermissionResume,
+    sessionStatus,
+    shutdownAll,
     recoverOnStartup,
     reconcileIndeterminateCommands,
   };

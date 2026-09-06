@@ -70,6 +70,17 @@ export interface EventJournal extends EventJournalPort {
   markCheckpointSuperseded(sessionId: string, deviceId: string, watermark: bigint, now: number): void;
   pendingBytes(): number;
   sweep(now: number): void;
+  /**
+   * Register (or, with undefined, clear) the append listener fired at the end
+   * of every appendWithinTransaction — i.e. exactly once per appended event,
+   * including appends that share a caller-owned transaction. Task 24's
+   * runtime uses it to fan pending events out to live WebSocket connections.
+   * The listener runs synchronously inside the append; a rollback of the
+   * surrounding transaction after the listener fired is possible in theory
+   * (the append itself is the last statement in practice) and is absorbed by
+   * the client-side eventId dedup.
+   */
+  setAppendListener(listener: ((event: PersistedEvent) => void) | undefined): void;
 }
 
 interface PendingRow {
@@ -91,6 +102,7 @@ interface DeliveryRow {
 }
 
 export function createEventJournal(db: SqliteDatabase, config: EventJournalConfig): EventJournal {
+  let appendListener: ((event: PersistedEvent) => void) | undefined;
   const insertPending = db.prepare(
     `INSERT INTO pending_events (sessionId, eventId, eventType, payloadJson, protocolVersion, createdAt)
      VALUES (?, ?, ?, ?, ?, ?)`,
@@ -178,7 +190,7 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
       });
       insertPending.run(sessionId, eventId, eventType, payloadJson, PROTOCOL_VERSION, now);
       void txDb; // same connection; kept for contract clarity
-      return {
+      const persisted: PersistedEvent = {
         sessionId,
         eventId: BigInt(eventId),
         eventType,
@@ -186,6 +198,15 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
         protocolVersion: PROTOCOL_VERSION,
         createdAt: now,
       };
+      if (appendListener !== undefined) {
+        try {
+          appendListener(persisted);
+        } catch {
+          // A delivery-side failure must never fail the append; the event is
+          // still persisted and will be replayed on the next reconnect.
+        }
+      }
+      return persisted;
     },
 
     replayAfter(sessionId: string, eventId: bigint): PersistedEvent[] {
@@ -227,6 +248,10 @@ export function createEventJournal(db: SqliteDatabase, config: EventJournalConfi
 
     sweep(now): void {
       sweepStmt.run(now);
+    },
+
+    setAppendListener(listener): void {
+      appendListener = listener;
     },
   };
 }

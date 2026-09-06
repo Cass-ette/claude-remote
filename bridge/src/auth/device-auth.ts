@@ -400,6 +400,13 @@ export interface DeviceAuth {
   /** Bearer check for every request; null when missing, expired, or revoked. */
   validateDeviceSession(token: string, now: number): ValidatedDeviceSession | null;
 
+  /**
+   * Expiry (epoch ms) of a STILL-VALID device session; null otherwise.
+   * Same validity rules as {@link validateDeviceSession} — used by the
+   * WebSocket write deadline (min of the Access exp and this value).
+   */
+  getSessionExpiry(token: string, now: number): number | null;
+
   revokeDevice(deviceId: string, now: number, hooks: RevocationHooks): void;
 
   listDevices(): DeviceSummary[];
@@ -638,6 +645,23 @@ export function createDeviceAuth(db: SqliteDatabase, options: DeviceAuthOptions 
       if (row.expiresAt <= now) return null;
       if (row.sessionRevokedAt !== null || row.deviceRevokedAt !== null) return null;
       return { deviceId: row.deviceId, accessSubject: row.accessSubject };
+    },
+
+    getSessionExpiry(token, now) {
+      if (typeof token !== "string" || token === "") {
+        return null;
+      }
+      const row = getSession.get(sha256Hex(token)) as
+        | {
+            expiresAt: number;
+            sessionRevokedAt: number | null;
+            deviceRevokedAt: number | null;
+          }
+        | undefined;
+      if (row === undefined) return null;
+      if (row.expiresAt <= now) return null;
+      if (row.sessionRevokedAt !== null || row.deviceRevokedAt !== null) return null;
+      return row.expiresAt;
     },
 
     revokeDevice(deviceId, now, hooks) {

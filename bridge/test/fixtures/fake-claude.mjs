@@ -125,6 +125,11 @@ try {
       parent_tool_use_id: null,
     });
 
+    // FAKE_CLAUDE_NO_RESULT=1 withholds the turn's result record: the turn
+    // never terminates, keeping the session `running`/`waiting_permission`
+    // deterministically for shutdown and permission-flow tests.
+    if (process.env.FAKE_CLAUDE_NO_RESULT === "1") continue;
+
     // One result per turn; the process keeps running after this — only stdin
     // close or a signal ends it.
     write({

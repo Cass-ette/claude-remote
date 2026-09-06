@@ -21,6 +21,7 @@ import { randomBytes } from "node:crypto";
 import { accessSync, constants as fsConstants, mkdirSync, writeFileSync } from "node:fs";
 import { delimiter, isAbsolute, join } from "node:path";
 import { SIGNAL_WAIT_SECONDS } from "../config.js";
+import { transcriptPathForSession } from "../history/claude-2.1.133-adapter.js";
 import type {
   ClaudeProcessFactory,
   ClaudeProcessHandle,
@@ -29,6 +30,7 @@ import type {
 import {
   ClaudeStreamJsonProcess,
   DEFAULT_PERMISSION_PROMPT_TOOL,
+  type ClaudeStreamEvent,
 } from "./stream-json-adapter.js";
 import { startProcessLeaseWrapper, type ProcessLease } from "./process-lease-wrapper.js";
 
@@ -146,6 +148,19 @@ export interface RealProcessFactoryOptions {
   readonly watcherScriptPath?: string;
   /** Override for tests; defaults to PATH-resolved mkfifo. */
   readonly mkfifoPath?: string;
+  /**
+   * Claude config directory (CLAUDE_CONFIG_DIR). When set, the handle's
+   * transcriptPath is derived from it (release-time stabilization) instead
+   * of staying undefined.
+   */
+  readonly claudeConfigDir?: string;
+  /**
+   * Notified with each freshly generated lease secret, right after the MCP
+   * config is written and BEFORE the child is spawned. The runtime wires it
+   * to the permission broker's registerLease so the per-session adapter can
+   * authenticate its `hello` frame.
+   */
+  readonly onLeaseGenerated?: (leaseSecret: string, sessionId: string) => void;
 }
 
 export function createRealProcessFactory(options: RealProcessFactoryOptions): ClaudeProcessFactory {
@@ -179,6 +194,7 @@ export function createRealProcessFactory(options: RealProcessFactoryOptions): Cl
           BRIDGE_SESSION_ID: sessionId,
         },
       });
+      options.onLeaseGenerated?.(leaseSecret, sessionId);
 
       const process_ = ClaudeStreamJsonProcess.start({
         command: claudeBin,
@@ -234,9 +250,13 @@ export function createRealProcessFactory(options: RealProcessFactoryOptions): Cl
         get pid(): number | undefined {
           return process_.pid;
         },
-        // Transcript path is not yet derivable without the history adapter
-        // (Task 19); undefined skips release-time transcript stabilization.
-        transcriptPath: undefined,
+        // With claudeConfigDir configured the canonical transcript path is
+        // derivable (history adapter, Task 19); otherwise undefined skips
+        // release-time transcript stabilization.
+        transcriptPath:
+          options.claudeConfigDir !== undefined
+            ? transcriptPathForSession(options.claudeConfigDir, cwd, sessionId)
+            : undefined,
         sendUser(requestId: string, text: string): void {
           process_.sendUser(requestId, sessionId, text);
         },
@@ -251,6 +271,9 @@ export function createRealProcessFactory(options: RealProcessFactoryOptions): Cl
         },
         awaitInit(timeoutMs: number): Promise<{ session_id: string }> {
           return process_.awaitInit(timeoutMs);
+        },
+        events(): AsyncIterableIterator<ClaudeStreamEvent> {
+          return process_.events();
         },
       };
     },

@@ -161,6 +161,12 @@ export interface CommandLedger {
     options: TransitionWithStatusEventOptions,
   ): Promise<{ record: CommandRecord; event: PersistedEvent }>;
 
+  /**
+   * Persist a command's result payload (idempotent replays return it). No
+   * status change and no event — callers pair it with a transition they own.
+   */
+  setResult(requestId: string, result: unknown, now: number): void;
+
   get(requestId: string): Promise<CommandRecord | undefined>;
 }
 
@@ -202,6 +208,7 @@ export function createCommandLedger(db: SqliteDatabase, journal: EventJournalPor
     "SELECT * FROM commands WHERE deviceId = ? AND idempotencyKey = ?",
   );
   const updateStatus = db.prepare("UPDATE commands SET status = ?, updatedAt = ? WHERE requestId = ?");
+  const setResultStmt = db.prepare("UPDATE commands SET resultJson = ?, updatedAt = ? WHERE requestId = ?");
 
   function acceptSync(
     envelope: Command,
@@ -310,6 +317,12 @@ export function createCommandLedger(db: SqliteDatabase, journal: EventJournalPor
     get(requestId) {
       const row = getByRequest.get(requestId) as CommandRow | undefined;
       return Promise.resolve(row === undefined ? undefined : rowToRecord(row));
+    },
+
+    setResult(requestId, result, now) {
+      const row = getByRequest.get(requestId) as CommandRow | undefined;
+      if (row === undefined) throw new Error(`unknown requestId ${requestId}`);
+      setResultStmt.run(JSON.stringify(result ?? null), now, requestId);
     },
   };
 }
