@@ -27,7 +27,8 @@ import { createHash } from "node:crypto";
 import type { AuditLog } from "../audit/audit-log.js";
 import type { PermissionBroker } from "../permissions/permission-broker.js";
 import type { ProjectRegistry } from "../projects/project-registry.js";
-import type { SessionSupervisor } from "../sessions/session-supervisor.js";
+import { ProjectIdentityError } from "../projects/project-registry.js";
+import type { SessionSupervisor, TurnEvidence } from "../sessions/session-supervisor.js";
 import {
   UnknownSessionError as SupervisorUnknownSessionError,
   InvalidSessionStateError,
@@ -40,14 +41,24 @@ import {
 import type { SnapshotService } from "../snapshots/snapshot-service.js";
 import { SnapshotProtocolError } from "../snapshots/snapshot-errors.js";
 import type { EventJournal } from "../events/event-journal.js";
-import { BackwardAckError } from "../events/event-journal.js";
+import { BackwardAckError, StoragePressureError } from "../events/event-journal.js";
 import { CheckpointCommitRequiredError } from "../snapshots/snapshot-errors.js";
+import type { SessionImporter } from "../history/session-importer.js";
+import {
+  InvalidSessionIdError,
+  SessionProjectMismatchError,
+  TranscriptUnimportableError,
+} from "../history/session-importer.js";
+import { TranscriptNotFoundError } from "../history/claude-2.1.133-adapter.js";
 import type { Command, ProtocolResponse, ResponseError } from "../protocol/v1/types.js";
 import { parseEventId } from "../protocol/v1/validator.js";
 import { PROTOCOL_VERSION } from "../protocol/v1/types.js";
 
 /** Snapshot page size: server-side constant (the client pages via cursors). */
 export const SNAPSHOT_PAGE_SIZE = 10;
+
+/** Typed error code for §11.6 storage-pressure rejections (HTTP 503). */
+export const STORAGE_PRESSURE_CODE = "STORAGE_PRESSURE";
 
 export interface DispatchOutcome {
   readonly httpStatus: number;
@@ -65,6 +76,23 @@ export class DispatchError extends Error {
   }
 }
 
+/**
+ * Parse a stored canonical payloadJson (migration 002). Returns undefined for
+ * pre-migration rows (empty string) or unparsable content — callers treat
+ * that as "payload not retained".
+ */
+function parseStoredPayload(payloadJson: string): Record<string, unknown> | undefined {
+  if (payloadJson === "") return undefined;
+  try {
+    const parsed = JSON.parse(payloadJson) as unknown;
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export interface CommandDispatcherDeps {
   readonly db: SqliteDatabase;
   readonly ledger: CommandLedger;
@@ -74,6 +102,14 @@ export interface CommandDispatcherDeps {
   readonly broker: PermissionBroker;
   readonly registry: ProjectRegistry;
   readonly audit: AuditLog;
+  /** Transcript-session importer (§6.6), wired by the runtime. */
+  readonly importer: SessionImporter;
+  /**
+   * Transcript evidence lookup (§7.4) — the same resolver the supervisor's
+   * startup reconciliation uses; retry_indeterminate consults it to classify
+   * an indeterminate command before re-dispatching.
+   */
+  readonly findTurnEvidence: (sessionId: string, uuid: string) => Promise<TurnEvidence>;
   readonly now: () => number;
   /** Marks the session's current writer device (permission resolve authz). */
   readonly noteWriter: (sessionId: string, deviceId: string) => void;
@@ -219,20 +255,53 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
         if (target === undefined) {
           throw new DispatchError(404, { code: "COMMAND_NOT_FOUND", message: "unknown requestId", retryable: false });
         }
-        if (target.status === "indeterminate") {
-          // §7.4: the client re-sends the command with a fresh requestId;
-          // retry_indeterminate only closes the old row as failed.
-          await deps.ledger.transitionWithStatusEvent(target.requestId, "failed", {
+        // Already classified (or never indeterminate): read-only no-op that
+        // reports the current status — retrying a terminal command must not
+        // re-run side effects (§8.2 idempotency spirit).
+        if (target.status !== "indeterminate") {
+          return { requestId: target.requestId, status: target.status };
+        }
+        // §7.4: consult transcript evidence FIRST. If the original turn is
+        // now classifiable, adopt the outcome and never re-send anything.
+        let evidence: TurnEvidence;
+        try {
+          evidence = await deps.findTurnEvidence(target.sessionId, target.requestId);
+        } catch (error) {
+          // No transcript at all (never written / deleted): the turn cannot
+          // have reached Claude — treat like absent evidence.
+          if (error instanceof TranscriptNotFoundError) {
+            evidence = { kind: "absent" };
+          } else {
+            throw error;
+          }
+        }
+        if (evidence.kind === "turn") {
+          await deps.ledger.transitionWithStatusEvent(target.requestId, evidence.outcome, {
             now: now(),
             buildEventPayload: (rec) => ({
               requestId: rec.requestId,
               idempotencyKey: rec.idempotencyKey,
               commandType: rec.commandType,
-              error: { code: "RETRYED", message: "closed by retry_indeterminate" },
+              result: { reconciledFrom: "transcript" },
             }),
           });
+          return { requestId: target.requestId, status: evidence.outcome };
         }
-        return { requestId: target.requestId, status: "failed" };
+        // Evidence absent / unparseable: re-dispatch with the ORIGINAL UUID
+        // and ORIGINAL payload (§7.4) — a fresh UUID would create a
+        // DIFFERENT user record in the transcript. Same-UUID re-sends are
+        // safe: the Phase 0 gate proved duplicate UUIDs do not duplicate
+        // transcript entries across resume.
+        const original = parseStoredPayload(target.payloadJson);
+        if (target.commandType !== "message.send" || original === undefined || typeof original.text !== "string") {
+          throw new DispatchError(409, {
+            code: "RETRY_NOT_DISPATCHABLE",
+            message: "the original command's payload was not retained and cannot be re-dispatched",
+            retryable: false,
+          });
+        }
+        await runSend(target.requestId, target.sessionId, original.text, deviceId);
+        return { requestId: target.requestId, status: "dispatched" };
       }
       case "permission.resolve": {
         const decision = payload.decision as "allow" | "deny";
@@ -250,14 +319,20 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
         deps.journal.acknowledge(sessionId, deviceId, lastEventId, now());
         return { acknowledged: true, lastEventId: lastEventId.toString() };
       }
-      case "session.scan_imports":
+      case "session.scan_imports": {
+        // §6.6: revalidate the project identity, then read-only scan of
+        // THAT project's transcript directory. The importer revalidates
+        // internally (step 1) — this call IS the scan.
+        const scan = await deps.importer.scanImports(payload.projectId as string);
+        return { candidates: [...scan.candidates], skipped: scan.skipped };
+      }
       case "session.import": {
-        // Transcript import of foreign sessions is not part of Chunk 3.
-        throw new DispatchError(400, {
-          code: "COMMAND_NOT_SUPPORTED",
-          message: `${envelope.commandType} is not supported by this Bridge version`,
-          retryable: false,
+        const binding = await deps.importer.importSession({
+          projectId: payload.projectId as string,
+          sessionId: payload.sessionId as string,
+          now: now(),
         });
+        return binding;
       }
       case "message.send": {
         throw new Error("message.send is handled asynchronously; unreachable in run()");
@@ -272,14 +347,15 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
     }
   }
 
-  /** Async dispatch path for message.send (§7.4, §8.3). */
-  async function runMessageSend(envelope: Command, deviceId: string): Promise<DispatchOutcome> {
-    const payload = envelope.payload as Record<string, unknown>;
-    const sessionId = payload.sessionId as string;
-    const text = payload.text as string;
-
+  /**
+   * Async dispatch core (§7.4, §8.3): ? → dispatching → dispatched around the
+   * supervisor's stdin write. Shared by message.send (from accepted) and
+   * command.retry_indeterminate (from indeterminate — the ledger's legal
+   * transitions admit indeterminate → dispatching for exactly that flow).
+   */
+  async function runSend(requestId: string, sessionId: string, text: string, deviceId: string): Promise<void> {
     deps.noteWriter(sessionId, deviceId);
-    await deps.ledger.transitionWithStatusEvent(envelope.requestId, "dispatching", {
+    await deps.ledger.transitionWithStatusEvent(requestId, "dispatching", {
       now: now(),
       buildEventPayload: (rec) => ({
         requestId: rec.requestId,
@@ -288,12 +364,12 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
       }),
     });
     try {
-      await deps.supervisor.sendMessage({ sessionId, requestId: envelope.requestId, text });
+      await deps.supervisor.sendMessage({ sessionId, requestId, text });
     } catch (error) {
       // dispatching → dispatched failed: the turn may or may not have
       // reached Claude; per §7.4 the ONLY legal follow-up from dispatching
       // besides dispatched is indeterminate.
-      await deps.ledger.transitionWithStatusEvent(envelope.requestId, "indeterminate", {
+      await deps.ledger.transitionWithStatusEvent(requestId, "indeterminate", {
         now: now(),
         buildEventPayload: (rec) => ({
           requestId: rec.requestId,
@@ -304,7 +380,7 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
       });
       throw mapSupervisorError(error);
     }
-    await deps.ledger.transitionWithStatusEvent(envelope.requestId, "dispatched", {
+    await deps.ledger.transitionWithStatusEvent(requestId, "dispatched", {
       now: now(),
       buildEventPayload: (rec) => ({
         requestId: rec.requestId,
@@ -312,6 +388,12 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
         commandType: rec.commandType,
       }),
     });
+  }
+
+  /** Async dispatch path for message.send (§7.4, §8.3). */
+  async function runMessageSend(envelope: Command, deviceId: string): Promise<DispatchOutcome> {
+    const payload = envelope.payload as Record<string, unknown>;
+    await runSend(envelope.requestId, payload.sessionId as string, payload.text as string, deviceId);
     return {
       httpStatus: 200,
       response: {
@@ -342,6 +424,30 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
     }
     if (error instanceof CheckpointCommitRequiredError) {
       return new DispatchError(409, { code: "CHECKPOINT_COMMIT_REQUIRED", message: error.message, retryable: false });
+    }
+    // §11.6 storage pressure: the journal rejects new user messages while
+    // pending events occupy the byte budget — retryable once the consumer
+    // ACKs and the sweep frees bytes.
+    if (error instanceof StoragePressureError) {
+      return new DispatchError(503, {
+        code: STORAGE_PRESSURE_CODE,
+        message: "pending events are at the storage budget; the journal rejects new user messages until the consumer acknowledges delivery",
+        retryable: true,
+      });
+    }
+    // §6.6/§10.5: project identity no longer matches the authorized record
+    // (moved/replaced dir, or unknown projectId).
+    if (error instanceof ProjectIdentityError) {
+      return new DispatchError(409, { code: "PROJECT_IDENTITY", message: error.message, retryable: false });
+    }
+    if (error instanceof InvalidSessionIdError) {
+      return new DispatchError(400, { code: "INVALID_SESSION_ID", message: error.message, retryable: false });
+    }
+    if (error instanceof TranscriptUnimportableError) {
+      return new DispatchError(400, { code: "TRANSCRIPT_UNIMPORTABLE", message: error.message, retryable: false });
+    }
+    if (error instanceof SessionProjectMismatchError) {
+      return new DispatchError(409, { code: "SESSION_PROJECT_MISMATCH", message: error.message, retryable: false });
     }
     const name = (error as Error).name;
     if (name === "UnknownPermissionRequestError" || name === "PermissionSessionMismatchError") {
@@ -407,6 +513,11 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
     }
 
     const record = accepted.record;
+    // Project-scoped commands (scan_imports / import / create) carry the
+    // projectId in the payload; §10.6 audit records it when present.
+    const payload = envelope.payload as Record<string, unknown>;
+    const auditProjectId =
+      typeof payload.projectId === "string" ? { projectId: payload.projectId as string } : {};
     try {
       if (envelope.commandType === "message.send") {
         const outcome = await runMessageSend(envelope, deviceId);
@@ -429,6 +540,7 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
         deviceId,
         requestId: envelope.requestId,
         ...(record.sessionId === "" ? {} : { sessionId: record.sessionId }),
+        ...auditProjectId,
         resultCode: "ok",
         detail: { commandStatus: "completed" },
         committed: true,
@@ -437,16 +549,23 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
     } catch (error) {
       const mapped = mapSupervisorError(error);
       try {
-        await deps.ledger.transition(envelope.requestId, "failed", { now: now() });
+        // Sync commands (still accepted) end failed. A message.send whose
+        // dispatch already moved the row — indeterminate per §7.4, where it
+        // must STAY so command.retry_indeterminate can target it — keeps
+        // its status; the row is never silently reclassified.
+        const current = await deps.ledger.get(envelope.requestId);
+        if (current === undefined || current.status === "accepted") {
+          await deps.ledger.transition(envelope.requestId, "failed", { now: now() });
+        }
       } catch {
-        // already terminal (e.g. message.send went indeterminate) — ledger
-        // row stays as-is
+        // already terminal — ledger row stays as-is
       }
       deps.audit.write({
         operationType: envelope.commandType,
         deviceId,
         requestId: envelope.requestId,
         ...(record.sessionId === "" ? {} : { sessionId: record.sessionId }),
+        ...auditProjectId,
         resultCode: mapped.error.code,
         committed: true,
       });

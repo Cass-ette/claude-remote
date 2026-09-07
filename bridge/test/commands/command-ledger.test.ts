@@ -121,6 +121,13 @@ describe("accept / acceptDuplicate idempotency", () => {
     expect(await ledger.get(env.requestId)).toEqual(rec);
   });
 
+  it("stores the canonical payload for same-UUID retry re-dispatch (§7.4)", async () => {
+    const env = envelope({ payload: { sessionId: "sess-1", text: "原本文本" } });
+    const rec = await ledger.accept(env, "device-1", computePayloadHash(env.payload), T0);
+    expect(rec.payloadJson).toBe(canonicalJson(env.payload));
+    expect((await ledger.get(env.requestId))?.payloadJson).toBe(canonicalJson(env.payload));
+  });
+
   it("same key + same hash replays the saved record", async () => {
     const env = envelope();
     const first = await ledger.accept(env, "device-1", computePayloadHash(env.payload), T0);
@@ -169,6 +176,9 @@ describe("transition table", () => {
     ["indeterminate", "completed"],
     ["indeterminate", "failed"],
     ["indeterminate", "interrupted"],
+    // §7.4 command.retry_indeterminate: the row re-enters dispatch with the
+    // SAME requestId and ORIGINAL payload instead of ending terminal.
+    ["indeterminate", "dispatching"],
     ["accepted", "completed"],
     ["accepted", "failed"],
     ["accepted", "interrupted"],
@@ -182,7 +192,7 @@ describe("transition table", () => {
     ["dispatched", "dispatching"],
     ["completed", "indeterminate"],
     ["dispatching", "completed"],
-    ["indeterminate", "dispatching"],
+    ["indeterminate", "dispatched"],
   ];
 
   async function seedStatus(status: CommandStatus): Promise<string> {

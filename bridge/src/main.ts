@@ -21,6 +21,7 @@ import {
 import { createSessionEventPump } from "./sessions/session-event-pump.js";
 import { createPermissionBroker, type PermissionBroker } from "./permissions/permission-broker.js";
 import { createSnapshotService, type SnapshotService } from "./snapshots/snapshot-service.js";
+import { createSessionImporter, type SessionImporter } from "./history/session-importer.js";
 import { createCommandDispatcher, type CommandDispatcher } from "./commands/command-dispatcher.js";
 import {
   createClaudeTranscriptAdapter,
@@ -43,6 +44,15 @@ import { validateCommand } from "./protocol/v1/validator.js";
 import type { FastifyInstance } from "fastify";
 
 const DEVICE_SESSION_HEADER = "x-claude-remote-device-session";
+
+/**
+ * Revocation poll interval (spec §10.4): a revocation applied by ANOTHER
+ * process (the admin CLI writes the shared database directly) is picked up
+ * by this in-process poller, which closes the revoked device's live sockets
+ * and denies its pending permissions. Injectable for tests through
+ * {@link StartBridgeOverrides.revocationPollIntervalMs}.
+ */
+export const REVOCATION_POLL_INTERVAL_MS = 30_000;
 
 /**
  * Bridge entry point (Task 24 wiring).
@@ -90,6 +100,8 @@ export interface BridgeHandle {
 export interface StartBridgeOverrides {
   /** Injectable Access verifier (tests supply a local-JWKS instance). */
   readonly accessVerifier?: AccessJwtVerifier;
+  /** Revocation poll interval override (tests use a few ms). */
+  readonly revocationPollIntervalMs?: number;
 }
 
 /** Detect the Claude Code CLI version for /capabilities; null when unknown. */
@@ -325,6 +337,15 @@ export async function startBridge(
     }
   };
 
+  // §6.6 transcript importer: scan/import of foreign sessions for an
+  // already-authorized project (same adapter as the snapshot service).
+  const importer: SessionImporter = createSessionImporter(db, {
+    claudeConfigDir: config.claudeConfigDir,
+    registry,
+    adapterFor: (projectRoot) =>
+      createClaudeTranscriptAdapter({ projectRoot, claudeConfigDir: config.claudeConfigDir }),
+  });
+
   const dispatcher = createCommandDispatcher({
     db,
     ledger,
@@ -334,6 +355,8 @@ export async function startBridge(
     broker,
     registry,
     audit,
+    importer,
+    findTurnEvidence,
     now,
     noteWriter,
     clearWriter,
@@ -347,6 +370,7 @@ export async function startBridge(
     verifier,
     devices,
     dispatcher,
+    audit,
     hostAscii: config.publicHost ?? "",
     now,
   });
@@ -367,13 +391,20 @@ export async function startBridge(
 
   const wsService = registerWebSocket(app, {
     authenticate: async (headers) => {
+      // §10.6: every WS authentication failure is audited (auth.ws) with a
+      // reason code; token/assertion values never reach the audit log.
+      const auditWsDenied = (resultCode: string, fields: { deviceId?: string; accessSubject?: string } = {}): void => {
+        audit.write({ operationType: "auth.ws", resultCode, ...fields });
+      };
       if (verifier === null) {
+        auditWsDenied("unauthorized");
         return { code: CLOSE_CODE.AUTH_INVALID, reason: "access verification is not configured" };
       }
       let identity;
       try {
         identity = await verifier.verifyRequest(headers);
       } catch {
+        auditWsDenied("unauthorized");
         return { code: CLOSE_CODE.AUTH_INVALID, reason: "invalid or missing access assertion" };
       }
       const token = headers[DEVICE_SESSION_HEADER];
@@ -387,9 +418,11 @@ export async function startBridge(
           ? devices.validateDeviceSession(tokenString, now())
           : null;
       if (expiry === null || validated === null) {
+        auditWsDenied("unauthorized", { accessSubject: identity.subject });
         return { code: CLOSE_CODE.AUTH_INVALID, reason: "invalid or missing device session" };
       }
       if (validated.accessSubject !== identity.subject) {
+        auditWsDenied("subject_mismatch", { deviceId: validated.deviceId, accessSubject: identity.subject });
         return { code: CLOSE_CODE.FORBIDDEN, reason: "access subject does not match the device session" };
       }
       const accessExpMs = Date.parse(identity.expiresAt);
@@ -489,12 +522,55 @@ export async function startBridge(
         wsService.closeDevice(target, CLOSE_CODE.AUTH_INVALID, "device revoked");
       },
     });
+    handledRevocations.add(deviceId);
+    audit.write({
+      operationType: "device.revoke",
+      deviceId,
+      resultCode: "ok",
+      detail: { source: "runtime" },
+      committed: true,
+    });
   };
+
+  // --- Revocation poller (§10.4) ------------------------------------------
+  // The admin CLI revokes against the shared database from a SEPARATE
+  // process; its no-op hooks cannot reach this Bridge's live sockets. The
+  // poller notices `devices.revokedAt` rows within one interval and applies
+  // the §10.4 side effects here: close the device's sockets (4401) and deny
+  // its pending permissions. Handled devices are tracked in memory only —
+  // re-handling after a restart is a harmless no-op (a revoked device cannot
+  // authenticate, so no sockets or pending permissions can exist).
+  const handledRevocations = new Set<string>();
+  for (const row of db
+    .prepare("SELECT deviceId FROM devices WHERE revokedAt IS NOT NULL")
+    .all() as Array<{ deviceId: string }>) {
+    handledRevocations.add(row.deviceId);
+  }
+  const applyRevocation = (deviceId: string): void => {
+    handledRevocations.add(deviceId);
+    wsService.closeDevice(deviceId, CLOSE_CODE.AUTH_INVALID, "device revoked");
+    void broker.denyAllForDevice(deviceId, "device revoked").catch(() => undefined);
+  };
+  const revocationPollMs = overrides.revocationPollIntervalMs ?? REVOCATION_POLL_INTERVAL_MS;
+  const revocationTimer = setInterval(() => {
+    try {
+      const rows = db
+        .prepare("SELECT deviceId FROM devices WHERE revokedAt IS NOT NULL")
+        .all() as Array<{ deviceId: string }>;
+      for (const { deviceId } of rows) {
+        if (!handledRevocations.has(deviceId)) applyRevocation(deviceId);
+      }
+    } catch (error) {
+      app.log.warn({ err: error }, "revocation poll failed");
+    }
+  }, revocationPollMs);
+  revocationTimer.unref?.();
 
   let closed = false;
   const close = async (): Promise<void> => {
     if (closed) return;
     closed = true;
+    clearInterval(revocationTimer);
     journal.setAppendListener(undefined);
     // §11.5 order: pending permissions denied FIRST (adapters get their
     // decision frames), then active sessions stopped (deny-first signal

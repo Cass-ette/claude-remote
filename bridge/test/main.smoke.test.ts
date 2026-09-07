@@ -64,7 +64,7 @@ describe("main smoke (Task 12)", () => {
     const applied = b.db
       .prepare("SELECT version FROM schema_migrations ORDER BY version")
       .all() as { version: number }[];
-    expect(applied.map((r) => r.version)).toEqual([1]);
+    expect(applied.map((r) => r.version)).toEqual([1, 2]);
 
     // Journal/ledger constructible; nothing pending after boot.
     expect(b.journal.pendingBytes()).toBe(0);

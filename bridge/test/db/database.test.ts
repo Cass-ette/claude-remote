@@ -86,7 +86,7 @@ describe("migrate", () => {
     const rows = db.prepare("SELECT version FROM schema_migrations").all() as {
       version: number;
     }[];
-    expect(rows).toEqual([{ version: 1 }]);
+    expect(rows).toEqual([{ version: 1 }, { version: 2 }]);
   });
 });
 
@@ -253,6 +253,8 @@ describe("schema", () => {
       "resultJson",
       "createdAt",
       "updatedAt",
+      // Migration 002 appends via ALTER TABLE — always last in PRAGMA order.
+      "payloadJson",
     ],
     pending_events: [
       "sessionId",

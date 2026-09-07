@@ -32,9 +32,10 @@ import * as jose from "jose";
 import WebSocket from "ws";
 import { AccessJwtVerifier, type JwksFetcher } from "../src/auth/access-jwt-verifier.js";
 import { buildSigningBytes } from "../src/auth/signing-bytes.js";
-import { deviceIdFromSpki } from "../src/auth/device-auth.js";
+import { createDeviceAuth, deviceIdFromSpki } from "../src/auth/device-auth.js";
+import { openDatabase } from "../src/db/database.js";
 import { encodeProjectPath } from "../src/history/claude-2.1.133-adapter.js";
-import { startBridge, type BridgeHandle } from "../src/main.js";
+import { startBridge, type BridgeHandle, type StartBridgeOverrides } from "../src/main.js";
 import {
   createFrameDecoder,
   encodeFrame,
@@ -138,8 +139,8 @@ async function makeWorld(opts: { noResult?: boolean } = {}): Promise<World> {
   return w;
 }
 
-async function boot(w: World = world): Promise<BridgeHandle> {
-  const bridge = await startBridge(w.env, { accessVerifier: verifier });
+async function boot(w: World = world, overrides: Partial<StartBridgeOverrides> = {}): Promise<BridgeHandle> {
+  const bridge = await startBridge(w.env, { accessVerifier: verifier, ...overrides });
   w.bridge = bridge;
   w.baseUrl = `http://127.0.0.1:${bridge.config.port}`;
   w.wsUrl = `${w.baseUrl.replace("http", "ws")}/api/v1/ws`;
@@ -292,9 +293,9 @@ async function httpCommand(
   client: DeviceClient,
   commandType: string,
   payload: unknown,
-  opts: { sessionId?: string | null; idempotencyKey?: string } = {},
+  opts: { sessionId?: string | null; idempotencyKey?: string; requestId?: string } = {},
 ): Promise<CommandResponse> {
-  const requestId = randomUUID();
+  const requestId = opts.requestId ?? randomUUID();
   const res = await fetch(`${world.baseUrl}/api/v1/commands`, {
     method: "POST",
     headers: { "content-type": "application/json", ...client.authHeaders() },
@@ -544,6 +545,20 @@ function commandRow(requestId: string): { status: string; resultJson: string | n
   return world.bridge!.db
     .prepare("SELECT status, resultJson FROM commands WHERE requestId = ?")
     .get(requestId) as { status: string; resultJson: string | null };
+}
+
+interface AuditRow {
+  operationType: string;
+  resultCode: string;
+  deviceId: string | null;
+  accessSubjectHash: string | null;
+  redactedDetail: string | null;
+}
+
+function auditRows(operationType: string): AuditRow[] {
+  return world.bridge!.db
+    .prepare("SELECT operationType, resultCode, deviceId, accessSubjectHash, redactedDetail FROM audit_events WHERE operationType = ? ORDER BY auditId")
+    .all(operationType) as AuditRow[];
 }
 
 async function waitFor(predicate: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
@@ -1196,6 +1211,302 @@ describe("runtime integration (Task 24)", () => {
         body: JSON.stringify({ protocolVersion: V1, requestId: randomUUID(), idempotencyKey: randomUUID(), commandType: "session.list", sessionId: null, sentAt: new Date().toISOString(), payload: {} }),
       });
       expect(after.status).toBe(401);
+    },
+    30_000,
+  );
+
+  it(
+    "§7.4 retry_indeterminate re-dispatches with the ORIGINAL uuid and payload",
+    async () => {
+      // Phase 1 (FAKE_CLAUDE_NO_RESULT=1): the first message holds the turn
+      // open, so a second message.send is REJECTED while running — the §7.4
+      // "the write failed, the turn may or may not have reached Claude" case.
+      process.env.FAKE_CLAUDE_NO_RESULT = "1";
+      world = await makeWorld({ noResult: true });
+      const bridge = await boot();
+      const record = bridge.registry.authorize(world.projectDir, "proj", { now: Date.now() });
+      const client = await pairedDevice();
+
+      const created = await httpCommand(client, "session.create", { projectId: record.projectId });
+      expect(created.status).toBe(200);
+      const sessionId = (created.body.result as { sessionId: string }).sessionId;
+
+      // R1 holds the turn open (running forever under NO_RESULT).
+      const hold = await httpCommand(client, "message.send", { sessionId, text: "hold" }, { sessionId });
+      expect(hold.status).toBe(200);
+      await waitFor(() => sessionRow(sessionId).status === "running", "session running");
+
+      // R2 is rejected mid-dispatch: the row must settle at INDETERMINATE
+      // (never failed — that is exactly what retry_indeterminate targets).
+      const retriedId = randomUUID();
+      const rejected = await httpCommand(
+        client,
+        "message.send",
+        { sessionId, text: "retry me 原本文本" },
+        { sessionId, requestId: retriedId },
+      );
+      expect(rejected.status).toBe(409);
+      expect((rejected.body.error as { code: string }).code).toBe("SESSION_CONFLICT");
+      await waitFor(() => commandRow(retriedId).status === "indeterminate", "command indeterminate");
+
+      // Stop the held turn, then drop NO_RESULT so the NEXT spawned child
+      // emits result records (children read FAKE_CLAUDE_NO_RESULT at spawn).
+      const stopped = await httpCommand(client, "session.stop", { sessionId }, { sessionId });
+      expect(stopped.status).toBe(200);
+      await waitFor(() => sessionRow(sessionId).status === "interrupted", "session interrupted");
+      delete process.env.FAKE_CLAUDE_NO_RESULT;
+      const resumed = await httpCommand(client, "session.resume", { sessionId }, { sessionId });
+      expect(resumed.status).toBe(200);
+      await waitFor(() => sessionRow(sessionId).status === "idle", "session idle after resume");
+
+      // §7.4: the retry re-dispatches the ORIGINAL requestId + payload.
+      const retry = await httpCommand(client, "command.retry_indeterminate", { requestId: retriedId });
+      expect(retry.status).toBe(200);
+      expect(retry.body.responseType).toBe("command.status");
+      expect(retry.body.result).toEqual({ requestId: retriedId, status: "dispatched" });
+
+      // fake-claude records the stdin uuid: it echoes the user record and the
+      // assistant record with `assistant-<uuid>`. The pump journals that
+      // assistant record — proving the re-send carried the ORIGINAL uuid (a
+      // fresh UUID would appear here instead and the turn below would never
+      // bind to this command row).
+      await waitFor(() => commandRow(retriedId).status === "completed", "retried command completed");
+      const assistantEvents = world.bridge!.db
+        .prepare("SELECT payloadJson FROM pending_events WHERE sessionId = ? AND eventType = 'assistant.message.completed'")
+        .all(sessionId) as Array<{ payloadJson: string }>;
+      expect(assistantEvents.some((e) => e.payloadJson.includes(`assistant-${retriedId}`))).toBe(true);
+      // (The waitFor above IS the binding proof: the pump completes the
+      // command keyed by the echoed user uuid — a fresh UUID would have left
+      // the row dispatched forever.)
+      // Retrying an already-classified command is the read-only no-op.
+      const again = await httpCommand(client, "command.retry_indeterminate", { requestId: retriedId });
+      expect(again.status).toBe(200);
+      expect(again.body.result).toEqual({ requestId: retriedId, status: "completed" });
+    },
+    30_000,
+  );
+
+  it(
+    "§10.4 revocation poller applies a CLI-process revocation within one interval",
+    async () => {
+      world = await makeWorld();
+      const bridge = await boot(world, { revocationPollIntervalMs: 60 });
+      bridge.registry.authorize(world.projectDir, "proj", { now: Date.now() });
+      const client = await pairedDevice();
+      const ws = connectWs(client);
+      await ws.opened;
+      // `opened` fires at upgrade time, before async authentication settles;
+      // a command round trip proves the connection is registered server-side
+      // (otherwise a racing revoke would close via the auth path instead).
+      const listId = ws.sendCommand("session.list", {});
+      const listRes = await ws.waitForResponse(listId);
+      expect(listRes.responseType).toBe("command.status");
+
+      // Simulate the admin CLI: a SEPARATE process revokes through its own
+      // database handle, whose no-op hooks cannot reach this bridge's
+      // sockets — only the poller can.
+      const cliDb = openDatabase(join(world.dataDir, "bridge.db"));
+      const cliDevices = createDeviceAuth(cliDb);
+      cliDevices.revokeDevice(client.deviceId, Date.now(), {
+        denyPendingPermissions: () => undefined,
+        closeSockets: () => undefined,
+      });
+      cliDb.close();
+
+      // The poller notices revokedAt and closes the socket 4401.
+      const closed = await ws.closed;
+      expect(closed.code).toBe(4401);
+      expect(closed.reason).toBe("device revoked");
+
+      // The device session no longer authenticates.
+      const after = await fetch(`${world.baseUrl}/api/v1/commands`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...client.authHeaders() },
+        body: JSON.stringify({ protocolVersion: V1, requestId: randomUUID(), idempotencyKey: randomUUID(), commandType: "session.list", sessionId: null, sentAt: new Date().toISOString(), payload: {} }),
+      });
+      expect(after.status).toBe(401);
+    },
+    30_000,
+  );
+
+  it(
+    "§10.6 audits pairing, challenges, verification, command denials, WS denials, and revocation",
+    async () => {
+      world = await makeWorld();
+      const bridge = await boot();
+      bridge.registry.authorize(world.projectDir, "proj", { now: Date.now() });
+      const client = await pairedDevice(); // → auth.pair ok, auth.challenge ok, auth.verify ok
+
+      // Pairing with a garbage token → 401 + invalid_pairing_token.
+      const { publicKey } = generateKeyPairSync("ec", { namedCurve: "prime256v1" });
+      const badSpki = publicKey.export({ type: "spki", format: "der" }) as Buffer;
+      const badToken = await fetch(`${world.baseUrl}/api/v1/auth/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-access-jwt-assertion": await signAssertion() },
+        body: JSON.stringify({
+          pairingToken: "garbage-token",
+          publicKeySpkiB64u: badSpki.toString("base64url"),
+          deviceId: deviceIdFromSpki(badSpki),
+        }),
+      });
+      expect(badToken.status).toBe(401);
+
+      // A second, DIFFERENT device → 403 + one_device_limit.
+      const minted = bridge.devices.mintPairingToken(Date.now());
+      const secondPair = await fetch(`${world.baseUrl}/api/v1/auth/pair`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-access-jwt-assertion": await signAssertion() },
+        body: JSON.stringify({
+          pairingToken: minted.token,
+          publicKeySpkiB64u: badSpki.toString("base64url"),
+          deviceId: deviceIdFromSpki(badSpki),
+        }),
+      });
+      expect(secondPair.status).toBe(403);
+
+      // Challenge for an unknown device → 401; the audit must NOT name the
+      // sub-failure (uniform-failure).
+      const unknownChallenge = await fetch(`${world.baseUrl}/api/v1/auth/challenge`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-access-jwt-assertion": await signAssertion() },
+        body: JSON.stringify({ deviceId: randomUUID() }),
+      });
+      expect(unknownChallenge.status).toBe(401);
+
+      // Verify with a garbage challenge → 401 + uniform-failure.
+      const badVerify = await fetch(`${world.baseUrl}/api/v1/auth/verify`, {
+        method: "POST",
+        headers: { "content-type": "application/json", "cf-access-jwt-assertion": await signAssertion() },
+        body: JSON.stringify({ challengeId: "nope", accessSubjectEcho: SUBJECT, signatureB64u: "AAAA" }),
+      });
+      expect(badVerify.status).toBe(401);
+
+      // /commands with no auth → 401; with a mismatched subject → 403.
+      const noAuth = await fetch(`${world.baseUrl}/api/v1/commands`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ protocolVersion: V1, requestId: randomUUID(), idempotencyKey: "k", commandType: "session.list", sessionId: null, sentAt: new Date().toISOString(), payload: {} }),
+      });
+      expect(noAuth.status).toBe(401);
+      const mismatch = await fetch(`${world.baseUrl}/api/v1/commands`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "cf-access-jwt-assertion": await signAssertion("other-user@example.com"),
+          "x-claude-remote-device-session": client.deviceSessionToken,
+        },
+        body: JSON.stringify({ protocolVersion: V1, requestId: randomUUID(), idempotencyKey: "k2", commandType: "session.list", sessionId: null, sentAt: new Date().toISOString(), payload: {} }),
+      });
+      expect(mismatch.status).toBe(403);
+
+      // WebSocket with a bogus device session → 4401 + auth.ws.
+      const wsBad = new WebSocket(world.wsUrl!, [V1], {
+        headers: { "cf-access-jwt-assertion": await signAssertion(), "x-claude-remote-device-session": "nope" },
+      });
+      const wsBadClosed = new Promise<number>((resolve) => wsBad.once("close", (code) => resolve(code)));
+      await new Promise<void>((resolve) => {
+        wsBad.once("open", () => resolve());
+        wsBad.once("error", () => resolve());
+        wsBad.once("close", () => resolve());
+      });
+      expect(await wsBadClosed).toBe(4401);
+      await waitFor(() => auditRows("auth.ws").length > 0, "auth.ws audit row");
+
+      // Runtime revocation → device.revoke.
+      bridge.revokeDevice(client.deviceId);
+      await waitFor(() => auditRows("device.revoke").length > 0, "device.revoke audit row");
+
+      // --- audit trail assertions (audit_events, insertion order) ---------
+      expect(auditRows("auth.pair").map((r) => r.resultCode)).toEqual([
+        "ok",
+        "invalid_pairing_token",
+        "one_device_limit",
+      ]);
+      const pairOk = auditRows("auth.pair")[0]!;
+      expect(pairOk.deviceId).toBe(client.deviceId);
+      expect(pairOk.accessSubjectHash).toBeTruthy();
+      expect(auditRows("auth.challenge").map((r) => r.resultCode)).toEqual(["ok", "uniform-failure"]);
+      expect(auditRows("auth.verify").map((r) => r.resultCode)).toEqual(["ok", "uniform-failure"]);
+      expect(auditRows("auth.request").map((r) => r.resultCode)).toEqual(["unauthorized", "subject_mismatch"]);
+      expect(auditRows("auth.ws").map((r) => r.resultCode)).toEqual(["unauthorized"]);
+      expect(auditRows("device.revoke").map((r) => r.resultCode)).toEqual(["ok"]);
+      expect(auditRows("device.revoke")[0]!.deviceId).toBe(client.deviceId);
+
+      // The JSONL trail carries the same operations — and never a token or
+      // assertion value (§10.6 redaction).
+      const trail = readFileSync(join(world.dataDir, "audit.jsonl"), "utf8");
+      const trailOps = trail
+        .trim()
+        .split("\n")
+        .map((line) => (JSON.parse(line) as { operationType: string }).operationType);
+      for (const op of ["auth.pair", "auth.challenge", "auth.verify", "auth.request", "auth.ws", "device.revoke"]) {
+        expect(trailOps).toContain(op);
+      }
+      expect(trail).not.toContain(client.deviceSessionToken);
+      expect(trail).not.toContain(client.assertion);
+    },
+    30_000,
+  );
+
+  it(
+    "§6.6 session.scan_imports and session.import bind foreign transcripts over the wire",
+    async () => {
+      const { full } = await bootFullWorld();
+      const { client, projectId } = full;
+
+      // Foreign transcripts in the project's transcript directory: one clean
+      // UUID-named session, one non-UUID file, one non-jsonl file.
+      const foreign = randomUUID();
+      writeTranscript(foreign, [userLine("u-1"), assistantLine("a-1"), TURN_END]);
+      writeFileSync(join(transcriptDir(), "not-a-uuid.jsonl"), "{}\n");
+      writeFileSync(join(transcriptDir(), "notes.txt"), "not a transcript\n");
+
+      // scan_imports: candidates + skipped counts, nothing imported yet.
+      const scan = await httpCommand(client, "session.scan_imports", { projectId });
+      expect(scan.status).toBe(200);
+      const scanResult = scan.body.result as {
+        candidates: Array<{ sessionId: string; importable: boolean; title: string | null }>;
+        skipped: number;
+      };
+      expect(scanResult.skipped).toBe(2);
+      const candidate = scanResult.candidates.find((c) => c.sessionId === foreign);
+      expect(candidate).toMatchObject({ sessionId: foreign, importable: true, title: null });
+
+      // import: binds the session to THIS project, source imported.
+      const imported = await httpCommand(client, "session.import", { projectId, sessionId: foreign });
+      expect(imported.status).toBe(200);
+      expect(imported.body.result).toMatchObject({ sessionId: foreign, projectId, created: true });
+      const row = full.bridge.db
+        .prepare("SELECT projectId, status, source FROM sessions WHERE sessionId = ?")
+        .get(foreign) as { projectId: string; status: string; source: string };
+      expect(row).toEqual({ projectId, status: "inactive", source: "imported" });
+
+      // Duplicate import is the dedup no-op.
+      const again = await httpCommand(client, "session.import", { projectId, sessionId: foreign });
+      expect(again.status).toBe(200);
+      expect((again.body.result as { created: boolean }).created).toBe(false);
+
+      // A DIFFERENT project cannot adopt the bound session.
+      mkdirSync(join(world.dataDir, "proj2"));
+      const second = full.bridge.registry.authorize(join(world.dataDir, "proj2"), "proj2", { now: Date.now() });
+      const cross = await httpCommand(client, "session.import", { projectId: second.projectId, sessionId: foreign });
+      expect(cross.status).toBe(409);
+      expect((cross.body.error as { code: string }).code).toBe("SESSION_PROJECT_MISMATCH");
+
+      // Non-UUID sessionIds never reach the dispatcher: the protocol schema
+      // rejects them with a typed 400.
+      const bad = await httpCommand(client, "session.import", { projectId, sessionId: "not-a-uuid" });
+      expect(bad.status).toBe(400);
+      expect((bad.body.error as { code: string }).code).toBe("INVALID_COMMAND");
+
+      // Both commands audited (§10.6); failures carry the typed error code
+      // (schema rejections happen before dispatch and audit nothing).
+      expect(auditRows("session.scan_imports").map((r) => r.resultCode)).toEqual(["ok"]);
+      expect(auditRows("session.import").map((r) => r.resultCode)).toEqual([
+        "ok",
+        "ok",
+        "SESSION_PROJECT_MISMATCH",
+      ]);
     },
     30_000,
   );

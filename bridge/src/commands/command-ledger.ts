@@ -46,6 +46,11 @@ export interface CommandRecord {
   readonly idempotencyKey: string;
   readonly commandType: string;
   readonly payloadHash: string;
+  /**
+   * Canonical JSON of the accepted payload (migration 002). Empty string for
+   * rows accepted before the column existed; parsed form is undefined then.
+   */
+  readonly payloadJson: string;
   readonly status: CommandStatus;
   readonly resultJson?: unknown;
   readonly createdAt: number;
@@ -99,13 +104,16 @@ export class SessionlessTransitionError extends Error {
  * - dispatching → dispatched | indeterminate
  * - dispatched → completed | failed | indeterminate | interrupted
  * - indeterminate → completed | failed | interrupted (transcript reconciliation)
+ * - indeterminate → dispatching (§7.4 command.retry_indeterminate: the user
+ *   explicitly re-dispatches the SAME requestId with the ORIGINAL payload —
+ *   the row re-enters the dispatch flow instead of ending terminal)
  * - terminal states (completed/failed/interrupted) are irreversible
  */
 const LEGAL_TRANSITIONS: Readonly<Record<CommandStatus, readonly CommandStatus[]>> = {
   accepted: ["dispatching", "completed", "failed", "interrupted"],
   dispatching: ["dispatched", "indeterminate"],
   dispatched: ["completed", "failed", "indeterminate", "interrupted"],
-  indeterminate: ["completed", "failed", "interrupted"],
+  indeterminate: ["completed", "failed", "interrupted", "dispatching"],
   interrupted: [],
   completed: [],
   failed: [],
@@ -177,6 +185,7 @@ interface CommandRow {
   idempotencyKey: string;
   commandType: string;
   payloadHash: string;
+  payloadJson: string;
   status: CommandStatus;
   resultJson: string | null;
   createdAt: number;
@@ -191,6 +200,7 @@ function rowToRecord(row: CommandRow): CommandRecord {
     idempotencyKey: row.idempotencyKey,
     commandType: row.commandType,
     payloadHash: row.payloadHash,
+    payloadJson: row.payloadJson ?? "",
     status: row.status,
     resultJson: row.resultJson === null ? undefined : (JSON.parse(row.resultJson) as unknown),
     createdAt: row.createdAt,
@@ -200,8 +210,8 @@ function rowToRecord(row: CommandRow): CommandRecord {
 
 export function createCommandLedger(db: SqliteDatabase, journal: EventJournalPort): CommandLedger {
   const insertStmt = db.prepare(
-    `INSERT INTO commands (requestId, deviceId, sessionId, idempotencyKey, commandType, payloadHash, status, createdAt, updatedAt)
-     VALUES (?, ?, ?, ?, ?, ?, 'accepted', ?, ?)`,
+    `INSERT INTO commands (requestId, deviceId, sessionId, idempotencyKey, commandType, payloadHash, payloadJson, status, createdAt, updatedAt)
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?, ?)`,
   );
   const getByRequest = db.prepare("SELECT * FROM commands WHERE requestId = ?");
   const getByIdempotency = db.prepare(
@@ -235,6 +245,9 @@ export function createCommandLedger(db: SqliteDatabase, journal: EventJournalPor
       envelope.idempotencyKey,
       envelope.commandType,
       payloadHash,
+      // §7.4: the canonical payload is kept so retry_indeterminate can
+      // re-dispatch the ORIGINAL message (same UUID, same text).
+      canonicalJson(envelope.payload),
       now,
       now,
     );
