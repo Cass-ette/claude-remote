@@ -1,0 +1,4 @@
+<resources>
+    <!-- Minimal host theme; Compose (Material 3, dark-first) draws the UI. -->
+    <style name="Theme.ClaudeRemote" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

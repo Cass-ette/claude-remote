@@ -1,0 +1,46 @@
+# Version catalog for the Claude Remote Android client.
+# Versions pinned to the proven probe stack (probes/cloudflare/android-probe):
+# Gradle 8.9 wrapper, AGP 8.5.2, Kotlin 1.9.24, Java 17, compileSdk 34.
+# Compose Compiler 1.5.14 is the release mapped to Kotlin 1.9.24; KSP
+# 1.9.24-1.0.20 is the matching KSP release for Room code generation.
+
+[versions]
+agp = "8.5.2"
+kotlin = "1.9.24"
+ksp = "1.9.24-1.0.20"
+composeBom = "2024.06.00"
+composeCompiler = "1.5.14"
+activityCompose = "1.9.0"
+navigationCompose = "2.7.7"
+room = "2.6.1"
+okhttp = "4.12.0"
+appauth = "0.11.1"
+browser = "1.8.0"
+kotlinxSerializationJson = "1.6.3"
+kotlinxCoroutines = "1.8.0"
+securityCrypto = "1.1.0-alpha06"
+junit = "4.13.2"
+
+[libraries]
+compose-bom = { group = "androidx.compose", name = "compose-bom", version.ref = "composeBom" }
+compose-ui = { group = "androidx.compose.ui", name = "ui" }
+compose-ui-tooling-preview = { group = "androidx.compose.ui", name = "ui-tooling-preview" }
+compose-material3 = { group = "androidx.compose.material3", name = "material3" }
+androidx-activity-compose = { group = "androidx.activity", name = "activity-compose", version.ref = "activityCompose" }
+androidx-navigation-compose = { group = "androidx.navigation", name = "navigation-compose", version.ref = "navigationCompose" }
+room-runtime = { group = "androidx.room", name = "room-runtime", version.ref = "room" }
+room-ktx = { group = "androidx.room", name = "room-ktx", version.ref = "room" }
+room-compiler = { group = "androidx.room", name = "room-compiler", version.ref = "room" }
+okhttp = { group = "com.squareup.okhttp3", name = "okhttp", version.ref = "okhttp" }
+appauth = { group = "net.openid", name = "appauth", version.ref = "appauth" }
+androidx-browser = { group = "androidx.browser", name = "browser", version.ref = "browser" }
+kotlinx-serialization-json = { group = "org.jetbrains.kotlinx", name = "kotlinx-serialization-json", version.ref = "kotlinxSerializationJson" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "kotlinxCoroutines" }
+androidx-security-crypto = { group = "androidx.security", name = "security-crypto", version.ref = "securityCrypto" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
+kotlin-serialization = { id = "org.jetbrains.kotlin.plugin.serialization", version.ref = "kotlin" }
+ksp = { id = "com.google.devtools.ksp", version.ref = "ksp" }
