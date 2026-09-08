@@ -59,6 +59,13 @@ android {
     }
 }
 
+// Export Room schemas next to Migrations.kt's history: every version bump
+// writes app/schemas/dev.clauderemote.android.data.local.AppDatabase/<n>.json
+// so future migrations can be validated with MigrationTestHelper.
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
+
 dependencies {
     // Compose UI shell.
     implementation(platform(libs.compose.bom))
@@ -89,4 +96,9 @@ dependencies {
 
     // JVM unit tests.
     testImplementation(libs.junit)
+
+    // Instrumented tests (Room projection DAO contract tests).
+    androidTestImplementation(libs.androidx.test.core)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.androidx.test.ext.junit)
 }
