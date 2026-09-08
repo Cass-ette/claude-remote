@@ -63,7 +63,10 @@ internal object DecimalStringLong {
             ?: throw SerializationException("value exceeds the signed 64-bit Long range: \"$raw\"")
     }
 
-    fun format(value: Long): String = value.toString()
+    fun format(value: Long): String {
+        require(value >= 0) { "event ids must be non-negative, got $value" }
+        return value.toString()
+    }
 }
 
 /** Serializes a Long as a decimal string (uint64String in the schemas). */
