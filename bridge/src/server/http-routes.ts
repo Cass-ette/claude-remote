@@ -245,6 +245,7 @@ export function registerApiRoutes(app: FastifyInstance, deps: ApiRoutesDeps): vo
         challengeId: challenge.challengeId,
         challengeRawB64u: challenge.challengeRawB64u,
         accessSubject: challenge.accessSubject,
+        hostAscii: challenge.hostAscii,
         expiresAt: challenge.expiresAt,
       });
     } catch (error) {

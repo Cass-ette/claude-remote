@@ -553,7 +553,7 @@ Bridge 公网 URL 在配置时必须满足：scheme 为 `https`，无 userinfo�
 后续认证：
 
 1. Android 请求 challenge。
-2. Bridge 生成规范小写 UUID `challengeId` 和 32 字节随机 `challengeRaw`，保存原始 32 字节、device ID、Bridge 已验证 Access assertion 的原始 `sub` 字符串、hostAscii、60 秒到期时间和单次使用状态。challenge 响应明确返回 `challengeId`、无 padding base64url 的 `challengeRaw` 和该原始 `accessSubject` 字符串；`challengeRaw` 在成功消费、到期或设备撤销时删除，且不得写入日志。
+2. Bridge 生成规范小写 UUID `challengeId` 和 32 字节随机 `challengeRaw`，保存原始 32 字节、device ID、Bridge 已验证 Access assertion 的原始 `sub` 字符串、hostAscii、60 秒到期时间和单次使用状态。challenge 响应明确返回 `challengeId`、无 padding base64url 的 `challengeRaw`、该原始 `accessSubject` 字符串和 Bridge 规范化的 `hostAscii`。与 `accessSubject` 同理，Android 必须原样使用响应中的 `hostAscii` 构造待签名字节，不自行执行 IDNA/主机规范化——两端规范化实现存在已知的合法差异（例如 UTS46 与 IDNA2003 对 ß 的处理）。`challengeRaw` 在成功消费、到期或设备撤销时删除，且不得写入日志。
 3. Android 必须使用 challenge 响应中收到的 `accessSubject` 原始字符串构造以下待签名字节，不从 opaque access token 推导 subject。所有长度为无符号大端，字符串使用 UTF-8，`accessSubject` 不执行 Unicode 归一化：
 
 ```text
@@ -832,7 +832,7 @@ Bridge 使用权限 `0600` 的本地 JSONL 审计日志，单文件 10 MiB，保
 2. Android 9（API 28）设备能生成不可导出的 Keystore ECDSA P-256 密钥；不支持的设备在配对前明确失败。
 3. Android 通过 Cloudflare Managed OAuth + PKCE 登录，Bridge 验证 Access assertion。
 4. Mac 显示五分钟单次二维码，Android 完成 ECDSA P-256 设备配对。
-5. Challenge 响应返回 Bridge 验证的原始 Access subject 供 Android 签名；回传 subject 不一致、重放配对令牌或重放 challenge 均失败。设备会话令牌在有效期内按 bearer 语义可复用，但在到期、设备撤销、Access subject 不匹配或 Access 认证失效后必须失败。
+5. Challenge 响应返回 Bridge 验证的原始 Access subject 和 Bridge 规范化的 hostAscii 供 Android 签名；回传 subject 不一致、重放配对令牌或重放 challenge 均失败。设备会话令牌在有效期内按 bearer 语义可复用，但在到期、设备撤销、Access subject 不匹配或 Access 认证失效后必须失败。
 6. 未配对设备无法访问任何会话信息。
 7. Android 能列出 Bridge 会话，并从指定授权项目导入至少一个有效旧 session；损坏和项目不匹配记录被拒绝。
 8. 打开导入或恢复的 session 时，Android 能从十分钟有效的不可变 transcript snapshot 分页显示既有用户、assistant 和工具历史；尾部部分 JSONL 不被误解析，解析失败会明确标记历史不完整。

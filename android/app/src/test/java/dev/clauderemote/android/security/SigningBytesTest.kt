@@ -89,6 +89,20 @@ class SigningBytesTest {
     }
 
     @Test
+    fun normalizeHostSharpSIsAKnownDivergenceFromTheBridgeUts46Normalizer() {
+        // KNOWN, ACCEPTED DIVERGENCE from the TypeScript bridge normalizer —
+        // the reason §10.3 has the challenge response carry the
+        // bridge-canonical hostAscii that Android must use verbatim.
+        // java.net.IDN implements IDNA2003, which maps ß -> ss, so this
+        // implementation yields "strasse.de", while the bridge's WHATWG
+        // UTS46 nontransitional processing keeps ß and yields
+        // "xn--strae-oqa.de". Both are correct per their own standards;
+        // production signing therefore never derives hostAscii locally.
+        assertEquals("strasse.de", normalizeHost("https://straße.de/"))
+        // The bridge value differs: domainToASCII("straße.de") === "xn--strae-oqa.de".
+    }
+
+    @Test
     fun normalizeHostAcceptsBareCanonicalHostname() {
         // The already-normalized storage form (no scheme) round-trips.
         assertEquals("bridge.example.com", normalizeHost("bridge.example.com"))

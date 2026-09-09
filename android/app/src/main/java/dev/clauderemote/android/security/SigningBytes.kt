@@ -48,11 +48,22 @@ class SigningInputError(message: String) : Exception(message)
  * - hostname is IDNA ToASCII'd, lowercased, and stripped of its trailing dot;
  * - the scheme, path, and `:443` never appear in the signed host.
  *
+ * VALIDATION FALLBACK ONLY (§10.3): production signing MUST use the
+ * bridge-canonical `hostAscii` returned verbatim in the challenge response
+ * (Task 29 wiring) — the bridge reconstructs the signed bytes server-side
+ * from its own record, so its normalization is the authority. This local
+ * normalization is known NOT to be byte-identical to the TypeScript
+ * `normalizeHost` (java.net.IDN is IDNA2003; the bridge uses WHATWG/UTS46 —
+ * see the divergence-pinning test in SigningBytesTest); it exists to
+ * validate user-entered configuration, never to derive signed bytes.
+ *
  * URL parsing mirrors the WHATWG parser the TypeScript implementation uses
  * for the checks above, but is deliberately stricter on two pathological
  * shapes WHATWG silently normalizes: percent-encoded host characters and
- * dot-segment paths (`/.`). Neither can produce a canonical host the two
- * implementations would agree on anyway, so they are rejected instead.
+ * dot-segment paths (`/.`). These are rejected fail-safe; because the
+ * bridge-canonical hostAscii from the challenge response is the
+ * authoritative signing input, this strictness cannot cause a signature
+ * mismatch.
  */
 fun normalizeHost(input: String): String {
     val trimmed = input.trim()
@@ -172,9 +183,11 @@ private fun toCanonicalAsciiHost(hostname: String, originalInput: String): Strin
     val lower = hostname.lowercase()
     // Pure-ASCII hosts pass through WHATWG's non-strict domainToASCII
     // unchanged, so java.net.IDN is only consulted for non-ASCII input
-    // (where it provides the IDNA A-label conversion). This also avoids
-    // IDN.toASCII's stricter per-label length rejection of already-ASCII
-    // labels, keeping acceptance aligned with the TypeScript.
+    // (where it provides the IDNA2003 A-label conversion). The unconditional
+    // per-label <=63 check below is stricter than the TypeScript (which has
+    // no per-label limit) by design; that is safe because the
+    // bridge-canonical hostAscii from the challenge response is the
+    // authoritative signing input.
     val ascii = if (lower.all { it.code < 0x80 }) {
         lower
     } else {

@@ -427,6 +427,7 @@ describe("issueChallenge", () => {
     expect(challenge.challengeId).toMatch(LOWERCASE_UUID);
     expect(challenge.challengeRawB64u).toMatch(B64U_32BYTES);
     expect(challenge.accessSubject).toBe(SUBJECT);
+    expect(challenge.hostAscii).toBe(HOST);
     expect(challenge.expiresAt).toBe(T0 + CHALLENGE_TTL_SECONDS * 1000);
 
     // The bridge stores the RAW challenge bytes (it must reconstruct the
@@ -434,8 +435,29 @@ describe("issueChallenge", () => {
     const row = db.prepare("SELECT challengeRaw, hostAscii, accessSubject FROM auth_challenges WHERE challengeId = ?")
       .get(challenge.challengeId) as { challengeRaw: Buffer; hostAscii: string; accessSubject: string };
     expect(Buffer.compare(row.challengeRaw, Buffer.from(challenge.challengeRawB64u, "base64url"))).toBe(0);
-    expect(row.hostAscii).toBe(HOST);
+    expect(row.hostAscii).toBe(challenge.hostAscii);
     expect(row.accessSubject).toBe(SUBJECT);
+  });
+
+  it("returns the bridge-canonical hostAscii the client must sign verbatim", () => {
+    const { auth, db } = freshAuth();
+    const keys = newDeviceKeys();
+    const { deviceId } = pairDevice(auth, keys, { accessSubject: SUBJECT });
+
+    // A URL-shaped config input is normalized BEFORE storage; the returned
+    // hostAscii is the bridge-canonical form (§10.3), never the raw input.
+    // Clients sign it verbatim instead of normalizing locally — the two
+    // platforms' normalizers have known legitimate divergences.
+    const challenge = auth.issueChallenge({
+      deviceId,
+      accessSubject: SUBJECT,
+      hostAscii: "https://Bridge.Example.COM./",
+      now: T0,
+    });
+    expect(challenge.hostAscii).toBe("bridge.example.com");
+    const row = db.prepare("SELECT hostAscii FROM auth_challenges WHERE challengeId = ?")
+      .get(challenge.challengeId) as { hostAscii: string };
+    expect(challenge.hostAscii).toBe(row.hostAscii);
   });
 
   it("rejects an unknown device", () => {

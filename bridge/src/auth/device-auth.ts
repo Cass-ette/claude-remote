@@ -343,6 +343,13 @@ export interface IssuedChallenge {
   readonly challengeRawB64u: string;
   /** The verified Access subject the client MUST sign verbatim. */
   readonly accessSubject: string;
+  /**
+   * The bridge-canonical host the client MUST use verbatim when building the
+   * signing bytes (§10.3), mirroring {@link accessSubject}: the client never
+   * runs its own IDNA/host normalization, because the two implementations
+   * have known legitimate divergences (e.g. UTS46 vs IDNA2003 on ß).
+   */
+  readonly hostAscii: string;
   readonly expiresAt: number;
 }
 
@@ -554,6 +561,7 @@ export function createDeviceAuth(db: SqliteDatabase, options: DeviceAuthOptions 
         challengeId,
         challengeRawB64u: challengeRaw.toString("base64url"),
         accessSubject: device.accessSubject,
+        hostAscii,
         expiresAt,
       };
     },
