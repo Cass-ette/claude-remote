@@ -126,14 +126,25 @@ internal fun parseCommandResponse(httpStatus: Int, bodyText: String): ProtocolRe
     if (httpStatus == 401) {
         throw AuthExpiredError("bridge rejected the Access assertion (HTTP 401)")
     }
-    if (httpStatus == 403) {
+    // 403 is ambiguous on this protocol: the auth boundary answers with a
+    // uniform detail-free body (§10.3), while structured command errors
+    // (SNAPSHOT_FORBIDDEN, PERMISSION_DEVICE_MISMATCH) also use 403 with a
+    // full §8.3 envelope. Try decoding the structured shape first; only an
+    // undecodable body falls back to the auth interpretation.
+    if (httpStatus == 403 && !bodyText.contains("\"protocolVersion\"")) {
         throw ForbiddenError("bridge rejected the device or project (HTTP 403)")
     }
     val response = try {
         ProtocolJson.json.decodeFromString(ProtocolResponse.serializer(), bodyText)
     } catch (e: SerializationException) {
+        if (httpStatus == 403) {
+            throw ForbiddenError("bridge rejected the device or project (HTTP 403)")
+        }
         throw BridgeHttpException(httpStatus, bodyText)
     } catch (e: IllegalArgumentException) {
+        if (httpStatus == 403) {
+            throw ForbiddenError("bridge rejected the device or project (HTTP 403)")
+        }
         throw BridgeHttpException(httpStatus, bodyText)
     }
     val error = response.error ?: return response

@@ -274,7 +274,16 @@ class ConnectionCoordinator(
             return delayedReconnect()
         }
         reconnectAttempts = 0
-        postResumeAcks()
+        try {
+            postResumeAcks()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            // The socket died between the Upgrade and the resume ACKs; degrade
+            // to the normal close-driven backoff path instead of killing the
+            // reconnect loop (mirrors the guarded call in connectWithBackoff).
+            return delayedReconnect()
+        }
         return listener
     }
 
