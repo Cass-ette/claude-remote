@@ -24,6 +24,23 @@ import java.security.spec.ECGenParameterSpec
 class DeviceUnsupportedError(message: String, cause: Throwable? = null) : Exception(message, cause)
 
 /**
+ * Signing seam consumed by the auth managers (Task 29): the non-exportable
+ * device key's identity and signature, plus the SPKI public half for
+ * pairing. Implemented by [DeviceKeyManager]; pure-JVM tests fake it so the
+ * device-session orchestration runs without a Keystore.
+ */
+interface DeviceSigner {
+    /** `base64url_no_pad(SHA-256(SPKI DER))` (§10.3 step 5). */
+    fun deviceId(): String
+
+    /** X.509 SubjectPublicKeyInfo DER of the device public key (§10.3 step 4). */
+    fun publicKeySpkiDer(): ByteArray
+
+    /** `SHA256withECDSA` over [bytes]; ASN.1 DER SEQUENCE(INTEGER r, INTEGER s). */
+    fun sign(bytes: ByteArray): ByteArray
+}
+
+/**
  * Owns the device-auth key inside the Android Keystore (spec §4, §10.3):
  *
  * - a non-exportable `secp256r1` (P-256) ECDSA keypair under [alias],
@@ -48,7 +65,7 @@ class DeviceKeyManager(
         KeyPairGeneratorSource { algorithm, provider ->
             KeyPairGenerator.getInstance(algorithm, provider)
         },
-) {
+) : DeviceSigner {
 
     /**
      * Seam for capability-probe failure-injection tests: produces the
@@ -92,7 +109,7 @@ class DeviceKeyManager(
 
     /** Signs [bytes] with `SHA256withECDSA`; returns the ASN.1 DER signature. */
     @Synchronized
-    fun sign(bytes: ByteArray): ByteArray {
+    override fun sign(bytes: ByteArray): ByteArray {
         val signature = Signature.getInstance("SHA256withECDSA")
         signature.initSign(ensureDeviceKey().private)
         signature.update(bytes)
@@ -100,10 +117,10 @@ class DeviceKeyManager(
     }
 
     /** The public key as X.509 SubjectPublicKeyInfo DER (§10.3 step 4). */
-    fun publicKeySpkiDer(): ByteArray = ensureDeviceKey().public.encoded
+    override fun publicKeySpkiDer(): ByteArray = ensureDeviceKey().public.encoded
 
     /** `base64url_no_pad(SHA-256(SPKI DER))` (§10.3 step 5). */
-    fun deviceId(): String = deviceIdFromSpki(publicKeySpkiDer())
+    override fun deviceId(): String = deviceIdFromSpki(publicKeySpkiDer())
 
     /** Deletes the entry under [alias] (test cleanup / device revocation). */
     @Synchronized
