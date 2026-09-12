@@ -73,7 +73,9 @@ export async function uninstall(options: UninstallOptions = {}): Promise<Uninsta
   }
 
   const runner = options.runner ?? createRealRunner();
-  if (existsSync(plistPath)) {
+  // Always attempt the bootout (by service target): a job whose plist was
+  // removed by hand can still be loaded, and NOT_LOADED output is tolerated.
+  {
     const bootout = await runner.run(bootoutCommand);
     if (bootout.code !== 0 && !NOT_LOADED.test(`${bootout.stdout}\n${bootout.stderr}`)) {
       throw new InstallError(
@@ -83,8 +85,6 @@ export async function uninstall(options: UninstallOptions = {}): Promise<Uninsta
       );
     }
     log(`booted out ${PLIST_LABEL} (gui/${uid})`);
-  } else {
-    log(`no plist at ${plistPath}; skipping launchctl bootout`);
   }
 
   const removed: string[] = [];
