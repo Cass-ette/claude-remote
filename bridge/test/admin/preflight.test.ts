@@ -12,6 +12,7 @@
  * never argv.
  */
 import { createConnection, createServer } from "node:net";
+import { createServer as createHttpServer } from "node:http";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,11 +24,19 @@ import { createAuditLog } from "../../src/audit/audit-log.js";
 import { runAdminCli, type AdminCliDeps } from "../../src/admin/cli.js";
 import {
   defaultBridgeHealthProber,
+  healthUrl,
   type BridgeHealthProbeInput,
   type BridgeHealthProber,
 } from "../../src/admin/preflight.js";
 
 const T0 = Date.parse("2026-09-01T00:00:00.000Z");
+
+/**
+ * Host-independent uid: the preflight pass tests stat the real temp dirs
+ * (owned by whoever runs vitest — 501 on macOS, 1000 on Linux CI), so the
+ * injected getuid must follow the same source instead of hardcoding 501.
+ */
+const TEST_UID = process.getuid?.() ?? 501;
 
 let dataDir: string;
 let tempRoot: string;
@@ -75,7 +84,7 @@ function makeDeps(
       healthy: true,
       detail: "GET http://127.0.0.1:43111/api/v1/health answered ok (stub)",
     }),
-    getuid: () => 501,
+    getuid: () => TEST_UID,
     homeDir: "/Users/tester",
     healthTimeoutMs: 5_000,
     ...overrides,
@@ -504,6 +513,7 @@ describe("preflight: bridge-health", () => {
     expect(input.host).toBe("127.0.0.1");
     expect(input.port).toBe(43111);
     expect(input.timeoutMs).toBeGreaterThan(0);
+    expect(input.occupiedGraceMs).toBeGreaterThan(0);
     // The spawn contract from the plan: BRIDGE_PREFLIGHT_HEALTH_ONLY=1 on the
     // loopback bind, and the operator env (incl. BRIDGE_DATA_DIR) flows in.
     expect(input.env.BRIDGE_PREFLIGHT_HEALTH_ONLY).toBe("1");
@@ -607,7 +617,28 @@ describe("preflight: --json structured output", () => {
 });
 
 // ---------------------------------------------------------------------------
-// The real prober: spawn node, one GET, terminate the child
+// Probe URL construction (IPv4 vs IPv6)
+// ---------------------------------------------------------------------------
+
+describe("healthUrl", () => {
+  it("builds the IPv4 loopback URL unchanged", () => {
+    expect(healthUrl("127.0.0.1", 43111)).toBe("http://127.0.0.1:43111/api/v1/health");
+  });
+
+  it("brackets an IPv6 host so the probe URL is valid", () => {
+    expect(healthUrl("::1", 43111)).toBe("http://[::1]:43111/api/v1/health");
+    expect(() => new URL(healthUrl("::1", 43111))).not.toThrow();
+    // Unbracketed, the same URL is invalid — the regression this guards.
+    expect(() => new URL(`http://::1:43111/api/v1/health`)).toThrow();
+  });
+
+  it("leaves an already-bracketed IPv6 host alone", () => {
+    expect(healthUrl("[::1]", 43111)).toBe("http://[::1]:43111/api/v1/health");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The real prober: spawn node, poll until answered, terminate the child
 // ---------------------------------------------------------------------------
 
 /** Grab a free TCP port on 127.0.0.1 and release it again. */
@@ -624,11 +655,11 @@ function freePort(): Promise<number> {
 }
 
 /** Expect nothing to be listening on the port anymore. */
-function expectPortClosed(port: number): Promise<void> {
+function expectPortClosed(port: number, host = "127.0.0.1"): Promise<void> {
   return new Promise((resolveClosed, rejectOpen) => {
-    const socket = createConnection({ host: "127.0.0.1", port }, () => {
+    const socket = createConnection({ host, port }, () => {
       socket.destroy();
-      rejectOpen(new Error(`port ${port} is still open`));
+      rejectOpen(new Error(`port ${port} on ${host} is still open`));
     });
     socket.on("error", () => resolveClosed());
   });
@@ -710,5 +741,78 @@ describe("defaultBridgeHealthProber (real child process)", () => {
     });
     expect(result.healthy).toBe(false);
     expect(result.detail).toMatch(/exited with code 3/);
+  }, 15_000);
+
+  // The reinstall race (must-fix): the old launchd job still holds the port
+  // and answers OK in ~ms, while the freshly spawned child needs far longer
+  // to hit EADDRINUSE and exit. An OK answer must not pass while the doomed
+  // child is merely still booting.
+  it("fails when another process already owns the port (occupied-port race)", async () => {
+    const occupier = createHttpServer((req, res) => {
+      if (req.url === "/api/v1/health") {
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ status: "ok" }));
+        return;
+      }
+      res.statusCode = 404;
+      res.end("{}");
+    });
+    const port = await new Promise<number>((resolvePort, reject) => {
+      occupier.once("error", reject);
+      occupier.listen(0, "127.0.0.1", () => {
+        const address = occupier.address();
+        resolvePort(typeof address === "object" && address !== null ? address.port : 0);
+      });
+    });
+    try {
+      // Fake child that binds nothing and exits ~50ms after boot,
+      // simulating the latency of hitting EADDRINUSE against the occupier.
+      const bridgeMain = writeScript("eaddrinuse-bridge.mjs", "setTimeout(() => process.exit(1), 50);\n");
+      const result = await defaultBridgeHealthProber({
+        nodeBin: process.execPath,
+        bridgeMain,
+        host: "127.0.0.1",
+        port,
+        timeoutMs: 10_000,
+        occupiedGraceMs: 5_000,
+        env: {
+          BRIDGE_PREFLIGHT_HEALTH_ONLY: "1",
+          BRIDGE_HOST: "127.0.0.1",
+          BRIDGE_PORT: String(port),
+          BRIDGE_DATA_DIR: dataDir,
+        },
+      });
+      expect(result.healthy).toBe(false);
+      expect(result.detail).toMatch(
+        /another process on 127\.0\.0\.1:\d+ answered .*exited with code 1/,
+      );
+    } finally {
+      // The prober's fetch keep-alives its socket; drop it so close() ends.
+      occupier.closeAllConnections();
+      await new Promise<void>((resolveClose) => occupier.close(() => resolveClose()));
+    }
+  }, 15_000);
+
+  it("passes on an IPv6 ::1 bind (bracketed probe URL) with the child alive through the grace window", async () => {
+    const port = await freePort();
+    const bridgeMain = writeScript("healthy-bridge-v6.mjs", HEALTHY_BRIDGE);
+    const result = await defaultBridgeHealthProber({
+      nodeBin: process.execPath,
+      bridgeMain,
+      host: "::1",
+      port,
+      timeoutMs: 10_000,
+      occupiedGraceMs: 400,
+      env: {
+        BRIDGE_PREFLIGHT_HEALTH_ONLY: "1",
+        BRIDGE_HOST: "::1",
+        BRIDGE_PORT: String(port),
+        BRIDGE_DATA_DIR: dataDir,
+      },
+    });
+    expect(result.healthy).toBe(true);
+    expect(result.detail).toContain(`http://[::1]:${port}/api/v1/health`);
+    expect(result.detail).toContain("grace window");
+    await expectPortClosed(port, "::1");
   }, 15_000);
 });

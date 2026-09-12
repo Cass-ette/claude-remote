@@ -509,7 +509,7 @@ describe("install preflight wiring", () => {
     expect(existsSync(join(home, "Library", "LaunchAgents", PLIST_FILENAME))).toBe(false);
   });
 
-  it("still honors the injected preflight seam and --skip-preflight", async () => {
+  it("still honors the injected preflight seam", async () => {
     const home = scratchHome();
     const config = fixtureConfig(home);
     const injected: string[] = [];
@@ -526,6 +526,33 @@ describe("install preflight wiring", () => {
     expect(injected).toEqual([join(home, "Library", "LaunchAgents", PLIST_FILENAME)]);
     // Only bootstrap ran — the injected gate replaced the spawn.
     expect(calls).toEqual([["/bin/launchctl", "bootstrap", "gui/501", join(home, "Library", "LaunchAgents", PLIST_FILENAME)]]);
+  });
+
+  it("--skip-preflight bypasses a failing gate and still bootstraps", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    const { calls, runner } = fakeRunner();
+    const logs: string[] = [];
+    const failingGate = () => [
+      { name: "data-dir", passed: false, detail: "has mode 755, expected 0700" },
+    ];
+    // Control: without the escape, the same failing gate refuses.
+    await expect(
+      install(config, { homeDir: home, runner, uid: 501, preflight: failingGate }),
+    ).rejects.toMatchObject({ code: "preflight_failed" });
+    expect(existsSync(join(home, "Library", "LaunchAgents", PLIST_FILENAME))).toBe(false);
+    // Escape: --skip-preflight bypasses the failing gate and bootstraps.
+    await install(config, {
+      homeDir: home,
+      runner,
+      uid: 501,
+      preflight: failingGate,
+      skipPreflight: true,
+      log: (line) => logs.push(line),
+    });
+    expect(calls).toEqual([["/bin/launchctl", "bootstrap", "gui/501", join(home, "Library", "LaunchAgents", PLIST_FILENAME)]]);
+    expect(existsSync(join(home, "Library", "LaunchAgents", PLIST_FILENAME))).toBe(true);
+    expect(logs.join("\n")).toContain("--skip-preflight");
   });
 });
 

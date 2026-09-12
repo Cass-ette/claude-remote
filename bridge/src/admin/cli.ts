@@ -92,7 +92,7 @@ export interface AdminCliDeps {
   readonly runCommand?: PreflightCommandRunner | undefined;
   /** Cloudflare Access apps fetcher for the identity-policy check (default: real API). */
   readonly fetchAccessApps?: AccessAppsFetcher | undefined;
-  /** Bridge health prober (default: spawn the built entry, one GET, SIGTERM). */
+  /** Bridge health prober (default: spawn the built entry, poll the health endpoint, SIGTERM). */
   readonly probeBridgeHealth?: BridgeHealthProber | undefined;
   /** Stat seam for the data-dir mode/ownership check (default: fs.statSync). */
   readonly statDataDir?: ((dataDir: string) => { mode: number; uid: number }) | undefined;
@@ -102,6 +102,8 @@ export interface AdminCliDeps {
   readonly homeDir?: string | undefined;
   /** Health probe timeout in milliseconds (default: 15000). */
   readonly healthTimeoutMs?: number | undefined;
+  /** Occupied-port grace window after an OK health answer, in milliseconds (default: 1500). */
+  readonly occupiedGraceMs?: number | undefined;
   /** Renders the pairing payload as printable text (the QR block). */
   readonly renderQr: (payload: string) => string;
   /** Single output sink for every line the CLI prints. */

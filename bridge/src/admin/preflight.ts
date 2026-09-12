@@ -25,8 +25,9 @@ import type { SqliteDatabase } from "../db/database.js";
  *   fetched or printed (the JWKS check touches the public certs endpoint
  *   only), and pairing tokens are out of scope here.
  * - The health check spawns the built bridge entry with
- *   BRIDGE_PREFLIGHT_HEALTH_ONLY=1 on the loopback bind, performs exactly
- *   one GET of /api/v1/health, and terminates the child.
+ *   BRIDGE_PREFLIGHT_HEALTH_ONLY=1 on the loopback bind, polls
+ *   GET /api/v1/health until it answers, holds an occupied-port grace
+ *   window before trusting an OK answer, and terminates the child.
  * - The preflight NEVER calls `launchctl bootstrap` — that stays in the
  *   installer, and only after this gate passes.
  * - Checks whose configuration is absent (Cloudflare team domain, tunnel
@@ -67,6 +68,22 @@ function info(name: string, details: string): PreflightCheck {
   return { name, status: "info", passed: true, details };
 }
 
+/**
+ * Default occupied-port grace window (ms): how long the prober waits after an
+ * OK health answer before trusting that the spawned child is the responder.
+ */
+export const DEFAULT_OCCUPIED_GRACE_MS = 1_500;
+
+/**
+ * Probe URL for the loopback health endpoint. IPv6 hosts (the config accepts
+ * `::1`) must be bracketed per RFC 3986, or `http://::1:43111/...` is not a
+ * valid URL and every fetch throws.
+ */
+export function healthUrl(host: string, port: number): string {
+  const bracketed = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${bracketed}:${port}/api/v1/health`;
+}
+
 /** Result of one external command (cloudflared …) via the injectable runner. */
 export interface CommandOutcome {
   readonly code: number;
@@ -88,6 +105,11 @@ export interface BridgeHealthProbeInput {
   readonly host: string;
   readonly port: number;
   readonly timeoutMs: number;
+  /**
+   * How long (ms) to keep waiting after an OK health answer before trusting
+   * it, so a child that hits EADDRINUSE has time to die (default 1.5s).
+   */
+  readonly occupiedGraceMs?: number | undefined;
   /** Child environment; always carries BRIDGE_PREFLIGHT_HEALTH_ONLY=1. */
   readonly env: Record<string, string>;
 }
@@ -111,6 +133,8 @@ export interface PreflightDeps {
   readonly getuid: () => number;
   readonly homeDir: string;
   readonly healthTimeoutMs: number;
+  /** Occupied-port grace window for the health probe (default 1.5s). */
+  readonly occupiedGraceMs: number;
 }
 
 /**
@@ -131,6 +155,7 @@ export interface PreflightDepsInput {
   readonly getuid?: (() => number) | undefined;
   readonly homeDir?: string | undefined;
   readonly healthTimeoutMs?: number | undefined;
+  readonly occupiedGraceMs?: number | undefined;
 }
 
 /** readString twin of config.ts: trim, empty string counts as unset. */
@@ -185,11 +210,19 @@ export const realFetchAccessApps: AccessAppsFetcher = async ({ apiToken, zoneId 
 
 /**
  * Real health prober (plan Task 36, step 3): spawn `node <bridgeMain>` with
- * BRIDGE_PREFLIGHT_HEALTH_ONLY=1 on the loopback bind, poll a single GET of
- * /api/v1/health until the deadline, then terminate the child (SIGTERM with
- * a SIGKILL fallback). Resolves only after the child is gone. A pre-existing
- * listener on the port is detected via the child exiting early
- * (EADDRINUSE) and reported as unhealthy.
+ * BRIDGE_PREFLIGHT_HEALTH_ONLY=1 on the loopback bind, then repeatedly GET
+ * /api/v1/health (150ms apart) until it answers, the child exits, or the
+ * deadline passes — and finally terminate the child (SIGTERM with a SIGKILL
+ * fallback), resolving only after the child is gone.
+ *
+ * An OK answer alone is not trusted: a pre-existing listener on the port
+ * (e.g. the old launchd job during a reinstall) answers in ~ms while the
+ * freshly spawned child takes far longer to hit EADDRINUSE and exit, so an
+ * immediate liveness check would false-pass. After an OK answer the prober
+ * holds an occupied-port grace window ({@link BridgeHealthProbeInput.occupiedGraceMs},
+ * default {@link DEFAULT_OCCUPIED_GRACE_MS}) and only reports healthy if the
+ * child is STILL alive afterwards; a child that died during the window means
+ * another process answered, which is reported as unhealthy.
  */
 export const defaultBridgeHealthProber: BridgeHealthProber = async (input) => {
   const child = spawn(input.nodeBin, [input.bridgeMain], {
@@ -216,7 +249,7 @@ export const defaultBridgeHealthProber: BridgeHealthProber = async (input) => {
     return tail === "" ? "" : `; child stderr: ${tail.replace(/\r?\n/g, " | ")}`;
   };
 
-  const url = `http://${input.host}:${input.port}/api/v1/health`;
+  const url = healthUrl(input.host, input.port);
   const deadline = Date.now() + input.timeoutMs;
   let lastProblem = "no response";
   try {
@@ -236,20 +269,35 @@ export const defaultBridgeHealthProber: BridgeHealthProber = async (input) => {
           } catch {
             status = "";
           }
-          if (status === "ok" && child.exitCode === null) {
+          if (status === "ok") {
+            // Occupied-port guard: a pre-existing listener (the old launchd
+            // job during a reinstall) answers in ~ms while the fresh child
+            // needs far longer to hit EADDRINUSE and exit, so the child must
+            // STILL be alive after a grace window before this counts as
+            // healthy. The race resolves early when the child dies.
+            const graceMs = input.occupiedGraceMs ?? DEFAULT_OCCUPIED_GRACE_MS;
+            let graceTimer: NodeJS.Timeout | undefined;
+            const childSurvived = await Promise.race([
+              exited.then(() => false),
+              new Promise<true>((resolveGrace) => {
+                graceTimer = setTimeout(() => resolveGrace(true), graceMs);
+              }),
+            ]);
+            if (graceTimer !== undefined) clearTimeout(graceTimer);
+            if (!childSurvived) {
+              return {
+                healthy: false,
+                detail:
+                  `another process on ${input.host}:${input.port} answered ${url}; the spawned bridge exited ` +
+                  `with code ${child.exitCode}${stderrNote()}`,
+              };
+            }
             return {
               healthy: true,
               detail:
-                `GET ${url} answered {"status":"ok"} (child spawned with BRIDGE_PREFLIGHT_HEALTH_ONLY=1 ` +
+                `GET ${url} answered {"status":"ok"} and the child stayed alive through the ` +
+                `${graceMs}ms occupied-port grace window (child spawned with BRIDGE_PREFLIGHT_HEALTH_ONLY=1 ` +
                 "on the loopback bind; terminated after the probe)",
-            };
-          }
-          if (status === "ok") {
-            return {
-              healthy: false,
-              detail:
-                `another process on ${input.host}:${input.port} answered ${url}; the spawned bridge exited ` +
-                `with code ${child.exitCode}${stderrNote()}`,
             };
           }
           lastProblem = `HTTP ${res.status} (body status ${JSON.stringify(status)})`;
@@ -294,6 +342,7 @@ export function resolvePreflightDeps(input: PreflightDepsInput): PreflightDeps {
     getuid: input.getuid ?? (() => process.getuid?.() ?? -1),
     homeDir: input.homeDir ?? homedir(),
     healthTimeoutMs: input.healthTimeoutMs ?? 15_000,
+    occupiedGraceMs: input.occupiedGraceMs ?? DEFAULT_OCCUPIED_GRACE_MS,
   };
 }
 
@@ -646,8 +695,9 @@ export async function runPreflight(deps: PreflightDeps): Promise<PreflightReport
   }
 
   // 9. Bridge health: spawn the built entry with BRIDGE_PREFLIGHT_HEALTH_ONLY=1
-  //    bound to the loopback host/port, one GET of /api/v1/health, terminate
-  //    the child. Runs only when a built bridge entry exists — the deploy
+  //    bound to the loopback host/port, poll GET /api/v1/health until it
+  //    answers (plus the occupied-port grace window), terminate the child.
+  //    Runs only when a built bridge entry exists — the deploy
   //    launcher / installer always set BRIDGE_MAIN to the dist entry.
   const bridgeMain =
     readEnvString(deps.env, "BRIDGE_MAIN") ??
@@ -684,6 +734,7 @@ export async function runPreflight(deps: PreflightDeps): Promise<PreflightReport
       host: config.host,
       port: config.port,
       timeoutMs: deps.healthTimeoutMs,
+      occupiedGraceMs: deps.occupiedGraceMs,
       env: childEnv,
     });
     checks.push(
