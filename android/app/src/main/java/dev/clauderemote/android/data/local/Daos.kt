@@ -89,6 +89,17 @@ interface MessageDao {
     @Query("SELECT COUNT(*) FROM messages WHERE sessionId = :sessionId")
     fun countForSession(sessionId: String): Int
 
+    /** Highest projected position in the session; null when empty (EventReducer). */
+    @Query("SELECT MAX(position) FROM messages WHERE sessionId = :sessionId")
+    fun maxPosition(sessionId: String): Long?
+
+    /** Correlation read for the command badge source (§7.4 requestId link). */
+    @Query("SELECT * FROM messages WHERE sessionId = :sessionId AND requestId = :requestId LIMIT 1")
+    fun getByRequestId(sessionId: String, requestId: String): MessageEntity?
+
+    @Query("DELETE FROM messages WHERE historyItemId = :historyItemId")
+    fun deleteByHistoryItemId(historyItemId: String)
+
     @Query("DELETE FROM messages WHERE sessionId = :sessionId")
     fun deleteForSession(sessionId: String)
 
