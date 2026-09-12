@@ -394,6 +394,28 @@ class ConversationViewModelTest {
         assertEquals(ConversationBanner.SESSION_CONFLICT, vm.uiState.value.banner)
     }
 
+    @Test
+    fun bannerSurvivesRefresh_untilItsConditionClears() {
+        val repo = FakeConversationRepository()
+        repo.session = session(SESSION_STATUS_IDLE)
+        val vm = conversationViewModel(repo)
+
+        vm.onCoordinatorSignal(CoordinatorSignal.ResyncRequired)
+        vm.refresh()
+        assertEquals(ConversationBanner.RESYNC_REQUIRED, vm.uiState.value.banner)
+
+        // Internal refresh paths (a send, a permission resolution) must not
+        // drop the banner either.
+        vm.sendMessage("still resyncing")
+        assertEquals(ConversationBanner.RESYNC_REQUIRED, vm.uiState.value.banner)
+
+        // The condition clearing is the ONLY thing that removes the banner.
+        vm.clearBanner()
+        assertNull(vm.uiState.value.banner)
+        vm.refresh()
+        assertNull(vm.uiState.value.banner)
+    }
+
     // -------------------------------------------------------------------
     // 8. Import scan/confirm (§12.4)
     // -------------------------------------------------------------------

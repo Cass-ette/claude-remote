@@ -18,6 +18,12 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
+        // Debug/CI default bridge endpoint: the emulator's alias for the host
+        // loopback, on the bridge's DEFAULT_BRIDGE_PORT (bridge/src/config.ts).
+        // Production installs override this with the user-entered host on the
+        // ConnectionScreen (persisted via BridgeHostStore).
+        buildConfigField("String", "DEFAULT_BRIDGE_BASE_URL", "\"http://10.0.2.2:43111\"")
+
         // Required by the AppAuth library manifest merger
         // (net.openid.appauth.RedirectUriReceiverActivity uses
         // ${appAuthRedirectScheme} as the redirect URI scheme).
@@ -104,4 +110,7 @@ dependencies {
     androidTestImplementation(platform(libs.compose.bom))
     androidTestImplementation(libs.compose.ui.test.junit4)
     debugImplementation(libs.compose.ui.test.manifest)
+
+    // Embedded HTTP+WS fake bridge for the E2E instrumented suite.
+    androidTestImplementation(libs.mockwebserver)
 }

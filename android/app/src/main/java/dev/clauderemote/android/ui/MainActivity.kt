@@ -11,18 +11,21 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import dev.clauderemote.android.BuildConfig
-import dev.clauderemote.android.data.local.CommandEventEntity
-import dev.clauderemote.android.data.local.MessageEntity
-import dev.clauderemote.android.data.local.SessionEntity
+import dev.clauderemote.android.ClaudeRemoteApp
 import dev.clauderemote.android.network.ConnectionState
 import dev.clauderemote.android.protocol.v1.PROTOCOL_VERSION
+import dev.clauderemote.android.protocol.v1.SessionCreateCommand
+import dev.clauderemote.android.protocol.v1.SessionCreatePayload
 import dev.clauderemote.android.ui.connection.ConnectionScreen
 import dev.clauderemote.android.ui.connection.ConnectionUiState
 import dev.clauderemote.android.ui.conversation.ConversationScreen
@@ -33,12 +36,15 @@ import dev.clauderemote.android.ui.sessions.SessionListScreen
 import dev.clauderemote.android.ui.sessions.SessionListUiState
 import dev.clauderemote.android.ui.sessions.SessionRowUi
 import dev.clauderemote.android.ui.sessions.sessionListGroupOf
+import java.time.Duration
 import java.time.Instant
+import java.util.UUID
+import kotlinx.coroutines.launch
 
 /**
- * Single-activity Compose host (§12). This chunk wires the nav graph over
- * FAKE repositories — the screens and the framework-independent ViewModel
- * are real; Room/coordinator wiring lands with Task 33.
+ * Single-activity Compose host (§12), wired over the REAL graph
+ * ([ClaudeRemoteApp.graph]): Room-backed projection, the live
+ * ConnectionCoordinator, the real ConversationRepository/CommandSender seams.
  *
  * Nav graph: connection → sessions → (conversation | import).
  */
@@ -124,76 +130,105 @@ private object Routes {
 
 @Composable
 private fun ClaudeRemoteNavGraph() {
+    val app = LocalContext.current.applicationContext as ClaudeRemoteApp
+    val graph = app.graph ?: return
     val navController = rememberNavController()
-
-    // Fake-backed shell wiring (this chunk); Task 33 swaps in Room DAOs and
-    // the ConnectionCoordinator-backed sender.
-    val repository = remember { DemoConversationRepository() }
-    val commandSender = remember { CommandSender { } }
-    val expirySource = remember { DemoTokenExpirySource() }
     val scope = rememberCoroutineScope()
-    val viewModel = remember(DEMO_SESSION_ID) {
-        ConversationViewModel(
-            sessionId = DEMO_SESSION_ID,
-            repository = repository,
-            commandSender = commandSender,
-            expirySource = expirySource,
-            scope = scope,
-        )
+
+    val connectionState by graph.coordinator.state.collectAsState()
+    var hostInput by remember { mutableStateOf(app.hostStore.bridgeHost() ?: "") }
+
+    // The session list is a read over the same Room projection the event
+    // pipeline writes; it reloads whenever a session's projection changes.
+    var sessionRows by remember { mutableStateOf(graph.sessionSnapshots()) }
+    LaunchedEffect(Unit) {
+        graph.projectionChanged.collect {
+            sessionRows = graph.sessionSnapshots()
+        }
     }
-    val uiState by viewModel.uiState.collectAsState()
-    val importState by viewModel.importState.collectAsState()
-    val expiryWarning by viewModel.expiryWarning.collectAsState()
 
     NavHost(navController = navController, startDestination = Routes.CONNECTION) {
         composable(Routes.CONNECTION) {
             ConnectionScreen(
                 state = ConnectionUiState(
-                    signedInAs = "demo@example.com",
-                    paired = true,
-                    deviceIdentity = "ZDAEY9MZFUQGLJ6L (demo)",
-                    connectionState = ConnectionState.CONNECTED,
+                    // The signed-in identity becomes available once the
+                    // interactive OAuth login (Task 29 browser flow) has run
+                    // on this install; until then no assertion is fabricated.
+                    signedInAs = null,
+                    paired = graph.tokenStore.getDeviceSessionToken() != null,
+                    deviceIdentity = runCatching { graph.deviceKeys.deviceId() }
+                        .getOrElse { "设备密钥不可用" },
+                    connectionState = connectionState,
                     appVersion = BuildConfig.VERSION_NAME,
-                    bridgeVersion = "2026.3.2 (demo)",
+                    bridgeVersion = null,
                     protocolVersion = PROTOCOL_VERSION,
-                    claudeCodeVersion = "2.1.133 (demo)",
-                    expiryWarning = expiryWarning,
+                    claudeCodeVersion = null,
+                    expiryWarning = null,
+                    bridgeHost = hostInput,
                 ),
-                onReLogin = {},
-                onScanPair = {},
+                onReLogin = {
+                    // Programmatic half of the re-login path: force an Access
+                    // refresh through the real OAuthManager, then restart the
+                    // connect loop. The interactive browser flow requires a
+                    // verified App Link host and lands with the login wiring.
+                    scope.launch {
+                        runCatching { graph.oauth.getValidAccessToken(forceRefresh = true) }
+                        graph.coordinator.start()
+                    }
+                },
+                onScanPair = {
+                    // Pairing needs the one-time token from the Mac-side QR;
+                    // the enrollment itself goes through the real
+                    // DeviceSessionManager once the scanner is wired.
+                },
+                onBridgeHostChange = { hostInput = it },
+                onSaveBridgeHost = { app.saveBridgeHost(hostInput) },
                 onOpenSessions = { navController.navigate(Routes.SESSIONS) },
             )
         }
         composable(Routes.SESSIONS) {
             SessionListScreen(
-                state = demoSessionListState(),
+                state = sessionListState(sessionRows.map(::sessionRowOf)),
                 onOpenSession = { sessionId ->
                     navController.navigate(Routes.CONVERSATION.replace("{sessionId}", sessionId))
                 },
-                onNewSession = { _, _ -> },
+                onNewSession = { projectId, displayName ->
+                    scope.launch {
+                        graph.sendCommand(
+                            SessionCreateCommand(
+                                requestId = UUID.randomUUID().toString(),
+                                idempotencyKey = UUID.randomUUID().toString(),
+                                sentAt = Instant.now().toString(),
+                                payload = SessionCreatePayload(projectId, displayName),
+                            ),
+                        )
+                    }
+                },
                 onScanImports = { navController.navigate(Routes.IMPORT) },
             )
         }
-        composable(Routes.CONVERSATION) {
-            LaunchedEffect(Unit) { viewModel.refresh() }
-            ConversationScreen(
-                state = uiState,
-                expiryWarning = expiryWarning,
-                connectionLabel = "Bridge 已连接 · 认证有效",
-                modelName = "claude-fable-5 (demo)",
-                onSendMessage = viewModel::sendMessage,
-                onSafeRetry = viewModel::safeRetry,
-                onResume = viewModel::resume,
-                onSendContinue = viewModel::sendContinue,
-                onStop = viewModel::stop,
-                onRelease = viewModel::release,
-                onAllowPermission = viewModel::allowPermission,
-                onDenyPermission = viewModel::denyPermission,
-            )
+        composable(Routes.CONVERSATION) { entry ->
+            val sessionId = entry.arguments?.getString("sessionId").orEmpty()
+            ConversationDestination(graph, sessionId)
         }
         composable(Routes.IMPORT) {
+            val viewModel = remember {
+                ConversationViewModel(
+                    sessionId = "",
+                    repository = graph.conversationRepository,
+                    commandSender = graph.sendCommand,
+                    expirySource = graph.tokenExpirySource,
+                    scope = scope,
+                )
+            }
+            val importState by viewModel.importState.collectAsState()
+            LaunchedEffect(sessionRows) {
+                // The project picker lists the projects this install already
+                // tracks in the projection (Bridge-authorized projects).
+                viewModel.setKnownProjects(sessionRows.map { it.projectId }.distinct())
+            }
             ImportSessionScreen(
-                state = importState.copy(projects = demoProjects),
+                state = importState,
                 onPickProject = viewModel::importScan,
                 onScan = { importState.projectId?.let(viewModel::importScan) },
                 onConfirmImport = viewModel::importConfirm,
@@ -203,148 +238,93 @@ private fun ClaudeRemoteNavGraph() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Demo (fake) data. Screens and ViewModel are production code; these fakes
-// only stand in for the Room/coordinator wiring of Task 33.
-// ---------------------------------------------------------------------------
+/** The conversation destination: one ViewModel over the real seams. */
+@Composable
+private fun ConversationDestination(
+    graph: dev.clauderemote.android.AppGraph,
+    sessionId: String,
+) {
+    val scope = rememberCoroutineScope()
+    val viewModel = remember(sessionId) {
+        ConversationViewModel(
+            sessionId = sessionId,
+            repository = graph.conversationRepository,
+            commandSender = graph.sendCommand,
+            expirySource = graph.tokenExpirySource,
+            scope = scope,
+        )
+    }
+    val uiState by viewModel.uiState.collectAsState()
+    val expiryWarning by viewModel.expiryWarning.collectAsState()
+    val connectionState by graph.coordinator.state.collectAsState()
 
-private const val DEMO_SESSION_ID = "33333333-3333-4333-8333-333333333333"
-private val demoProjects = listOf("claude-remote", "study/thesis")
-private val demoInstant = Instant.parse("2026-09-01T08:00:00Z")
+    // §11.1 coordinator signals surface as conversation banners; the RESYNC
+    // banner clears when the connection returns to CONNECTED after recovery.
+    LaunchedEffect(sessionId) {
+        graph.coordinator.signals.collect { viewModel.onCoordinatorSignal(it) }
+    }
+    LaunchedEffect(sessionId) {
+        graph.coordinator.state.collect { state ->
+            if (state == ConnectionState.CONNECTED &&
+                viewModel.uiState.value.banner == ConversationBanner.RESYNC_REQUIRED
+            ) {
+                viewModel.clearBanner()
+            }
+        }
+    }
+    // Re-derive the UI state whenever this session's projection changed.
+    LaunchedEffect(sessionId) {
+        graph.projectionChanged.collect { changed ->
+            if (changed == sessionId) viewModel.refresh()
+        }
+    }
+    LaunchedEffect(Unit) { viewModel.refresh() }
 
-private fun demoSessionListState(): SessionListUiState {
-    val rows = listOf(
-        SessionRowUi(
-            sessionId = DEMO_SESSION_ID,
-            projectName = "claude-remote",
-            title = "UI 壳与假仓库",
-            model = "claude-fable-5",
-            status = "running",
-            lastActivity = "5 分钟前",
-        ),
-        SessionRowUi(
-            sessionId = "44444444-4444-4444-8444-444444444444",
-            projectName = "study/thesis",
-            title = "论文修订",
-            model = "claude-fable-5",
-            status = "waiting_permission",
-            lastActivity = "1 小时前",
-        ),
-        SessionRowUi(
-            sessionId = "55555555-5555-4555-8555-555555555555",
-            projectName = "claude-remote",
-            title = "Bridge 重连策略",
-            model = "claude-sonnet-4-6",
-            status = "interrupted",
-            lastActivity = "昨天",
-        ),
-    )
-    return SessionListUiState(
-        groups = SessionListGroup.entries
-            .map { group -> group to rows.filter { sessionListGroupOf(it.status) == group } }
-            .filter { (_, rowsInGroup) -> rowsInGroup.isNotEmpty() }
-            .map { (group, rowsInGroup) -> SessionGroupUi(group, rowsInGroup) },
+    ConversationScreen(
+        state = uiState,
+        expiryWarning = expiryWarning,
+        connectionLabel = when (connectionState) {
+            ConnectionState.CONNECTED -> "Bridge 已连接"
+            ConnectionState.CONNECTING -> "Bridge 连接中…"
+            ConnectionState.DISCONNECTED -> "Bridge 未连接"
+            ConnectionState.STOPPED -> "Bridge 已停止"
+        },
+        modelName = "跟随 Mac 设置",
+        onSendMessage = viewModel::sendMessage,
+        onSafeRetry = viewModel::safeRetry,
+        onResume = viewModel::resume,
+        onSendContinue = viewModel::sendContinue,
+        onStop = viewModel::stop,
+        onRelease = viewModel::release,
+        onAllowPermission = viewModel::allowPermission,
+        onDenyPermission = viewModel::denyPermission,
     )
 }
 
-/** In-memory demo projection: one running session with a tool call and an indeterminate send. */
-private class DemoConversationRepository : ConversationRepository {
-    private val session = SessionEntity(
-        sessionId = DEMO_SESSION_ID,
-        projectId = "claude-remote",
-        displayName = "UI 壳与假仓库",
-        status = "running",
-        lastAckEventId = 42L,
-        updatedAt = demoInstant,
-    )
+/** Groups the projected sessions into the §12.1 list. */
+private fun sessionListState(rows: List<SessionRowUi>): SessionListUiState = SessionListUiState(
+    groups = SessionListGroup.entries
+        .map { group -> group to rows.filter { sessionListGroupOf(it.status) == group } }
+        .filter { (_, rowsInGroup) -> rowsInGroup.isNotEmpty() }
+        .map { (group, rowsInGroup) -> SessionGroupUi(group, rowsInGroup) },
+)
 
-    private val messages = mutableListOf(
-        MessageEntity(
-            historyItemId = "demo-user-1",
-            sessionId = DEMO_SESSION_ID,
-            historyRevision = "live",
-            role = "user",
-            contentJson = """[{"kind":"text","text":"帮我看一下这个崩溃窗口"}]""",
-            sourceIdsJson = "[]",
-            status = "complete",
-            requestId = "demo-req-1",
-            position = 0,
-            createdAt = "2026-09-01T07:59:00Z",
-            updatedAt = demoInstant,
-        ),
-        MessageEntity(
-            historyItemId = "demo-tool-1",
-            sessionId = DEMO_SESSION_ID,
-            historyRevision = "live",
-            role = "tool",
-            contentJson = """[{"kind":"tool_use","toolName":"Read","toolUseId":"demo-tool-1",""" +
-                """"input":{"file_path":"/tmp/claude-remote/crash.log"}},""" +
-                """{"kind":"tool_output","text":"(前 40 行崩溃日志…)","truncated":true}]""",
-            sourceIdsJson = "[]",
-            status = "complete",
-            requestId = null,
-            position = 1,
-            createdAt = "2026-09-01T07:59:10Z",
-            updatedAt = demoInstant,
-        ),
-        MessageEntity(
-            historyItemId = "demo-user-2",
-            sessionId = DEMO_SESSION_ID,
-            historyRevision = "live",
-            role = "user",
-            contentJson = """[{"kind":"text","text":"再跑一次外场验证"}]""",
-            sourceIdsJson = "[]",
-            status = "complete",
-            requestId = "demo-req-2",
-            position = 2,
-            createdAt = "2026-09-01T08:00:00Z",
-            updatedAt = demoInstant,
-        ),
-    )
+/** Maps one projected session onto its §12.1 row. */
+private fun sessionRowOf(session: dev.clauderemote.android.data.local.SessionEntity) = SessionRowUi(
+    sessionId = session.sessionId,
+    projectName = session.projectId.ifBlank { "未知项目" },
+    title = session.displayName.ifBlank { session.sessionId.take(8) },
+    model = "跟随 Mac 设置",
+    status = session.status,
+    lastActivity = relativeActivity(session.updatedAt),
+)
 
-    private val commands = mutableListOf(
-        CommandEventEntity(
-            requestId = "demo-req-1",
-            sessionId = DEMO_SESSION_ID,
-            idempotencyKey = "demo-req-1",
-            commandType = "message.send",
-            status = "completed",
-            resultJson = null,
-            updatedAt = demoInstant,
-        ),
-        CommandEventEntity(
-            requestId = "demo-req-2",
-            sessionId = DEMO_SESSION_ID,
-            idempotencyKey = "demo-req-2",
-            commandType = "message.send",
-            status = "indeterminate",
-            resultJson = null,
-            updatedAt = demoInstant,
-        ),
-    )
-
-    override fun session(sessionId: String): SessionEntity? =
-        session.takeIf { it.sessionId == sessionId }
-
-    override fun messages(sessionId: String): List<MessageEntity> =
-        messages.filter { it.sessionId == sessionId }.sortedBy { it.position }
-
-    override fun commandEvents(sessionId: String): List<CommandEventEntity> =
-        commands.filter { it.sessionId == sessionId }
-
-    override fun upsertMessage(message: MessageEntity) {
-        messages.removeAll { it.historyItemId == message.historyItemId }
-        messages.add(message)
+private fun relativeActivity(instant: Instant, now: Instant = Instant.now()): String {
+    val minutes = Duration.between(instant, now).toMinutes()
+    return when {
+        minutes < 1 -> "刚刚"
+        minutes < 60 -> "$minutes 分钟前"
+        minutes < 24 * 60 -> "${minutes / 60} 小时前"
+        else -> "${minutes / (24 * 60)} 天前"
     }
-
-    override fun upsertCommandEvent(event: CommandEventEntity) {
-        commands.removeAll { it.requestId == event.requestId }
-        commands.add(event)
-    }
-}
-
-/** Demo expiry seam: no token is near expiry in the shell. */
-private class DemoTokenExpirySource : TokenExpirySource {
-    override fun accessTokenExpiresAtMs(): Long? = null
-    override fun deviceSessionExpiresAtMs(): Long? = null
 }

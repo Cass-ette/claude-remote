@@ -8,14 +8,23 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
@@ -39,6 +48,8 @@ data class ConnectionUiState(
     val protocolVersion: String,
     val claudeCodeVersion: String?,
     val expiryWarning: ExpiryWarning?,
+    /** Currently saved bridge host (bare host or full base URL); null = debug default. */
+    val bridgeHost: String?,
 )
 
 @Composable
@@ -47,6 +58,8 @@ fun ConnectionScreen(
     onReLogin: () -> Unit,
     onScanPair: () -> Unit,
     onOpenSessions: () -> Unit,
+    onBridgeHostChange: (String) -> Unit = {},
+    onSaveBridgeHost: () -> Unit = {},
 ) {
     Column(
         modifier = Modifier
@@ -98,6 +111,25 @@ fun ConnectionScreen(
                     MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
+            // The production bridge host is user-entered here and persisted
+            // (BridgeHostStore); an empty value keeps the debug default.
+            var hostInput by remember(state.bridgeHost) {
+                mutableStateOf(state.bridgeHost ?: "")
+            }
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                OutlinedTextField(
+                    value = hostInput,
+                    onValueChange = onBridgeHostChange,
+                    modifier = Modifier.weight(1f),
+                    label = { Text("Bridge 主机") },
+                    placeholder = { Text("例如 bridge.example.com") },
+                    singleLine = true,
+                )
+                Spacer(Modifier.width(8.dp))
+                Button(onClick = onSaveBridgeHost, enabled = hostInput.isNotBlank()) {
+                    Text("保存")
+                }
+            }
         }
 
         state.expiryWarning?.let { warning ->

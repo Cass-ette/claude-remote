@@ -19,6 +19,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
@@ -78,7 +79,9 @@ fun PermissionSheet(
     }
 }
 
-/** The sheet body, public so the instrumented test drives it deterministically. */
+/**
+ * The sheet body, public so the instrumented test drives it deterministically.
+ */
 @Composable
 fun PermissionSheetContent(
     state: PermissionSheetUiState,
@@ -86,7 +89,13 @@ fun PermissionSheetContent(
     onDeny: (String) -> Unit,
 ) {
     val titleFocus = remember { FocusRequester() }
-    val expired = state.expiresAtMs != null && state.remainingSeconds() <= 0
+    // The countdown state lives in THIS scope (not inside [CountdownLabel]):
+    // `expired` and both button `enabled` states derive from it, so the
+    // zero-crossing recomposes the whole body. When the ticker state was
+    // owned by the label, only the label recomposed at zero — the buttons
+    // stayed enabled and the label stuck on a stale count.
+    val remainingMs by rememberRemainingMs(state.expiresAtMs)
+    val expired = state.expiresAtMs != null && remainingMs <= 0
 
     Column(
         modifier = Modifier
@@ -104,7 +113,7 @@ fun PermissionSheetContent(
         Spacer(Modifier.height(12.dp))
         PermissionDetail(state)
         Spacer(Modifier.height(12.dp))
-        CountdownLabel(state, expired)
+        CountdownLabel(state, remainingMs, expired)
         Spacer(Modifier.height(16.dp))
         Row(horizontalArrangement = Arrangement.spacedBy(0.dp)) {
             // Deny is the primary (filled) action: fail-closed ordering, and
@@ -183,21 +192,30 @@ private fun PermissionDetail(state: PermissionSheetUiState) {
     }
 }
 
-/** §12.3 countdown; when it hits zero the sheet is disabled (fail-closed). */
+/**
+ * Countdown state hoisted to the caller's scope (§12.3 fail-closed expiry):
+ * ticks once per second until the wall-clock expiry crosses, then stops.
+ * Returns Long.MAX_VALUE when no expiry is advertised (never expires).
+ */
 @Composable
-private fun CountdownLabel(state: PermissionSheetUiState, expired: Boolean) {
-    if (state.expiresAtMs == null) return
-    var remainingMs by remember(state.expiresAtMs) {
-        mutableLongStateOf(state.expiresAtMs - System.currentTimeMillis())
-    }
-    LaunchedEffect(state.expiresAtMs) {
+private fun rememberRemainingMs(expiresAtMs: Long?): State<Long> {
+    val remaining = remember(expiresAtMs) { mutableLongStateOf(expiresAtMs?.let { it - System.currentTimeMillis() } ?: Long.MAX_VALUE) }
+    LaunchedEffect(expiresAtMs) {
+        val expiry = expiresAtMs ?: return@LaunchedEffect
         while (true) {
-            val left = state.expiresAtMs - System.currentTimeMillis()
-            remainingMs = left
+            val left = expiry - System.currentTimeMillis()
+            remaining.longValue = left
             if (left <= 0) break
             delay(1_000)
         }
     }
+    return remaining
+}
+
+/** §12.3 countdown; when it hits zero the sheet is disabled (fail-closed). */
+@Composable
+private fun CountdownLabel(state: PermissionSheetUiState, remainingMs: Long, expired: Boolean) {
+    if (state.expiresAtMs == null) return
     Text(
         text = if (expired) {
             "已过期：请求将按拒绝处理"
@@ -221,12 +239,7 @@ data class PermissionSheetUiState(
     val commandOrPath: String?,
     val rawParamsJson: String?,
     val expiresAtMs: Long?,
-) {
-    fun remainingSeconds(): Long {
-        val expiry = expiresAtMs ?: return -1
-        return (expiry - System.currentTimeMillis()) / 1000
-    }
-}
+)
 
 internal fun PendingPermissionUi.toSheetState(): PermissionSheetUiState = PermissionSheetUiState(
     permissionRequestId = permissionRequestId,

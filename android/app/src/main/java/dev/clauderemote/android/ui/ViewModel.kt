@@ -88,9 +88,14 @@ class ConversationViewModel(
         refresh()
     }
 
-    /** Re-reads the projection and the token expiries; the screens call this on resume. */
+    /**
+     * Re-reads the projection and the token expiries; the screens call this on resume.
+     * The banner SURVIVES the re-derivation — it is transient UI state owned by
+     * [onCoordinatorSignal], cleared only when its condition clears
+     * ([clearBanner]), never by a routine refresh.
+     */
     fun refresh() {
-        _uiState.value = computeUiState()
+        _uiState.value = computeUiState().copy(banner = _uiState.value.banner)
         _expiryWarning.value = computeExpiryWarning()
     }
 
@@ -265,6 +270,16 @@ class ConversationViewModel(
         )
     }
 
+    /**
+     * Feeds the §12.4 project picker: the projects this install already
+     * tracks in the projection (the Bridge-authorized set).
+     */
+    fun setKnownProjects(projects: List<String>) {
+        if (_importState.value.projects != projects) {
+            _importState.value = _importState.value.copy(projects = projects)
+        }
+    }
+
     fun importConfirm(targetSessionId: String) {
         sendCommand(
             SessionImportCommand(
@@ -293,6 +308,17 @@ class ConversationViewModel(
                 is CoordinatorSignal.UpgradeRequired -> ConversationBanner.UPGRADE_REQUIRED
             },
         )
+    }
+
+    /**
+     * Clears the banner once its condition is resolved (e.g. the connection
+     * returned to CONNECTED after a §6.7 resync, or a re-login succeeded).
+     * Until then the banner persists across every [refresh].
+     */
+    fun clearBanner() {
+        if (_uiState.value.banner != null) {
+            _uiState.value = _uiState.value.copy(banner = null)
+        }
     }
 
     // -------------------------------------------------------------------
