@@ -1,0 +1,41 @@
+# claude-remote cloudflared tunnel configuration (spec §5, §10.1, §10.2).
+#
+# Rendered by deploy/scripts/render-cloudflared-config.ts from the same 0600
+# env file the launchd installer writes (~/Library/LaunchAgents/
+# dev.clauderemote.bridge.env, Task 34) plus the cloudflared/Access keys
+# (CF_TUNNEL_ID, CF_TUNNEL_CREDENTIALS_FILE, CF_ACCESS_SUBJECTS). Run:
+#
+#   cloudflared tunnel run --config <rendered config.yml>
+#
+# SECURITY INVARIANTS (enforced by the renderer and its tests — do not weaken
+# without updating deploy/scripts/render-cloudflared-config.test.ts):
+#
+#   1. Exactly ONE ingress hostname: the Bridge public host. The renderer
+#      refuses a second hostname, so cloudflared never gets a wildcard or a
+#      sibling domain mapping, and never a generic TCP forward. The only
+#      origin is the Bridge HTTP listener on 127.0.0.1 at the Bridge port.
+#   2. The ingress list ends with the mandatory catch-all that answers 404
+#      for every request not matching the hostname above.
+#   3. No origin-request tweaks: the origin is plain HTTP on loopback, so
+#      there is nothing to TLS-verify and no verification bypass may ever be
+#      introduced in this file.
+#   4. The Bridge itself stays bound to 127.0.0.1 (launchd plist, Task 34);
+#      stopping this tunnel removes all public reachability.
+#
+# Warnings:
+#   - Keep credentials-file readable only by this user (cloudflared tunnel
+#     create writes it 0600; do not relax that).
+#   - The Access application (rendered next to this file as access-app.json)
+#     must keep the exact-path bypass limited to /.well-known/assetlinks.json
+#     so Android App Link verification stays HTTPS-authenticated while every
+#     API route stays behind Cloudflare Access.
+#   - Cloudflare service tokens are never used anywhere in this deployment:
+#     authentication is per-device Access Managed OAuth (spec §10.2).
+tunnel: {{CF_TUNNEL_ID}}
+credentials-file: {{CF_TUNNEL_CREDENTIALS_FILE}}
+ingress:
+  # The single public hostname -> the loopback Bridge HTTP listener.
+  - hostname: {{BRIDGE_PUBLIC_HOST}}
+    service: http://127.0.0.1:{{BRIDGE_PORT}}
+  # Mandatory final catch-all: anything else answers 404.
+  - service: http_status:404

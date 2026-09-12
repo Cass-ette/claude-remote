@@ -13,6 +13,8 @@
     "deploy/scripts/env-file.ts",
     "deploy/scripts/install-launchd.ts",
     "deploy/scripts/uninstall-launchd.ts",
-    "deploy/scripts/install-launchd.test.ts"
+    "deploy/scripts/install-launchd.test.ts",
+    "deploy/scripts/render-cloudflared-config.ts",
+    "deploy/scripts/render-cloudflared-config.test.ts"
   ]
 }
