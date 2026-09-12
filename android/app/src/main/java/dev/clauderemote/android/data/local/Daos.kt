@@ -162,9 +162,14 @@ interface CheckpointDao {
     @Query("SELECT * FROM checkpoint_commit_pending LIMIT 1")
     fun getPendingCheckpoint(): CheckpointCommitPendingEntity?
 
-    /** Cleared only after session.snapshot.commit succeeds. */
-    @Query("DELETE FROM checkpoint_commit_pending")
-    fun clearPendingCheckpoint()
+    /**
+     * Cleared only after session.snapshot.commit succeeds — and only the row
+     * of the cycle that committed: a clear naming a different snapshotId
+     * (e.g. a row another session's cycle wrote meanwhile) must leave that
+     * row, and its ACK ceiling, intact.
+     */
+    @Query("DELETE FROM checkpoint_commit_pending WHERE snapshotId = :snapshotId")
+    fun clearPendingCheckpoint(snapshotId: String)
 }
 
 @Dao
@@ -186,6 +191,19 @@ interface PendingLiveEventDao {
             "WHERE sessionId = :sessionId AND eventId > :afterEventId"
     )
     fun deleteBufferedEvents(sessionId: String, afterEventId: Long): Int
+
+    /**
+     * Post-commit cleanup (§6.7): only the rows the committed checkpoint
+     * SUPERSEDES (eventId <= deliveryWatermark) are deleted. Rows above the
+     * watermark that could not be applied yet (a mid-window arrival behind a
+     * gap) are still un-ACKed and must survive for §8.5 redelivery — never
+     * clear the whole session buffer here.
+     */
+    @Query(
+        "DELETE FROM pending_live_events " +
+            "WHERE sessionId = :sessionId AND eventId <= :watermark"
+    )
+    fun deleteBufferedEventsUpTo(sessionId: String, watermark: Long): Int
 
     @Query("SELECT COUNT(*) FROM pending_live_events WHERE sessionId = :sessionId")
     fun countForSession(sessionId: String): Int

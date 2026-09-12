@@ -101,11 +101,35 @@ class EventReducer(
             }
             else -> {
                 applyTyped(daos, event)
-                daos.sessions.ackIfAfter(sessionId, eventId, now())
+                advanceCursor(daos, sessionId, eventId)
                 drainBuffered(daos, sessionId, eventId)
                 Outcome.APPLIED
             }
         }
+    }
+
+    /**
+     * §8.5 cursor advance. The sessions row IS the cursor's storage: for an
+     * unknown session whose first event is non-status (nothing upserts the
+     * row yet) ackIfAfter's UPDATE matches zero rows, the position never
+     * persists, and every reconnect replays from zero — a permanent wedge.
+     * A minimal row is created first so the cursor still advances; a later
+     * session.state.changed (or snapshot cycle) fills in the real fields.
+     */
+    private fun advanceCursor(daos: ProjectionDaos, sessionId: String, candidate: Long) {
+        if (daos.sessions.getBySessionId(sessionId) == null) {
+            daos.sessions.upsert(
+                SessionEntity(
+                    sessionId = sessionId,
+                    projectId = "",
+                    displayName = "",
+                    status = STATUS_UNKNOWN,
+                    lastAckEventId = null,
+                    updatedAt = now(),
+                ),
+            )
+        }
+        daos.sessions.ackIfAfter(sessionId, candidate, now())
     }
 
     /**
@@ -118,7 +142,7 @@ class EventReducer(
         while (remaining.firstOrNull()?.eventId == cursor + 1L) {
             val next = remaining.removeFirst()
             decodeEnvelope(next.envelopeJson)?.let { applyTyped(daos, it) }
-            daos.sessions.ackIfAfter(sessionId, next.eventId, now())
+            advanceCursor(daos, sessionId, next.eventId)
             cursor = next.eventId
         }
         remaining.forEach { daos.pendingEvents.bufferPendingEvent(it) }
@@ -604,6 +628,9 @@ class EventReducer(
         const val STATUS_PENDING = "pending"
         const val STATUS_RESOLVED = "resolved"
         const val STATUS_INTERRUPTED = "interrupted"
+
+        /** Placeholder lifecycle state of a minimal cursor row (§8.5). */
+        const val STATUS_UNKNOWN = "unknown"
 
         const val REVISION_LIVE = "live"
         const val FALLBACK_PREFIX = "streaming-assistant:"

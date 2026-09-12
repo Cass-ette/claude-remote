@@ -439,6 +439,38 @@ class EventReducerTest {
     }
 
     // -------------------------------------------------------------------
+    // 7b. Unknown session + non-status first event: cursor still advances
+    // -------------------------------------------------------------------
+
+    @Test
+    fun nonStatusFirstEventForUnknownSession_createsCursorRowAndAdvances() {
+        // NO sessions row at all (the session's first delivery is a delta,
+        // which upserts no session row): the cursor must still persist —
+        // otherwise every reconnect replays from zero and the session
+        // wedges (§8.5).
+        val outcome = reducer.apply(
+            daos,
+            event(1, "assistant.message.delta", """{"frame":{"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi"}}}"""),
+        )
+
+        assertEquals(EventReducer.Outcome.APPLIED, outcome)
+        val session = sessions.rows[SESSION_ID]
+        assertNotNull("a non-status first event still materializes a cursor row", session)
+        assertEquals(EventReducer.STATUS_UNKNOWN, session?.status)
+        assertEquals(1L, session?.lastAckEventId)
+        assertEquals("""[{"kind":"text","text":"Hi"}]""", messages.rows.values.single().contentJson)
+
+        // Continuity holds on the next event too (no duplicate/replay).
+        val second = reducer.apply(
+            daos,
+            event(2, "assistant.message.delta", """{"frame":{"type":"content_block_delta","delta":{"type":"text_delta","text":" there"}}}"""),
+        )
+        assertEquals(EventReducer.Outcome.APPLIED, second)
+        assertEquals(2L, sessions.rows[SESSION_ID]?.lastAckEventId)
+        assertEquals("""[{"kind":"text","text":"Hi there"}]""", messages.rows.values.single().contentJson)
+    }
+
+    // -------------------------------------------------------------------
     // 8. BridgeSnapshotApi wire mapping (dispatcher field names)
     // -------------------------------------------------------------------
 
@@ -690,6 +722,12 @@ private class FakePendingLiveEventDao : PendingLiveEventDao {
 
     override fun deleteBufferedEvents(sessionId: String, afterEventId: Long): Int {
         val doomed = rows.filter { it.sessionId == sessionId && it.eventId > afterEventId }
+        rows.removeAll(doomed.toSet())
+        return doomed.size
+    }
+
+    override fun deleteBufferedEventsUpTo(sessionId: String, watermark: Long): Int {
+        val doomed = rows.filter { it.sessionId == sessionId && it.eventId <= watermark }
         rows.removeAll(doomed.toSet())
         return doomed.size
     }

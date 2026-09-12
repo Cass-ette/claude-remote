@@ -5,6 +5,7 @@ import androidx.room.Room
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import dev.clauderemote.android.data.local.AppDatabase
+import dev.clauderemote.android.data.local.CheckpointCommitPendingEntity
 import dev.clauderemote.android.data.local.Migrations
 import dev.clauderemote.android.data.local.PendingLiveEventEntity
 import dev.clauderemote.android.data.local.SessionEntity
@@ -117,9 +118,21 @@ class SnapshotCoordinatorTest {
             nextCursor = "c1",
             commands = listOf(SnapshotCommandState("req-1", "message.send", "dispatched")),
             pendingPermission = PendingPermissionSnapshot(
-                payloadJson =
-                    """{"permissionRequestId":"pr-1","toolName":"Write","input":{"file_path":"/tmp/x"},"""" +
-                        """"requestedAt":"2026-09-03T09:59:00Z","expiresAt":"2026-09-03T10:01:00Z","displayCategory":"file_change"}""",
+                // The captured permission.requested payload, verbatim. Kept
+                // as one trimIndent raw string: splitting it across adjacent
+                // raw-string literals once produced `,""requestedAt"` (an
+                // unparseable double quote) and the coordinator's defensive
+                // parse skip silently dropped the permission projection.
+                payloadJson = """
+                    {
+                      "permissionRequestId": "pr-1",
+                      "toolName": "Write",
+                      "input": {"file_path": "/tmp/x"},
+                      "requestedAt": "2026-09-03T09:59:00Z",
+                      "expiresAt": "2026-09-03T10:01:00Z",
+                      "displayCategory": "file_change"
+                    }
+                """.trimIndent(),
                 remainingMs = 42_000,
             ),
         )
@@ -127,6 +140,7 @@ class SnapshotCoordinatorTest {
             items = listOf(historyItem("h2", "assistant", "hi there")),
             nextCursor = null,
         )
+        api.commitScript += { call -> commitResult(call) }
 
         runBlocking {
             val job = launch { coordinator.onResyncRequired(SESSION_ID) }
@@ -263,8 +277,11 @@ class SnapshotCoordinatorTest {
         val recovered = runBlocking { restarted.recoverPendingCheckpoints() }
 
         assertTrue(recovered)
-        assertEquals(1, api.commitCalls.size)
-        val retry = api.commitCalls.single()
+        // The crashed attempt AND the restart retry — the fake records every
+        // commit invocation, including the one that "died" mid-response.
+        assertEquals(2, api.commitCalls.size)
+        assertEquals(crashedKey, api.commitCalls.first().idempotencyKey)
+        val retry = api.commitCalls.last()
         assertEquals(crashedKey, retry.idempotencyKey)
         assertEquals("snap-1", retry.snapshotId)
         assertEquals("rev-1", retry.historyRevision)
@@ -353,6 +370,148 @@ class SnapshotCoordinatorTest {
         assertEquals("running", db.sessionDao().getBySessionId(SESSION_ID)?.status)
         assertEquals(1L, db.sessionDao().getBySessionId(SESSION_ID)?.lastAckEventId)
         assertEquals(listOf(SESSION_ID to 1L), acks.sent.toList())
+    }
+
+    // -------------------------------------------------------------------------
+    // 6. 410 while paging: rebuild from a fresh begin, nothing durable written
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun snapshotExpiredWhilePaging_rebuildsFromFreshBeginWithoutCommitting() {
+        db.sessionDao().upsert(session(status = "running", lastAckEventId = 95))
+        api.beginScript += beginResult(
+            snapshotId = "snap-1",
+            historyRevision = "rev-1",
+            deliveryBase = 100,
+            deliveryWatermark = 200,
+            items = listOf(historyItem("hA1", "user", "stale")),
+            nextCursor = "c1",
+        )
+        // The prepared snapshot expires between the first and second page:
+        // a 410 from page must trigger a fresh begin, never propagate.
+        api.pages["c1"] = SnapshotPageResult(
+            items = listOf(historyItem("hA2", "assistant", "stale 2")),
+            nextCursor = "c2",
+        )
+        api.pageErrors["c2"] = SnapshotExpiredError(retryable = true, "snapshot expired")
+        api.beginScript += beginResult(
+            snapshotId = "snap-2",
+            historyRevision = "rev-2",
+            deliveryBase = 100,
+            deliveryWatermark = 200,
+            items = listOf(historyItem("hB1", "user", "fresh")),
+        )
+        api.commitScript += { call -> commitResult(call) }
+
+        runBlocking { coordinator.onResyncRequired(SESSION_ID) }
+
+        // Only the rebuilt snapshot reached the projection and the commit:
+        // the expired cycle wrote NOTHING durable — no projection replace,
+        // no pending row, no commit.
+        assertEquals(listOf("hB1"), db.messageDao().getForSession(SESSION_ID).map { it.historyItemId })
+        assertEquals(1, api.commitCalls.size)
+        assertEquals("snap-2", api.commitCalls.single().snapshotId)
+        assertNull(db.checkpointDao().getPendingCheckpoint())
+        assertEquals(200L, db.sessionDao().getBySessionId(SESSION_ID)?.lastAckEventId)
+    }
+
+    @Test
+    fun snapshotExpiredWhilePaging_boundedByMaxCyclesPropagates() {
+        db.sessionDao().upsert(session(status = "running", lastAckEventId = 95))
+        repeat(SnapshotCoordinator.MAX_SNAPSHOT_CYCLES) { n ->
+            api.beginScript += beginResult(
+                snapshotId = "snap-$n",
+                historyRevision = "rev-$n",
+                deliveryBase = 100,
+                deliveryWatermark = 200,
+                nextCursor = "c-$n",
+            )
+            api.pageErrors["c-$n"] = SnapshotExpiredError(retryable = true, "snapshot expired")
+        }
+        var propagated: SnapshotExpiredError? = null
+        runBlocking {
+            try {
+                coordinator.onResyncRequired(SESSION_ID)
+            } catch (e: SnapshotExpiredError) {
+                propagated = e
+            }
+        }
+        assertNotNull("page 410s beyond MAX_SNAPSHOT_CYCLES must propagate", propagated)
+        assertEquals(0, api.commitCalls.size)
+        assertFalse(coordinator.isResyncing(SESSION_ID))
+    }
+
+    // -------------------------------------------------------------------------
+    // 7. Cross-session single-flight: never clobber another pending row
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun resyncRequired_refusesWhenAnotherSessionsCheckpointIsPending() {
+        db.checkpointDao().setPendingCheckpoint(
+            CheckpointCommitPendingEntity(
+                sessionId = OTHER_SESSION_ID,
+                snapshotId = "snap-other",
+                historyRevision = "rev-other",
+                deliveryBase = 10,
+                deliveryWatermark = 20,
+                idempotencyKey = "idem-other",
+                createdAt = now,
+            ),
+        )
+
+        var conflict: PendingCheckpointConflictException? = null
+        runBlocking {
+            try {
+                coordinator.onResyncRequired(SESSION_ID)
+            } catch (e: PendingCheckpointConflictException) {
+                conflict = e
+            }
+        }
+        assertNotNull("a second session's cycle must refuse, not clobber", conflict)
+        assertEquals(SESSION_ID, conflict?.requestedSessionId)
+        assertEquals(OTHER_SESSION_ID, conflict?.pendingSessionId)
+        // The other session's pending row (and its ACK ceiling) is intact,
+        // and no network cycle was started for this session.
+        assertEquals("snap-other", db.checkpointDao().getPendingCheckpoint()?.snapshotId)
+        assertEquals(0, api.commitCalls.size)
+        assertFalse(coordinator.isResyncing(SESSION_ID))
+    }
+
+    // -------------------------------------------------------------------------
+    // 8. Buffered event above the watermark survives the post-commit cleanup
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun bufferedEventAboveWatermarkBehindGap_survivesCommitCleanupAndAppliesWhenGapFills() {
+        db.sessionDao().upsert(session(status = "running", lastAckEventId = 95))
+        seedBuffer(deltaEvent(201, "Hel"))
+        seedBuffer(deltaEvent(202, "lo"))
+        // 203 is still in flight: a mid-window arrival at 204 must NOT be
+        // dropped by the post-commit buffer cleanup — only rows <= the
+        // committed watermark are superseded.
+        seedBuffer(deltaEvent(204, "!"))
+        api.beginScript += beginResult(
+            snapshotId = "snap-1",
+            historyRevision = "rev-1",
+            deliveryBase = 100,
+            deliveryWatermark = 200,
+            items = listOf(historyItem("h1", "user", "hello")),
+        )
+        api.commitScript += { call -> commitResult(call) }
+
+        runBlocking { coordinator.onResyncRequired(SESSION_ID) }
+
+        // 201/202 applied; 204 (> watermark, gap at 203) survived the cleanup.
+        assertEquals(1, db.pendingLiveEventDao().countForSession(SESSION_ID))
+        assertEquals(202L, db.sessionDao().getBySessionId(SESSION_ID)?.lastAckEventId)
+
+        // The gap fills (bridge redelivery of 203): the survivor drains and
+        // applies in eventId order — "Hel"+"lo"+""+"!".
+        runBlocking { repository.handleEvent(deltaEvent(203, "")) }
+        assertEquals(0, db.pendingLiveEventDao().countForSession(SESSION_ID))
+        val streaming = db.messageDao().getForSession(SESSION_ID).single { it.status == "streaming" }
+        assertEquals("""[{"kind":"text","text":"Hello!"}]""", streaming.contentJson)
+        assertEquals(204L, db.sessionDao().getBySessionId(SESSION_ID)?.lastAckEventId)
     }
 
     // -------------------------------------------------------------------------
@@ -446,6 +605,7 @@ class SnapshotCoordinatorTest {
 
     private companion object {
         const val SESSION_ID = "22222222-2222-4222-8222-222222222222"
+        const val OTHER_SESSION_ID = "33333333-3333-4333-8333-333333333333"
         const val TEST_DB_NAME = "snapshot-coordinator-test.db"
     }
 }
@@ -464,6 +624,7 @@ private class FakeSnapshotApi : SnapshotApi {
     val beginScript = ArrayDeque<SnapshotBeginResult>()
     val beginHooks = mutableMapOf<Int, suspend () -> Unit>()
     val pages = mutableMapOf<String, SnapshotPageResult>()
+    val pageErrors = mutableMapOf<String, Exception>()
     val commitScript = ArrayDeque<suspend (CommitCall) -> SnapshotCommitResult>()
     var pageHook: (suspend () -> Unit)? = null
     private var beginsServed = 0
@@ -476,6 +637,7 @@ private class FakeSnapshotApi : SnapshotApi {
 
     override suspend fun page(sessionId: String, cursor: String): SnapshotPageResult {
         pageHook?.invoke()
+        pageErrors[cursor]?.let { throw it }
         return pages.getValue(cursor)
     }
 

@@ -59,24 +59,50 @@ class SnapshotCoordinator(
 ) {
 
     /**
-     * Runs the full §6.7 recovery for one session (the 4410 path). On a
-     * 410 commit the cycle restarts from a fresh begin — the pending row
-     * pins the ACK ceiling at the OLD deliveryBase until the new cycle's
-     * transaction replaces it — bounded by [MAX_SNAPSHOT_CYCLES].
+     * Runs the full §6.7 recovery for one session (the 4410 path). On a 410 —
+     * while paging or on the commit — the cycle restarts from a fresh begin;
+     * until the new cycle's transaction replaces it, the pending row (if any)
+     * pins the ACK ceiling at the OLD deliveryBase. Restarts are bounded by
+     * [MAX_SNAPSHOT_CYCLES].
+     *
+     * @throws PendingCheckpointConflictException when a DIFFERENT session's
+     * checkpoint commit is still pending: the pending table is single-row,
+     * so a second cycle here would clobber that row. Recover the pending
+     * commit ([recoverPendingCheckpoints]) first.
      */
     suspend fun onResyncRequired(sessionId: String) {
+        val existing = withContext(io) { db.checkpointDao().getPendingCheckpoint() }
+        if (existing != null && existing.sessionId != sessionId) {
+            throw PendingCheckpointConflictException(
+                requestedSessionId = sessionId,
+                pendingSessionId = existing.sessionId,
+            )
+        }
         gate.begin(sessionId)
         try {
             var attempt = 0
             while (true) {
                 attempt += 1
-                val begin = api.begin(sessionId)
-                val items = ArrayList(begin.items)
-                var cursor = begin.nextCursor
-                while (cursor != null) {
-                    val page = api.page(sessionId, cursor)
-                    items.addAll(page.items)
-                    cursor = page.nextCursor
+                val begin: SnapshotBeginResult
+                val items: MutableList<SnapshotHistoryItem>
+                try {
+                    begin = api.begin(sessionId)
+                    items = ArrayList(begin.items)
+                    var cursor = begin.nextCursor
+                    while (cursor != null) {
+                        val page = api.page(sessionId, cursor)
+                        items.addAll(page.items)
+                        cursor = page.nextCursor
+                    }
+                } catch (e: SnapshotExpiredError) {
+                    // 410 while PREPARING (§6.7): the snapshot expired before
+                    // all pages arrived, so nothing durable was written this
+                    // cycle — a fresh begin rebuilds, bounded against expire
+                    // loops by MAX_SNAPSHOT_CYCLES. A previous cycle's pending
+                    // row (if any) survives as the ACK ceiling until the next
+                    // cycle's transaction replaces it.
+                    if (attempt >= MAX_SNAPSHOT_CYCLES) throw e
+                    continue
                 }
                 val idempotencyKey = newIdempotencyKey()
                 db.withTransaction { writeCheckpointProjection(sessionId, begin, items, idempotencyKey) }
@@ -95,7 +121,7 @@ class SnapshotCoordinator(
                     if (attempt >= MAX_SNAPSHOT_CYCLES) throw e
                     continue
                 }
-                withContext(io) { db.checkpointDao().clearPendingCheckpoint() }
+                withContext(io) { db.checkpointDao().clearPendingCheckpoint(begin.snapshotId) }
                 applyBuffered(sessionId, begin.deliveryWatermark)
                 return
             }
@@ -127,7 +153,7 @@ class SnapshotCoordinator(
                 onResyncRequired(pending.sessionId)
                 return true
             }
-            withContext(io) { db.checkpointDao().clearPendingCheckpoint() }
+            withContext(io) { db.checkpointDao().clearPendingCheckpoint(pending.snapshotId) }
             applyBuffered(pending.sessionId, pending.deliveryWatermark)
             return true
         } finally {
@@ -265,21 +291,31 @@ class SnapshotCoordinator(
 
     /**
      * Post-commit: apply the buffered live events above the watermark in
-     * eventId order, then drop the leftovers (everything at/below the
-     * watermark is superseded by the committed snapshot; anything the drain
-     * could not apply is still un-ACKed and will be redelivered — §8.5
-     * at-least-once covers the deletion).
+     * eventId order, in waves — an event buffered while a wave applies
+     * (mid-window arrival) is picked up by the next wave, so contiguous
+     * arrivals apply within this cycle. Afterwards drop ONLY the rows the
+     * committed checkpoint supersedes (<= watermark); anything above the
+     * watermark the drain could not apply (a mid-window arrival behind a
+     * gap) is still un-ACKed and must survive for §8.5 redelivery.
      */
     private suspend fun applyBuffered(sessionId: String, watermark: Long) {
-        val buffered = withContext(io) {
-            db.pendingLiveEventDao().takeBufferedEvents(sessionId, afterEventId = watermark)
+        var after = watermark
+        while (true) {
+            val buffered = withContext(io) {
+                db.pendingLiveEventDao().takeBufferedEvents(sessionId, afterEventId = after)
+            }
+            if (buffered.isEmpty()) break
+            val daos = daos()
+            for (row in buffered) {
+                val event = reducer.decodeEnvelope(row.envelopeJson) ?: continue
+                db.withTransaction { reducer.apply(daos, event) }
+            }
+            // Rows the reducer re-buffered (still behind a gap) or new
+            // arrivals below this bound are not re-taken; `after` strictly
+            // increases per non-empty wave, so the loop always terminates.
+            after = buffered.last().eventId
         }
-        val daos = daos()
-        for (row in buffered) {
-            val event = reducer.decodeEnvelope(row.envelopeJson) ?: continue
-            db.withTransaction { reducer.apply(daos, event) }
-        }
-        withContext(io) { db.pendingLiveEventDao().clearForSession(sessionId) }
+        withContext(io) { db.pendingLiveEventDao().deleteBufferedEventsUpTo(sessionId, watermark) }
         val cursor = withContext(io) { db.sessionDao().getBySessionId(sessionId)?.lastAckEventId } ?: return
         if (cursor > watermark) {
             acknowledge(sessionId, cursor)
@@ -298,6 +334,19 @@ class SnapshotCoordinator(
         const val MAX_SNAPSHOT_CYCLES = 3
     }
 }
+
+/**
+ * §6.7 single-flight violation: another session's prepared checkpoint is
+ * still pending. The pending table is single-row, so starting a cycle for a
+ * second session would clobber that row (and its ACK ceiling) — recover the
+ * pending commit first ([SnapshotCoordinator.recoverPendingCheckpoints]).
+ */
+class PendingCheckpointConflictException(
+    val requestedSessionId: String,
+    val pendingSessionId: String,
+) : IllegalStateException(
+    "cannot resync session $requestedSessionId: session $pendingSessionId still has an uncommitted checkpoint"
+)
 
 /**
  * Per-session re-entrant flag marking an in-flight §6.7 cycle. While held,

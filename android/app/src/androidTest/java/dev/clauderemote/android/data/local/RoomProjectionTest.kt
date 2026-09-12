@@ -180,9 +180,29 @@ class RoomProjectionTest {
         }
 
         // The ceiling lifts only once the pending row is cleared post-commit.
-        db.checkpointDao().clearPendingCheckpoint()
+        db.checkpointDao().clearPendingCheckpoint(snapshotId = "snap-1")
         assertTrue(db.sessionDao().ackGuarded(sessionId, candidate = 150, now = now))
         assertEquals(150L, db.sessionDao().getBySessionId(sessionId)?.lastAckEventId)
+    }
+
+    // -------------------------------------------------------------------------
+    // 4b. clearPendingCheckpoint deletes only the named cycle's row
+    // -------------------------------------------------------------------------
+
+    @Test
+    fun clearPendingCheckpointScopesToTheCycleSnapshotRow() {
+        db.checkpointDao().setPendingCheckpoint(pendingCheckpoint(snapshotId = "snap-A"))
+
+        // A clear naming a DIFFERENT snapshot (e.g. a cycle whose row was
+        // replaced mid-flight) must leave this row — and its ACK ceiling —
+        // alone: deleting unconditionally could clobber another session's
+        // prepared checkpoint.
+        db.checkpointDao().clearPendingCheckpoint(snapshotId = "snap-B")
+        assertEquals("snap-A", db.checkpointDao().getPendingCheckpoint()?.snapshotId)
+        assertFalse(db.sessionDao().ackGuarded(sessionId, candidate = 150, now = now))
+
+        db.checkpointDao().clearPendingCheckpoint(snapshotId = "snap-A")
+        assertNull(db.checkpointDao().getPendingCheckpoint())
     }
 
     // -------------------------------------------------------------------------
@@ -293,10 +313,11 @@ class RoomProjectionTest {
     private fun pendingCheckpoint(
         deliveryBase: Long = 100,
         deliveryWatermark: Long = 200,
+        snapshotId: String = "snap-1",
     ): CheckpointCommitPendingEntity =
         CheckpointCommitPendingEntity(
             sessionId = sessionId,
-            snapshotId = "snap-1",
+            snapshotId = snapshotId,
             historyRevision = "rev-1",
             deliveryBase = deliveryBase,
             deliveryWatermark = deliveryWatermark,
