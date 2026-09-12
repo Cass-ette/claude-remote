@@ -97,8 +97,11 @@ dependencies {
     // JVM unit tests.
     testImplementation(libs.junit)
 
-    // Instrumented tests (Room projection DAO contract tests).
+    // Instrumented tests (Room projection DAO contract tests, Compose UI).
     androidTestImplementation(libs.androidx.test.core)
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(platform(libs.compose.bom))
+    androidTestImplementation(libs.compose.ui.test.junit4)
+    debugImplementation(libs.compose.ui.test.manifest)
 }
