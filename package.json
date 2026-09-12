@@ -16,7 +16,8 @@
     "phase0:cloudflare": "tsx probes/cloudflare/run-real-gate.ts",
     "deploy:install-launchd": "tsx deploy/scripts/install-launchd.ts",
     "deploy:uninstall-launchd": "tsx deploy/scripts/uninstall-launchd.ts",
-    "deploy:render-cloudflared": "tsx deploy/scripts/render-cloudflared-config.ts"
+    "deploy:render-cloudflared": "tsx deploy/scripts/render-cloudflared-config.ts",
+    "deploy:preflight": "tsx deploy/scripts/preflight.ts"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

@@ -16,7 +16,11 @@
 //   4. Only ever writes under ~/Library/LaunchAgents — never /Library/
 //      LaunchDaemons (system-wide) and never as root.
 //   5. `launchctl bootstrap gui/$UID` runs only after the preflight gate
-//      passes (config validation + dist entry + executable node).
+//      passes: local checks (config validation + dist entry + executable
+//      node) plus the bridge admin CLI self-check spawned as
+//      `<node> <dist>/src/admin/cli.js admin preflight --json` (Task 36;
+//      loopback bind, data-dir mode/ownership, JWKS, plist containment,
+//      cloudflared, Access policy, loopback health probe).
 //
 // KeepAlive is { SuccessfulExit = false }: launchd restarts the job unless
 // the previous run exited 0. The Bridge exits 0 on graceful shutdown
@@ -116,7 +120,12 @@ export interface CommandResult {
 
 /** Injectable command runner so tests never invoke the real launchctl. */
 export interface CommandRunner {
-  run(command: string[]): Promise<CommandResult>;
+  /**
+   * Run one command. `env` (when given) replaces the child environment —
+   * used by the default preflight so BRIDGE_* values and Cloudflare secrets
+   * ride the environment, never argv.
+   */
+  run(command: string[], env?: NodeJS.ProcessEnv): Promise<CommandResult>;
 }
 
 export interface InstallOptions {
@@ -132,8 +141,10 @@ export interface InstallOptions {
   readonly dryRun?: boolean | undefined;
   /** Development escape hatch: skip the preflight gate. */
   readonly skipPreflight?: boolean | undefined;
-  /** Replace the built-in preflight (Task 36 wires the admin preflight). */
-  readonly preflight?: ((config: InstallConfig, paths: ResolvedPaths) => PreflightCheck[]) | undefined;
+  /** Replace the built-in preflight (async allowed; tests inject sync fakes). */
+  readonly preflight?:
+  | ((config: InstallConfig, paths: ResolvedPaths) => PreflightCheck[] | Promise<PreflightCheck[]>)
+  | undefined;
   /** Progress sink (default: console.log; tests silence it). */
   readonly log?: ((line: string) => void) | undefined;
 }
@@ -302,12 +313,7 @@ export function renderEnvFile(config: InstallConfig): string {
  * Pre-install gate on what exists today: validated config, built bridge dist
  * entry, executable absolute node. Cloudflare team domain + aud must be
  * both-set or both-unset (the bridge fails remote-access startup otherwise).
- *
- * TODO(Task 36): replace with the bridge admin preflight
- * (deploy/scripts/preflight.ts wired into bridge/src/admin/cli.ts), which
- * additionally checks JWKS reachability, data-dir mode/ownership, cloudflared,
- * and the loopback health endpoint. The installer keeps `--skip-preflight`
- * as the documented development escape hatch either way.
+ * Kept as the local half of {@link runBridgePreflight}.
  */
 export function runInstallerPreflight(config: InstallConfig, _paths: ResolvedPaths): PreflightCheck[] {
   const checks: PreflightCheck[] = [];
@@ -364,20 +370,142 @@ export function runInstallerPreflight(config: InstallConfig, _paths: ResolvedPat
 }
 
 // ---------------------------------------------------------------------------
+// Default preflight (Task 36): the bridge admin CLI self-check
+// ---------------------------------------------------------------------------
+
+/** JSON shape emitted by `bridge admin preflight --json` (stdout only). */
+interface BridgePreflightJson {
+  readonly ok?: unknown;
+  readonly failed?: unknown;
+  readonly checks?: unknown;
+}
+
+/** Derive the built admin CLI entry that sits next to the bridge main entry. */
+export function bridgeAdminCliFromMain(bridgeMain: string): string {
+  return join(dirname(bridgeMain), "admin", "cli.js");
+}
+
+function tail(text: string, maxLength = 300): string {
+  const trimmed = text.trim();
+  return trimmed === "" ? "" : trimmed.slice(-maxLength);
+}
+
+/**
+ * Default pre-install gate (implementation-plan Task 36): the installer's
+ * local checks PLUS the bridge admin CLI's full self-check, spawned as
+ *
+ *   <nodeBin> <bridgeMain-dir>/admin/cli.js admin preflight --json
+ *
+ * The child inherits the operator's environment (so CF_API_TOKEN /
+ * CF_ZONE_ID / CF_EXPECTED_SUBJECT / BRIDGE_CLOUDFLARE_TUNNEL_NAME may be
+ * provided for the optional Cloudflare checks) and receives the install
+ * config as BRIDGE_* variables, including BRIDGE_PLIST_PATH (containment
+ * verified on the bridge side too). Cloudflare secrets ride the child
+ * ENVIRONMENT — never argv, which is visible to every process listing.
+ * This gate never calls `launchctl bootstrap`; that stays the installer's
+ * last step.
+ */
+export async function runBridgePreflight(
+  config: InstallConfig,
+  paths: ResolvedPaths,
+  runner: CommandRunner,
+): Promise<PreflightCheck[]> {
+  const local = runInstallerPreflight(config, paths);
+
+  const adminCli = bridgeAdminCliFromMain(config.bridgeMain);
+  let adminOk = false;
+  try {
+    adminOk = statSync(adminCli).isFile();
+  } catch {
+    adminOk = false;
+  }
+  if (!adminOk) {
+    return [
+      ...local,
+      {
+        name: "bridge-admin-cli-dist-exists",
+        passed: false,
+        detail: `${adminCli} does not exist — build the bridge first (npm run build -w @claude-remote/bridge)`,
+      },
+    ];
+  }
+  if (local.some((check) => !check.passed)) {
+    // Node/dist-entry failures already block a meaningful spawn; report them.
+    return local;
+  }
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    BRIDGE_DATA_DIR: config.dataDir,
+    BRIDGE_HOST: config.host,
+    BRIDGE_PORT: String(config.port),
+    BRIDGE_MAIN: config.bridgeMain,
+    BRIDGE_NODE_BIN: config.nodeBin,
+    BRIDGE_PLIST_PATH: paths.plistPath,
+  };
+  if (config.cloudflareTeamDomain !== undefined) {
+    env.BRIDGE_CLOUDFLARE_TEAM_DOMAIN = config.cloudflareTeamDomain;
+  }
+  if (config.cloudflareAud !== undefined) {
+    env.BRIDGE_CLOUDFLARE_AUD = config.cloudflareAud;
+  }
+  if (config.publicHost !== undefined) {
+    env.BRIDGE_PUBLIC_HOST = config.publicHost;
+  }
+
+  const result = await runner.run([config.nodeBin, adminCli, "admin", "preflight", "--json"], env);
+
+  let report: BridgePreflightJson | undefined;
+  try {
+    report = JSON.parse(result.stdout) as BridgePreflightJson;
+  } catch {
+    report = undefined;
+  }
+  if (report === undefined || !Array.isArray(report.checks)) {
+    return [
+      ...local,
+      {
+        name: "bridge-preflight-report",
+        passed: false,
+        detail:
+          `admin preflight exited ${result.code} without a parsable JSON report` +
+          (result.stderr.trim() !== "" ? `: ${tail(result.stderr)}` : ""),
+      },
+    ];
+  }
+
+  const bridgeChecks: PreflightCheck[] = [];
+  for (const raw of report.checks) {
+    if (raw === null || typeof raw !== "object") continue;
+    const check = raw as { name?: unknown; passed?: unknown; details?: unknown };
+    if (typeof check.name !== "string") continue;
+    bridgeChecks.push({
+      name: check.name,
+      passed: check.passed === true,
+      detail: typeof check.details === "string" ? check.details : "",
+    });
+  }
+  return [...local, ...bridgeChecks];
+}
+
+// ---------------------------------------------------------------------------
 // Runner + install orchestration
 // ---------------------------------------------------------------------------
 
 /** Real runner: absolute /bin/launchctl, never resolved from PATH. */
 export function createRealRunner(): CommandRunner {
   return {
-    run: (command) =>
+    run: (command, env) =>
       new Promise<CommandResult>((resolveRun) => {
         const bin = command[0];
         if (bin === undefined || bin === "") {
           resolveRun({ code: 1, stdout: "", stderr: "internal error: empty command" });
           return;
         }
-        const child = spawn(bin, command.slice(1), { stdio: ["ignore", "pipe", "pipe"] });
+        const child = spawn(bin, command.slice(1), {
+          stdio: ["ignore", "pipe", "pipe"],
+          ...(env === undefined ? {} : { env }),
+        });
         let stdout = "";
         let stderr = "";
         child.stdout?.on("data", (chunk: Buffer) => (stdout += String(chunk)));
@@ -408,12 +536,16 @@ export async function install(config: InstallConfig, options: InstallOptions = {
   const log = options.log ?? (() => {});
   const uid = requireUid(options.uid);
   const bootstrapCommand = ["/bin/launchctl", "bootstrap", `gui/${uid}`, paths.plistPath];
+  const runner = options.runner ?? createRealRunner();
 
   if (options.skipPreflight === true) {
     log("WARNING: --skip-preflight — running without the preflight gate (development only).");
   } else {
-    const preflight = options.preflight ?? runInstallerPreflight;
-    const failed = preflight(config, paths).filter((check) => !check.passed);
+    // Default gate (Task 36): local installer checks + the bridge admin
+    // CLI's self-check spawned through the same injectable runner.
+    const preflight =
+      options.preflight ?? ((cfg: InstallConfig, p: ResolvedPaths) => runBridgePreflight(cfg, p, runner));
+    const failed = (await preflight(config, paths)).filter((check) => !check.passed);
     if (failed.length > 0) {
       throw new InstallError(
         "preflight_failed",
@@ -453,7 +585,6 @@ export async function install(config: InstallConfig, options: InstallOptions = {
     chmodSync(logFile, 0o600);
   }
 
-  const runner = options.runner ?? createRealRunner();
   const bootstrap = await runner.run(bootstrapCommand);
   if (bootstrap.code !== 0) {
     throw new InstallError(

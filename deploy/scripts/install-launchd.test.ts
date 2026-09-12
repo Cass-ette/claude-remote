@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -14,6 +14,7 @@ import {
   renderPlist,
   resolvePaths,
   resolvePlistTarget,
+  runBridgePreflight,
   runInstallerPreflight,
   type InstallConfig,
 } from "./install-launchd.js";
@@ -46,8 +47,10 @@ function fixtureConfig(home: string): InstallConfig {
   chmodSync(nodeBin, 0o755);
 
   const bridgeMain = join(home, "repo", "bridge", "dist", "src", "main.js");
-  mkdirSync(join(home, "repo", "bridge", "dist", "src"), { recursive: true });
+  const adminCli = join(home, "repo", "bridge", "dist", "src", "admin", "cli.js");
+  mkdirSync(join(home, "repo", "bridge", "dist", "src", "admin"), { recursive: true });
   writeFileSync(bridgeMain, "// dist entry\n");
+  writeFileSync(adminCli, "// admin cli dist entry\n");
 
   const dataDir = join(home, "Library", "Application Support", "claude-remote");
   return normalizeInstallConfig({
@@ -77,21 +80,39 @@ function plistStrings(xml: string): Map<string, string> {
 
 interface FakeRunner {
   calls: string[][];
+  /** Captured child env for each run (undefined = default inherit). */
+  envs: Array<NodeJS.ProcessEnv | undefined>;
   runner: CommandRunner;
 }
 
+/** Ok report the fake runner returns for the spawned bridge preflight. */
+const PASSING_BRIDGE_PREFLIGHT = {
+  code: 0,
+  stdout: JSON.stringify({
+    ok: true,
+    failed: 0,
+    checks: [{ name: "loopback-bind", passed: true, status: "pass", details: "BRIDGE_HOST=127.0.0.1 (loopback only)" }],
+  }),
+  stderr: "",
+};
+
 function fakeRunner(failures: Array<{ match: (cmd: string[]) => boolean; stderr: string }> = []): FakeRunner {
   const calls: string[][] = [];
+  const envs: Array<NodeJS.ProcessEnv | undefined> = [];
   const runner: CommandRunner = {
-    async run(command) {
+    async run(command, env) {
       calls.push(command);
+      envs.push(env);
+      if (command.includes("preflight")) {
+        return PASSING_BRIDGE_PREFLIGHT;
+      }
       for (const failure of failures) {
         if (failure.match(command)) return { code: 1, stdout: "", stderr: failure.stderr };
       }
       return { code: 0, stdout: "", stderr: "" };
     },
   };
-  return { calls, runner };
+  return { calls, envs, runner };
 }
 
 function modeOf(path: string): number {
@@ -329,7 +350,9 @@ describe("install", () => {
     expect(modeOf(join(config.dataDir, "logs", "bridge.out.log"))).toBe(0o600);
     expect(modeOf(join(config.dataDir, "logs", "bridge.err.log"))).toBe(0o600);
 
-    expect(calls).toEqual([["/bin/launchctl", "bootstrap", "gui/501", plistPath]]);
+    // The preflight spawn precedes bootstrap (dry-run of the gate itself).
+    expect(calls).toHaveLength(2);
+    expect(calls[1]).toEqual(["/bin/launchctl", "bootstrap", "gui/501", plistPath]);
   });
 
   it("--dry-run writes nothing and never calls launchctl", async () => {
@@ -338,7 +361,7 @@ describe("install", () => {
     const { calls, runner } = fakeRunner();
     const result = await install(config, { homeDir: home, runner, uid: 501, dryRun: true });
     expect(result.dryRun).toBe(true);
-    expect(calls).toEqual([]);
+    expect(calls.some((cmd) => cmd[0] === "/bin/launchctl")).toBe(false);
     expect(existsSync(join(home, "Library", "LaunchAgents", PLIST_FILENAME))).toBe(false);
     expect(existsSync(join(config.dataDir, "logs"))).toBe(false);
   });
@@ -359,6 +382,150 @@ describe("install", () => {
     await expect(
       install(config, { homeDir: home, runner, uid: 501, plistDirOverride: "/Library/LaunchDaemons" }),
     ).rejects.toMatchObject({ code: "PLIST_TARGET_OUTSIDE_LAUNCHAGENTS" });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Task 36 — the default preflight spawns the bridge admin CLI self-check
+// ---------------------------------------------------------------------------
+
+describe("runBridgePreflight (default gate)", () => {
+  it("spawns <node> <dist>/src/admin/cli.js admin preflight --json with the config in the child env", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    const paths = resolvePaths({ homeDir: home, dataDir: config.dataDir });
+    const { calls, envs, runner } = fakeRunner();
+
+    const checks = await runBridgePreflight(config, paths, runner);
+    expect(checks.every((check) => check.passed)).toBe(true);
+
+    const adminCli = join(home, "repo", "bridge", "dist", "src", "admin", "cli.js");
+    expect(calls).toEqual([[config.nodeBin, adminCli, "admin", "preflight", "--json"]]);
+    const childEnv = envs[0];
+    expect(childEnv?.BRIDGE_DATA_DIR).toBe(config.dataDir);
+    expect(childEnv?.BRIDGE_HOST).toBe("127.0.0.1");
+    expect(childEnv?.BRIDGE_PORT).toBe("43111");
+    expect(childEnv?.BRIDGE_MAIN).toBe(config.bridgeMain);
+    expect(childEnv?.BRIDGE_NODE_BIN).toBe(config.nodeBin);
+    expect(childEnv?.BRIDGE_PLIST_PATH).toBe(paths.plistPath);
+    expect(childEnv?.BRIDGE_CLOUDFLARE_TEAM_DOMAIN).toBe("myteam.cloudflareaccess.com");
+    expect(childEnv?.BRIDGE_CLOUDFLARE_AUD).toBe("0e9a5b2f7dbf4e1b9a17d8e0c3f2a1b0");
+    // SECURITY: secrets ride the environment, never argv.
+    const argv = calls[0]?.join(" ") ?? "";
+    expect(argv).not.toContain("myteam.cloudflareaccess.com");
+    expect(argv).not.toContain("0e9a5b2f7dbf4e1b9a17d8e0c3f2a1b0");
+  });
+
+  it("maps the child JSON report into typed checks, preserving failures", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    const paths = resolvePaths({ homeDir: home, dataDir: config.dataDir });
+    const runner: CommandRunner = {
+      async run() {
+        return {
+          code: 1,
+          stdout: JSON.stringify({
+            ok: false,
+            failed: 1,
+            checks: [
+              { name: "loopback-bind", passed: true, status: "pass", details: "BRIDGE_HOST=127.0.0.1" },
+              { name: "data-dir", passed: false, status: "fail", details: "has mode 755, expected 0700" },
+              { name: "cloudflare-jwks", passed: true, status: "info", details: "not set" },
+            ],
+          }),
+          stderr: "",
+        };
+      },
+    };
+    const checks = await runBridgePreflight(config, paths, runner);
+    const byName = new Map(checks.map((check) => [check.name, check]));
+    expect(byName.get("loopback-bind")).toMatchObject({ passed: true, detail: "BRIDGE_HOST=127.0.0.1" });
+    expect(byName.get("data-dir")).toMatchObject({ passed: false, detail: expect.stringContaining("expected 0700") });
+    expect(byName.get("cloudflare-jwks")).toMatchObject({ passed: true });
+    expect(checks.some((check) => check.name === "node-bin-absolute-executable")).toBe(true);
+  });
+
+  it("fails closed when the child emits no parsable JSON", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    const paths = resolvePaths({ homeDir: home, dataDir: config.dataDir });
+    const runner: CommandRunner = {
+      async run() {
+        return { code: 1, stdout: "not json at all", stderr: "boom" };
+      },
+    };
+    const checks = await runBridgePreflight(config, paths, runner);
+    const report = checks.find((check) => check.name === "bridge-preflight-report");
+    expect(report?.passed).toBe(false);
+    expect(report?.detail).toContain("exited 1");
+  });
+
+  it("fails when the admin CLI dist entry is missing (build first)", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    rmSync(join(home, "repo", "bridge", "dist", "src", "admin"), { recursive: true, force: true });
+    const paths = resolvePaths({ homeDir: home, dataDir: config.dataDir });
+    const { calls, runner } = fakeRunner();
+    const checks = await runBridgePreflight(config, paths, runner);
+    expect(checks.find((check) => check.name === "bridge-admin-cli-dist-exists")?.passed).toBe(false);
+    expect(calls).toEqual([]);
+  });
+});
+
+describe("install preflight wiring", () => {
+  it("runs the spawned bridge preflight through the injected runner before bootstrap", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    const { calls, envs, runner } = fakeRunner();
+    await install(config, { homeDir: home, runner, uid: 501 });
+
+    const adminCli = join(home, "repo", "bridge", "dist", "src", "admin", "cli.js");
+    expect(calls[0]).toEqual([config.nodeBin, adminCli, "admin", "preflight", "--json"]);
+    expect(calls[1]).toEqual(["/bin/launchctl", "bootstrap", "gui/501", join(home, "Library", "LaunchAgents", PLIST_FILENAME)]);
+    expect(envs[0]?.BRIDGE_PLIST_PATH).toBe(join(home, "Library", "LaunchAgents", PLIST_FILENAME));
+    expect(envs[1]).toBeUndefined();
+  });
+
+  it("refuses to write files or bootstrap when the bridge preflight fails", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    const runner: CommandRunner = {
+      async run() {
+        return {
+          code: 1,
+          stdout: JSON.stringify({
+            ok: false,
+            failed: 1,
+            checks: [{ name: "data-dir", passed: false, status: "fail", details: "has mode 755, expected 0700" }],
+          }),
+          stderr: "",
+        };
+      },
+    };
+    await expect(install(config, { homeDir: home, runner, uid: 501 })).rejects.toMatchObject({
+      code: "preflight_failed",
+      message: expect.stringContaining("data-dir"),
+    });
+    expect(existsSync(join(home, "Library", "LaunchAgents", PLIST_FILENAME))).toBe(false);
+  });
+
+  it("still honors the injected preflight seam and --skip-preflight", async () => {
+    const home = scratchHome();
+    const config = fixtureConfig(home);
+    const injected: string[] = [];
+    const { calls, runner } = fakeRunner();
+    await install(config, {
+      homeDir: home,
+      runner,
+      uid: 501,
+      preflight: (_config, paths) => {
+        injected.push(paths.plistPath);
+        return [];
+      },
+    });
+    expect(injected).toEqual([join(home, "Library", "LaunchAgents", PLIST_FILENAME)]);
+    // Only bootstrap ran — the injected gate replaced the spawn.
+    expect(calls).toEqual([["/bin/launchctl", "bootstrap", "gui/501", join(home, "Library", "LaunchAgents", PLIST_FILENAME)]]);
   });
 });
 

@@ -28,7 +28,6 @@
  *   never written to the audit trail.
  * - Every mutating admin operation writes an `admin.*` audit event.
  */
-import { statSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { Command, CommanderError } from "commander";
 import * as qrcodeTerminalModule from "qrcode-terminal";
@@ -38,12 +37,25 @@ import { defaultJwksFetcher, type JwksFetcher } from "../auth/access-jwt-verifie
 import { createDeviceAuth, type DeviceAuth } from "../auth/device-auth.js";
 import { createAuditLog, type AuditLog } from "../audit/audit-log.js";
 import { createProjectRegistry, type ProjectRegistry } from "../projects/project-registry.js";
+import {
+  resolvePreflightDeps,
+  runPreflight,
+  type AccessAppsFetcher,
+  type BridgeHealthProber,
+  type PreflightCommandRunner,
+} from "./preflight.js";
 
-/** Operator-facing failure: printed as `error: <message>` with a nonzero exit. */
+/**
+ * Operator-facing failure: printed as `error: <message>` with a nonzero exit.
+ * `silent` suppresses that line — used by `preflight --json` so stdout stays
+ * a single parsable JSON document even on failure (the report itself carries
+ * the failure detail; the installer parses stdout).
+ */
 export class AdminCommandError extends Error {
   constructor(
     message: string,
     readonly exitCode = 1,
+    readonly silent = false,
   ) {
     super(message);
     this.name = "AdminCommandError";
@@ -71,6 +83,25 @@ export interface AdminCliDeps {
   readonly createAudit: (db: SqliteDatabase, filePath: string, now: () => number) => AuditLog;
   /** JWKS fetcher used by `preflight` (Cloudflare Access certs endpoint). */
   readonly fetchJwks: JwksFetcher;
+  /**
+   * Preflight-only seams (Task 36); all optional and defaulted to the real
+   * implementations by resolvePreflightDeps so existing constructors stay
+   * valid. See ./preflight.ts.
+   */
+  /** Command runner for the cloudflared tunnel check (default: real spawn). */
+  readonly runCommand?: PreflightCommandRunner | undefined;
+  /** Cloudflare Access apps fetcher for the identity-policy check (default: real API). */
+  readonly fetchAccessApps?: AccessAppsFetcher | undefined;
+  /** Bridge health prober (default: spawn the built entry, one GET, SIGTERM). */
+  readonly probeBridgeHealth?: BridgeHealthProber | undefined;
+  /** Stat seam for the data-dir mode/ownership check (default: fs.statSync). */
+  readonly statDataDir?: ((dataDir: string) => { mode: number; uid: number }) | undefined;
+  /** uid seam for the ownership check (default: process.getuid). */
+  readonly getuid?: (() => number) | undefined;
+  /** Home directory anchoring the plist-path containment check (default: os.homedir). */
+  readonly homeDir?: string | undefined;
+  /** Health probe timeout in milliseconds (default: 15000). */
+  readonly healthTimeoutMs?: number | undefined;
   /** Renders the pairing payload as printable text (the QR block). */
   readonly renderQr: (payload: string) => string;
   /** Single output sink for every line the CLI prints. */
@@ -346,108 +377,37 @@ export function buildAdminProgram(deps: AdminCliDeps): Command {
 
   admin
     .command("preflight")
-    .description("check loopback bind, data dir, database, audit log, and Cloudflare Access JWKS reachability")
-    .action(async () => {
-      let failures = 0;
-      const report = (ok: boolean, name: string, info: string): void => {
-        failures += ok ? 0 : 1;
-        deps.write(`${ok ? "PASS" : "FAIL"}  ${name}: ${info}\n`);
-      };
-
-      // 1. Loopback-only bind (loadConfig refuses any non-loopback BRIDGE_HOST
-      //    and requires BRIDGE_DATA_DIR). Every later check needs the config.
-      let config: BridgeConfig;
-      try {
-        config = loadConfig(deps.env);
-        report(
-          true,
-          "loopback-bind",
-          `BRIDGE_HOST=${config.host} (loopback only), port ${config.port}`,
-        );
-      } catch (error) {
-        report(false, "loopback-bind", (error as Error).message);
-        throw new AdminCommandError("preflight failed: configuration is invalid; later checks skipped");
-      }
-
-      // 2. Data dir exists with exactly 0700. Report only — never chmod.
-      try {
-        const mode = statSync(config.dataDir).mode & 0o777;
-        if (mode === 0o700) {
-          report(true, "data-dir", `${config.dataDir} (mode 0700)`);
-        } else {
-          report(
-            false,
-            "data-dir",
-            `${config.dataDir} has mode ${mode.toString(8).padStart(3, "0")}, expected 0700`,
-          );
-        }
-      } catch (error) {
-        report(false, "data-dir", `cannot stat ${config.dataDir}: ${(error as Error).message}`);
-      }
-
-      // 3. Database opens and migrates cleanly.
-      let db: SqliteDatabase | undefined;
-      try {
-        db = deps.openDb(config.databasePath);
-        report(true, "database", `${config.databasePath} opens and migrates cleanly`);
-      } catch (error) {
-        report(false, "database", (error as Error).message);
-      }
-
-      // 4. Audit log opens (creating/rotating is its own concern; no probe write).
-      if (db === undefined) {
-        deps.write("INFO  audit-log: skipped (database unavailable)\n");
-      } else {
-        try {
-          deps.createAudit(db, config.auditLogPath, deps.now);
-          report(true, "audit-log", `${config.auditLogPath} opens (0600, rotating)`);
-        } catch (error) {
-          report(false, "audit-log", (error as Error).message);
-        } finally {
-          db.close();
-        }
-      }
-
-      // 5. Cloudflare Access JWKS reachability — only when Access is
-      //    configured. The check reports reachable/unreachable and never
-      //    logs assertion contents (it only fetches the public certs URL).
-      if (config.cloudflareTeamDomain === undefined) {
-        deps.write(
-          "INFO  cloudflare-jwks: BRIDGE_CLOUDFLARE_TEAM_DOMAIN not set (local-only bridge); check skipped\n",
-        );
-      } else if (config.cloudflareAud === undefined) {
-        report(
-          false,
-          "cloudflare-jwks",
-          "BRIDGE_CLOUDFLARE_TEAM_DOMAIN is set without BRIDGE_CLOUDFLARE_AUD; " +
-            "both are required for Access assertion verification",
-        );
-      } else {
-        try {
-          await deps.fetchJwks(config.cloudflareTeamDomain);
-          report(
+    .description(
+      "self-check before exposing the bridge: loopback bind, data dir (mode+owner), database, " +
+        "audit log, Cloudflare Access JWKS, launchd plist containment, cloudflared tunnel, " +
+        "Access identity policy, and a loopback /api/v1/health probe of the built entry",
+    )
+    .option("--json", "emit the structured report as a single JSON document (for the launchd installer)")
+    .action(async (options: { json?: boolean }) => {
+      const preflightReport = await runPreflight(resolvePreflightDeps(deps));
+      if (options.json === true) {
+        // Machine mode: stdout is exactly one JSON document — no trailing
+        // error line, secrets never appear in check details.
+        deps.write(`${JSON.stringify(preflightReport, null, 2)}\n`);
+        if (!preflightReport.ok) {
+          throw new AdminCommandError(
+            `preflight failed: ${preflightReport.failed} check(s) failed`,
+            1,
             true,
-            "cloudflare-jwks",
-            `https://${config.cloudflareTeamDomain}/cdn-cgi/access/certs reachable`,
           );
-        } catch (error) {
-          report(false, "cloudflare-jwks", `JWKS unreachable: ${(error as Error).message}`);
         }
+        return;
       }
-
-      // 6. Tunnel-only exposure: derived from the loopback config above
-      //    (the bridge itself can never expose a non-loopback interface).
-      //    Verifying the DEPLOYMENT (connector config, DNS, LAN exposure)
-      //    is Task 36's deploy-time preflight.
-      report(
-        true,
-        "tunnel-only",
-        "bridge binds loopback only; remote exposure must come from the external " +
-          "Cloudflare Tunnel (deploy-time verification: Task 36)",
-      );
-
-      if (failures > 0) {
-        throw new AdminCommandError(`preflight failed: ${failures} check(s) failed`);
+      const label = { pass: "PASS", fail: "FAIL", info: "INFO" } as const;
+      for (const check of preflightReport.checks) {
+        deps.write(`${label[check.status]}  ${check.name}: ${check.details}\n`);
+      }
+      if (!preflightReport.ok) {
+        const reason =
+          preflightReport.fatal !== undefined
+            ? preflightReport.fatal
+            : `${preflightReport.failed} check(s) failed`;
+        throw new AdminCommandError(`preflight failed: ${reason}`);
       }
     });
 
@@ -478,7 +438,9 @@ export async function runAdminCli(
     return 0;
   } catch (error) {
     if (error instanceof AdminCommandError) {
-      deps.write(`error: ${error.message}\n`);
+      if (!error.silent) {
+        deps.write(`error: ${error.message}\n`);
+      }
       return error.exitCode;
     }
     if (error instanceof CommanderError) {
