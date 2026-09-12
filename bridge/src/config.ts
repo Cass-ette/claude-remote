@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { mkdirSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { normalizeTeamDomain } from "./auth/access-jwt-verifier.js";
@@ -121,6 +121,70 @@ function readString(env: EnvSource, key: string): string | undefined {
   return trimmed === "" ? undefined : trimmed;
 }
 
+/**
+ * Parse dotenv-style KEY=VALUE text (the 0600 env file written by the
+ * launchd installer, Task 34). One assignment per line; `#` comments and
+ * blank/malformed lines are skipped; surrounding single/double quotes on the
+ * value are stripped. No interpolation.
+ */
+export function parseEnvFileContents(text: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line === "" || line.startsWith("#")) continue;
+    const eq = line.indexOf("=");
+    if (eq <= 0) continue;
+    const key = line.slice(0, eq).trim();
+    const rawValue = line.slice(eq + 1).trim();
+    let value = rawValue;
+    if (rawValue.length >= 2) {
+      for (const quote of ['"', "'"]) {
+        if (rawValue.startsWith(quote) && rawValue.endsWith(quote)) {
+          value = rawValue.slice(1, -1);
+        }
+      }
+    }
+    if (key !== "") out[key] = value;
+  }
+  return out;
+}
+
+/**
+ * Layer BRIDGE_ENV_FILE under the given environment source (Task 34): the
+ * launchd plist is mode 0644 and must carry only non-secret env inline, so
+ * Cloudflare Access secrets live in a sibling 0600 file referenced via
+ * BRIDGE_ENV_FILE. Real environment entries always win over file entries,
+ * and empty-string env entries count as unset (same as readString).
+ *
+ * The file must be an absolute path, must exist, and must not be readable or
+ * writable by group/others — it carries secrets.
+ */
+function layerEnvFile(env: EnvSource): EnvSource {
+  const envFile = readString(env, "BRIDGE_ENV_FILE");
+  if (envFile === undefined) return env;
+  if (!isAbsolute(envFile)) {
+    throw new Error(`BRIDGE_ENV_FILE must be an absolute path; got ${JSON.stringify(envFile)}.`);
+  }
+  let stats;
+  try {
+    stats = statSync(envFile);
+  } catch {
+    throw new Error(`BRIDGE_ENV_FILE points at a missing or unreadable file: ${envFile}`);
+  }
+  if ((stats.mode & 0o077) !== 0) {
+    throw new Error(
+      `BRIDGE_ENV_FILE must not be readable or writable by group/others (expected mode 0600 or stronger); ` +
+        `got mode 0${(stats.mode & 0o777).toString(8)} for ${envFile}.`,
+    );
+  }
+  const fromFile = parseEnvFileContents(readFileSync(envFile, "utf8"));
+  const merged: Record<string, string> = { ...fromFile };
+  for (const [key, value] of Object.entries(env)) {
+    if (typeof value === "string" && value.trim() !== "") merged[key] = value;
+  }
+  return merged;
+}
+
 function parseHost(env: EnvSource): "127.0.0.1" | "::1" {
   const host = readString(env, "BRIDGE_HOST") ?? DEFAULT_BRIDGE_HOST;
   if (!LOOPBACK_HOSTS.has(host)) {
@@ -232,21 +296,24 @@ function parseCloudflareTeamDomain(env: EnvSource): string | undefined {
 /**
  * Validate environment variables and produce an immutable
  * {@link BridgeConfig}. Creates {@link BRIDGE_DATA_DIR} recursively with
- * owner-only permissions after validation succeeds.
+ * owner-only permissions after validation succeeds. When BRIDGE_ENV_FILE is
+ * set, its dotenv-style contents are layered UNDER the passed environment
+ * ({@link layerEnvFile}) before validation.
  */
 export function loadConfig(env: EnvSource): BridgeConfig {
-  const host = parseHost(env);
-  const port = parsePort(env);
-  const dataDir = parseDataDir(env);
-  const pendingEventsByteBudget = parsePendingEventsByteBudget(env);
-  const claudeBin = readString(env, "BRIDGE_CLAUDE_BIN");
-  const permissionAdapterEntry = parseOptionalAbsolutePath(env, "BRIDGE_PERMISSION_ADAPTER_ENTRY");
-  const permissionTimeoutSeconds = parsePermissionTimeoutSeconds(env);
-  const cloudflareTeamDomain = parseCloudflareTeamDomain(env);
-  const cloudflareAud = readString(env, "BRIDGE_CLOUDFLARE_AUD");
-  const deviceSessionTtlSeconds = parseDeviceSessionTtlSeconds(env);
-  const publicHost = readString(env, "BRIDGE_PUBLIC_HOST");
-  const claudeConfigDir = parseClaudeConfigDir(env);
+  const source = layerEnvFile(env);
+  const host = parseHost(source);
+  const port = parsePort(source);
+  const dataDir = parseDataDir(source);
+  const pendingEventsByteBudget = parsePendingEventsByteBudget(source);
+  const claudeBin = readString(source, "BRIDGE_CLAUDE_BIN");
+  const permissionAdapterEntry = parseOptionalAbsolutePath(source, "BRIDGE_PERMISSION_ADAPTER_ENTRY");
+  const permissionTimeoutSeconds = parsePermissionTimeoutSeconds(source);
+  const cloudflareTeamDomain = parseCloudflareTeamDomain(source);
+  const cloudflareAud = readString(source, "BRIDGE_CLOUDFLARE_AUD");
+  const deviceSessionTtlSeconds = parseDeviceSessionTtlSeconds(source);
+  const publicHost = readString(source, "BRIDGE_PUBLIC_HOST");
+  const claudeConfigDir = parseClaudeConfigDir(source);
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
 

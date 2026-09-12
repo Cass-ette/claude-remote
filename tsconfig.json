@@ -9,6 +9,10 @@
     "probes/run-phase0.test.ts",
     "probes/cloudflare/run-real-gate.ts",
     "probes/cloudflare/map-outcome.ts",
-    "probes/cloudflare/test/map-outcome.test.ts"
+    "probes/cloudflare/test/map-outcome.test.ts",
+    "deploy/scripts/env-file.ts",
+    "deploy/scripts/install-launchd.ts",
+    "deploy/scripts/uninstall-launchd.ts",
+    "deploy/scripts/install-launchd.test.ts"
   ]
 }

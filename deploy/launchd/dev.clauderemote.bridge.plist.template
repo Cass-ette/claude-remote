@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  claude-remote Bridge user LaunchAgent (spec §5, §10.1, §10.6).
+
+  SECURITY INVARIANTS (enforced by deploy/scripts/install-launchd.ts and its
+  tests — do not weaken without updating them):
+
+  1. NO Sockets/Listeners keys. launchd must never open a socket on the
+     Bridge's behalf; the Bridge process itself binds 127.0.0.1 only and
+     remote reachability comes exclusively from the externally managed
+     Cloudflare Tunnel connector (a separate user process).
+  2. This is a per-user LaunchAgent under ~/Library/LaunchAgents — never a
+     system-wide LaunchDaemon, so the Bridge never runs as root.
+  3. Only NON-secret environment lives inline here (the plist is mode 0644,
+     readable by other local users). Cloudflare Access secrets
+     (BRIDGE_CLOUDFLARE_TEAM_DOMAIN / BRIDGE_CLOUDFLARE_AUD / …) stay in the
+     sibling {{ENV_FILENAME}} file (mode 0600), pointed at by BRIDGE_ENV_FILE;
+     the Bridge loads that file at boot (bridge/src/config.ts).
+  4. ProgramArguments uses the ABSOLUTE node path captured at install time —
+     launchd agents do not inherit the user's shell PATH.
+
+  KeepAlive semantics: { SuccessfulExit = false } restarts the job unless the
+  previous run exited 0. The Bridge exits 0 on graceful shutdown (SIGTERM
+  handled per §11.5), so an intentional stop stays stopped, while a crash
+  (nonzero exit) is restarted by launchd.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{NODE_BIN}}</string>
+        <string>{{BRIDGE_MAIN}}</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>BRIDGE_DATA_DIR</key>
+        <string>{{BRIDGE_DATA_DIR}}</string>
+        <key>BRIDGE_HOST</key>
+        <string>127.0.0.1</string>
+        <key>BRIDGE_PORT</key>
+        <string>{{BRIDGE_PORT}}</string>
+        <key>BRIDGE_ENV_FILE</key>
+        <string>{{BRIDGE_ENV_FILE}}</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{STDOUT_PATH}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{STDERR_PATH}}</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
