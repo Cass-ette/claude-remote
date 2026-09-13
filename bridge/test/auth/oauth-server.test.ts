@@ -23,7 +23,7 @@ import { createAuditLog, type AuditLog } from "../../src/audit/audit-log.js";
 const TEAM_DOMAIN = "test-team.cloudflareaccess.com";
 const ISSUER = `https://${TEAM_DOMAIN}`;
 const AUDIENCE = "0e9a5b2f7dbf4e1b9a17d8e0c3f2a1b0";
-const SUBJECT = "1804534439@qq.com";
+const SUBJECT = "owner@example.com";
 const KID = "test-kid-1";
 const PUBLIC_HOST = "bridge.example.com";
 const FINGERPRINT = "5B:54:BC:BA:A5:1A:12:F4:4D:98:6A:C1:40:BC:14:CB:6A:67:CD:6F:CF:D6:DC:41:4E:78:89:32:9E:EF:6C:1C";
@@ -381,6 +381,22 @@ describe("POST /auth/token", () => {
     });
     expect(res.statusCode).toBe(400);
     expect((res.json() as { error: string }).error).toBe("invalid_client");
+  });
+});
+
+describe("GET /auth/callback", () => {
+  it("serves a no-store HTML bounce page for browsers that load the redirect target", async () => {
+    const res = await app!.inject({ method: "GET", url: "/auth/callback?code=x&state=y" });
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-type"]).toContain("text/html");
+    expect(res.headers["cache-control"]).toBe("no-store");
+    expect(res.body).toContain("打开 App");
+    // The bounce link is an intent:// URL naming the app package (Edge Custom
+    // Tabs keep plain-https taps in-browser); built client-side from location,
+    // so the query is never templated into the HTML server-side.
+    expect(res.body).toContain("intent://");
+    expect(res.body).toContain("dev.clauderemote.android");
+    expect(res.body).not.toContain("code=x");
   });
 });
 

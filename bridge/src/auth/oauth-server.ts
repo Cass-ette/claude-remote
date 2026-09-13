@@ -209,6 +209,47 @@ function queryParam(request: FastifyRequest, key: string): string | null {
   return typeof value === "string" && value !== "" ? value : null;
 }
 
+/** Static bounce page served at the redirect path (see route comment). */
+const CALLBACK_BOUNCE_HTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'">
+<title>登录完成</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: grid; place-items: center;
+         background: #1a1c1e; color: #e3e2e6; font-family: system-ui, sans-serif; }
+  main { text-align: center; padding: 2rem; max-width: 30rem; }
+  h1 { font-size: 1.2rem; margin: 0 0 .5rem; }
+  p { color: #c4c6cf; font-size: .9rem; line-height: 1.5; margin: 0 0 1.5rem; }
+  a.open { display: inline-block; padding: .8rem 2.2rem; border-radius: 999px;
+           background: #9ec6ff; color: #00325b; font-weight: 600; text-decoration: none; }
+</style>
+</head>
+<body>
+<main>
+  <h1>登录完成</h1>
+  <p>浏览器没有自动返回 App。点击下面的按钮回到 Claude Remote 完成登录。</p>
+  <a class="open" id="open" href="#">打开 App</a>
+</main>
+<script>
+(() => {
+  // Chromium Custom Tabs honor App Links on 302 redirects inconsistently (Edge
+  // keeps https navigations in-browser even on a user-gesture tap). An
+  // intent:// URL naming the package forces the handoff in every Chromium
+  // browser; the fallback keeps the same page when the app is missing.
+  const u = new URL(location.href);
+  document.getElementById("open").href =
+    "intent://" + u.host + u.pathname + u.search +
+    "#Intent;scheme=https;package=${ANDROID_PACKAGE_NAME};S.browser_fallbackUrl=" +
+    encodeURIComponent(location.href) + ";end";
+})();
+</script>
+</body>
+</html>`;
+
 /** RFC 6749 §5.2 error response. */
 function oauthError(status: number, error: string, description?: string): { status: number; body: Record<string, string> } {
   return { status, body: description === undefined ? { error } : { error, error_description: description } };
@@ -477,6 +518,21 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
       });
     }
     return badGrant("unsupported_grant_type", "grant_type must be authorization_code or refresh_token");
+  });
+
+  // Browsers differ on whether a 302 redirect is handed to the verified
+  // Android App Link (Chrome does; Edge Custom Tabs do not, and Edge also
+  // keeps plain-https taps in-browser). When the browser loads the redirect
+  // target itself, this static bounce page offers an intent:// link (built
+  // client-side from location) that names the package, forcing the handoff in
+  // every Chromium browser and re-delivering code/state verbatim. The page
+  // never templates the query server-side (no injection surface).
+  app.get(OAUTH_REDIRECT_PATH, async (_request, reply) => {
+    return reply
+      .code(200)
+      .header("content-type", "text/html; charset=utf-8")
+      .header("cache-control", "no-store")
+      .send(CALLBACK_BOUNCE_HTML);
   });
 
   if (deps.fingerprint !== undefined) {
