@@ -36,7 +36,7 @@ android {
         // the default, and the bridge must serve the matching
         // /.well-known/assetlinks.json for the APK signing fingerprint.
         val bridgeHost = (project.findProperty("bridgeAppLinkHost") as String?)
-            ?.trim()?.takeIf { it.isNotBlank() } ?: "bridge.wql.me"
+            ?.trim()?.takeIf { it.isNotBlank() } ?: "bridge.example.com"
         manifestPlaceholders["bridgeAppLinkHost"] = bridgeHost
     }
 

@@ -216,7 +216,7 @@ cd android && ./gradlew app:assembleDebug -PbridgeAppLinkHost=<public-host> && c
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-- `applicationId` 为 `dev.clauderemote.android`，`minSdk 28` / `targetSdk 34`。不传 `-PbridgeAppLinkHost` 时默认 `bridge.wql.me`。
+- `applicationId` 为 `dev.clauderemote.android`，`minSdk 28` / `targetSdk 34`。不传 `-PbridgeAppLinkHost` 时默认占位域名 `bridge.example.com`——真实部署必须显式传入。
 - debug APK 使用 debug keystore 签名；**release 签名是后续工作**（见 spec §16），发布前请勿分发 debug APK。
 
 App Link 验证需要 Bridge 服务 `/.well-known/assetlinks.json`，而该路由**仅在配置了 APK 证书指纹时注册**。取 debug keystore 的 SHA-256 指纹并写入 env 文件，然后重启 Bridge：
