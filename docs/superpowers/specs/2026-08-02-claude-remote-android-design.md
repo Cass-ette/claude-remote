@@ -23,7 +23,7 @@
 - 手机断线后重连并补齐所有未确认事件。
 - Mac Bridge 重启后清理旧进程状态，并通过 session ID 恢复会话。
 - 通过 Cloudflare Tunnel 从公网安全访问。
-- 通过 Cloudflare Access Managed OAuth 和设备密钥进行双层认证。
+- 通过 Cloudflare Access 身份验证（经 Bridge 自建 OAuth 授权服务器，修订 §10.2）和设备密钥进行双层认证。
 
 ## 3. 非目标
 
@@ -74,7 +74,7 @@ Android 首版最低支持 Android 9（API 28）。设备必须能在 Android Ke
 实施 Phase 0 包含三个独立门槛：
 
 1. Claude Code：权限 MCP 契约、session ID 和跨 resume 的用户消息 UUID 去重。
-2. Cloudflare：Managed OAuth、Access bearer HTTP 请求和 bearer WebSocket Upgrade。
+2. Cloudflare：Access 邮箱 OTP 身份门、Access bearer HTTP 请求和 bearer WebSocket Upgrade（Phase 0 实测确认 Access 不提供 OAuth 授权端点，登录改为 Bridge 自建授权服务器，见 §10.2 修订）。
 3. Transcript：目标 Claude Code 版本的只读历史快照转换。
 
 任一门槛失败都停止对应实现并回到架构决策，不把不兼容留到最终验收。
@@ -83,7 +83,7 @@ Android 首版最低支持 Android 9（API 28）。设备必须能在 Android Ke
 
 ```text
 Android App
-    │  Managed OAuth + PKCE
+    │  OAuth (Bridge AS, 修订 §10.2) + PKCE
     │  HTTPS / WebSocket
     ▼
 Cloudflare Access + Tunnel
@@ -119,7 +119,7 @@ Bridge 由 macOS `launchd` 自动启动。Cloudflare Tunnel 将单一公网主�
 
 职责：
 
-- 通过 Cloudflare Access Managed OAuth 的 Authorization Code + PKCE 完成用户登录。
+- 通过 Bridge OAuth 授权服务器（Cloudflare Access 作身份提供方，修订 §10.2）的 Authorization Code + PKCE 完成用户登录。
 - 设备首次配对，并在 Android Keystore 中保存不可导出的 ECDSA P-256 私钥。
 - 保存 OAuth refresh token 和 Bridge 设备会话令牌的加密副本。
 - 使用 Room 持久化标准化的会话历史投影、消息发送状态和最后确认事件位置。
@@ -516,22 +516,48 @@ Bridge 使用固定的 `--permission-mode default` 和 Permission MCP Adapter。
 - Tunnel ingress 只映射所需 HTTP 主机名，不使用通用 TCP 转发。
 - Tunnel 停止后，Bridge 不应从局域网或公网直接访问。
 
-### 10.2 Cloudflare Access Managed OAuth
+### 10.2 认证：Bridge OAuth 授权服务器 + Cloudflare Access 身份门（修订）
 
-Cloudflare Access 应用策略只允许用户指定的唯一身份。Android 使用 Managed OAuth 的 Authorization Code + PKCE（S256）流程，而不是尝试复制浏览器的 `CF_Authorization` cookie。
+> **修订记录（2026-09-13）**：初版假设 Cloudflare Access 提供 "Managed OAuth" 授权端点。
+> 实施中确认 Access 只提供身份验证（邮箱 One-time PIN 等），不暴露任何 OAuth 授权
+> 服务器端点，App 无法对 Access 发起 Authorization Code 流程。修订为：**Bridge 自身
+> 充当最小 OAuth 2.0 授权服务器**，Cloudflare Access 保留为身份提供方，在
+> `/auth/authorize` 上执行邮箱 OTP 人机验证。设备配对与签名协议（§10.3）、令牌加密
+> 存储不变；变化仅在登录/令牌分发层。
+
+架构分工：
+
+- **Cloudflare Access**：边缘身份门。Access 应用策略只允许用户指定的唯一邮箱身份；
+  `/auth/authorize` 保持 Access 保护，人类在此完成邮箱 One-time PIN。
+- **Bridge 授权服务器**：RFC 8414 元数据发现、RFC 7591 动态 public client 注册、
+  PKCE S256 Authorization Code 流程、refresh token 分发。
 
 登录流程：
 
-1. App 从 `https://<host>/.well-known/oauth-authorization-server` 发现 OAuth 元数据。
-2. App 作为无 client secret 的 public client 动态注册，并保存 `client_id`。
-3. App 使用 Auth Tab 或 Custom Tab 打开登录页，携带 `state`、PKCE challenge、redirect URI 和目标 resource。
-4. Cloudflare 通过经过验证的 HTTPS Android App Link 返回 authorization code。
-5. App 校验 `state`，用 PKCE verifier 换取 opaque access token 和 refresh token。
-6. Refresh token 使用 Android Keystore 保护的密钥加密保存。
+1. App 从 `https://<host>/.well-known/oauth-authorization-server` 发现 OAuth 元数据（issuer 为 `https://<host>`）。
+2. App 作为无 client secret 的 public client 动态注册（`POST /auth/registration`，注册数上限 64），redirect URI 固定为 `https://<host>/auth/callback`，保存 `client_id`。注册只接受 `token_endpoint_auth_method=none`，任何 `client_secret` 输入被拒绝。
+3. App 打开 Custom Tab 访问 `GET /auth/authorize`（response_type=code、client_id、redirect_uri、code_challenge、code_challenge_method=S256、state）。该路径在 Access 之后：未通过 Access 的请求先收到 Access 邮箱 OTP 登录页；通过后 Bridge 校验参数并 302 重定向回经过验证的 HTTPS Android App Link，携带 `code`、`state` 与 RFC 9207 `iss`。参数校验失败一律返回 400 JSON，绝不重定向。
+4. authorization code 五分钟有效、单次使用（原子消费；数据库只存 sha256 哈希），并绑定 client、redirect_uri、Access subject、原始 assertion 与 PKCE challenge。
+5. App 校验 `state` 后 `POST /auth/token`（`grant_type=authorization_code`）以 PKCE verifier 换取令牌。Bridge 在签发前对暂存的 assertion **重新执行完整验证**（签名、issuer、audience、subject、到期）。
+6. **access token 即 Access assertion**：Bridge 把当前有效的 Access JWT 原文作为 opaque access token 返回，App 不解析、不本地校验。refresh token 为 256 位随机值，数据库只存哈希；`grant_type=refresh_token` 重新验证 assertion 仍有效后原样重发 access token，assertion 已过期则返回 `invalid_grant` 并删除该 refresh token。令牌端点错误响应遵循 RFC 6749 §5.2。
+7. Refresh token 使用 Android Keystore 保护的密钥加密保存。
 
-HTTP 请求和 WebSocket Upgrade 均使用 `Authorization: Bearer <access_token>`。不把 Cloudflare service token 嵌入 APK。
+redirect_uri 安全：scheme 必须 https、host 与配置的公网 host 完全一致、path 恰为 `/auth/callback`、无端口、userinfo、query 或 fragment。App Link 由 Bridge 服务的 `/.well-known/assetlinks.json`（仅在配置了 APK 证书 SHA-256 指纹时注册该路由）配合 manifest `autoVerify` 完成验证。
 
-Cloudflare 在 origin 请求中提供 `Cf-Access-Jwt-Assertion`。Bridge 验证签名、issuer、audience、subject 和到期时间，并要求 subject 与配对设备记录一致。配对、挑战和全部 API 路由都位于 Access 保护之后。
+边缘（Access）路径策略（revised §10.2 bypass 集）：
+
+| 路径 | Access | 说明 |
+| --- | --- | --- |
+| `/auth/authorize` | **保护** | 人类邮箱 OTP 登录门 |
+| `/.well-known/assetlinks.json` | bypass | App Link 验证须免认证可读 |
+| `/.well-known/oauth-authorization-server` | bypass | App 在登录前发现元数据 |
+| `/auth/registration` | bypass | public client 动态注册 |
+| `/auth/token` | bypass | code/refresh 换令牌，令牌本身即凭证 |
+| `/api/v1/*` 与 WebSocket | bypass | origin 验证，见下段 |
+
+HTTP 请求和 WebSocket Upgrade 均使用 `Authorization: Bearer <access_token>`（即 Access JWT）。不把 Cloudflare service token 嵌入 APK。
+
+`/api/v1/*` 与 WebSocket 在 Access 边缘 bypass，由 Bridge 在 origin 验证同一凭证：优先读取 Cloudflare 注入的 `Cf-Access-Jwt-Assertion` 头，bypass 路径上回退校验 `Authorization: Bearer` 中的 Access JWT——两条路径使用同一验证器与同一策略（签名、issuer、audience、subject、到期），并要求 subject 与配对设备记录一致。配对、挑战和全部 API 路由的认证由 Bridge 在 origin 强制执行，边缘 bypass 不降低安全性。
 
 Access token 即将到期时，App 先 refresh 再建立新 WebSocket。Bridge 将每个 socket 的最长寿命限制为 Access assertion 和设备会话两者较早的到期时间，到期主动以 `4401` 关闭；App refresh 后重连。这样不依赖 Cloudflare 是否会主动关闭已建立的 WebSocket。
 
@@ -539,7 +565,7 @@ Access token 即将到期时，App 先 refresh 再建立新 WebSocket。Bridge �
 
 配对流程：
 
-1. Mac 本地命令生成 256 位随机配对令牌，二维码包含 Bridge URL、令牌和五分钟到期时间。
+1. Mac 本地命令生成 256 位随机配对令牌，二维码包含 Bridge URL、令牌和五分钟到期时间（首版 App 以手动输入 host + 令牌或扫描 `claude-remote://pair` 深链预填的方式消费令牌；相机扫二维码为后续版本候选）。
 2. Bridge 只保存配对令牌哈希；令牌单次使用。
 3. Android Keystore 生成不可导出的 `secp256r1` ECDSA 密钥对。
 4. Android 用 X.509 SubjectPublicKeyInfo（SPKI）DER 编码公钥，并以无 padding 的 base64url 传输为 `publicKeySpki`。
@@ -830,7 +856,7 @@ Bridge 使用权限 `0600` 的本地 JSONL 审计日志，单文件 10 MiB，保
 
 1. Phase 0 分别验证 Claude 权限/UUID 去重、Cloudflare OAuth/WebSocket 和 transcript 历史转换；任一门槛失败则不继续对应实现。
 2. Android 9（API 28）设备能生成不可导出的 Keystore ECDSA P-256 密钥；不支持的设备在配对前明确失败。
-3. Android 通过 Cloudflare Managed OAuth + PKCE 登录，Bridge 验证 Access assertion。
+3. Android 通过 Bridge OAuth 授权服务器（Access 邮箱 OTP 身份门）+ PKCE 登录，Bridge 验证 Access assertion。
 4. Mac 显示五分钟单次二维码，Android 完成 ECDSA P-256 设备配对。
 5. Challenge 响应返回 Bridge 验证的原始 Access subject 和 Bridge 规范化的 hostAscii 供 Android 签名；回传 subject 不一致、重放配对令牌或重放 challenge 均失败。设备会话令牌在有效期内按 bearer 语义可复用，但在到期、设备撤销、Access subject 不匹配或 Access 认证失效后必须失败。
 6. 未配对设备无法访问任何会话信息。
@@ -864,7 +890,7 @@ Bridge 使用权限 `0600` 的本地 JSONL 审计日志，单文件 10 MiB，保
 - 历史 session 文件格式不是实时控制 API，导入功能只能读取最小字段并允许失败。
 - 普通终端可绕过 Bridge 锁直接恢复同一 session，系统只能通过流程警告降低并发写入风险。
 - 项目白名单不是文件系统沙箱；用户批准的 Claude 工具仍可能访问项目外资源。
-- Cloudflare Managed OAuth 文档没有单独保证 WebSocket Upgrade 的 bearer 行为，必须在真实 Access 应用中通过端到端门槛验证。
+- 边缘 bypass 路径上 `Authorization: Bearer` 能否原样穿透 Cloudflare 到达 origin，以及 origin 侧同一验证器是否覆盖全部 bypass 路径，必须在真实部署中通过端到端门槛验证（修订 §10.2）。
 - Cloudflare Access、Tunnel 和用户配置错误仍可能扩大暴露面，需要提供部署前自检。
 - 设备会话令牌是短期 bearer token，不提供逐请求防重放；令牌和有效 Access 身份同时泄露时存在到期前重用窗口。
 - Android Keystore 实现存在厂商差异，API 28 能力探测必须阻止不满足不可导出 P-256 要求的设备。

@@ -150,36 +150,14 @@ export class AccessJwtVerifier {
   }
 
   /**
-   * Verify the `Cf-Access-Jwt-Assertion` header of an inbound request
-   * (header lookup is case-insensitive). Throws {@link MissingAssertionError}
-   * when the header is absent/blank and {@link InvalidAssertionError} when
-   * verification fails. Never returns or throws the assertion body.
+   * Verify the request's Access assertion (header lookup is
+   * case-insensitive). Throws {@link MissingAssertionError} when no usable
+   * assertion is present and {@link InvalidAssertionError} when verification
+   * fails. Never returns or throws the assertion body.
    */
   async verifyRequest(headers: Record<string, string | string[] | undefined>): Promise<VerifiedAccessIdentity> {
-    const raw = this.extractAssertion(headers);
+    const raw = extractRawAssertion(headers);
     return this.verifyAssertion(raw);
-  }
-
-  /** Extract and validate the assertion header value. */
-  private extractAssertion(headers: Record<string, string | string[] | undefined>): string {
-    for (const [name, value] of Object.entries(headers)) {
-      if (name.toLowerCase() !== CF_ACCESS_ASSERTION_HEADER) continue;
-      let assertion: string;
-      if (Array.isArray(value)) {
-        // Duplicate assertion headers are never legitimate; reject as malformed.
-        if (value.length !== 1) {
-          throw new InvalidAssertionError("malformed", "assertion header must appear exactly once");
-        }
-        assertion = value[0] ?? "";
-      } else {
-        assertion = value ?? "";
-      }
-      if (assertion.trim() === "") {
-        throw new MissingAssertionError();
-      }
-      return assertion;
-    }
-    throw new MissingAssertionError();
   }
 
   /**
@@ -295,6 +273,48 @@ export class AccessJwtVerifier {
     // assertion is not at fault; route mapping may treat these as 5xx).
     return err instanceof Error ? err : new Error("assertion verification failed");
   }
+}
+
+/** Header carrying a Bearer credential (matched case-insensitively). */
+export const AUTHORIZATION_HEADER = "authorization";
+
+/**
+ * Extract the raw Access assertion carried by a request: the
+ * `Cf-Access-Jwt-Assertion` edge header when present (the Access-fronted
+ * paths), otherwise the `Authorization: Bearer` credential (the app-facing
+ * paths whose Access edge policy is bypassed; the same JWT the bridge minted
+ * into the app's hands via its OAuth token endpoint). Duplicate headers are
+ * never legitimate. Throws {@link MissingAssertionError} when neither header
+ * carries a usable value. Callers must treat the returned string as secret.
+ */
+export function extractRawAssertion(headers: Record<string, string | string[] | undefined>): string {
+  let authorization: string | null = null;
+  for (const [name, value] of Object.entries(headers)) {
+    const lower = name.toLowerCase();
+    if (lower !== CF_ACCESS_ASSERTION_HEADER && lower !== AUTHORIZATION_HEADER) continue;
+    let single: string;
+    if (Array.isArray(value)) {
+      if (value.length !== 1) {
+        throw new InvalidAssertionError("malformed", `${lower} header must appear exactly once`);
+      }
+      single = value[0] ?? "";
+    } else {
+      single = value ?? "";
+    }
+    if (lower === CF_ACCESS_ASSERTION_HEADER) {
+      if (single.trim() === "") throw new MissingAssertionError();
+      return single;
+    }
+    authorization = single;
+  }
+  if (authorization !== null) {
+    const match = /^Bearer\s+(.+)$/i.exec(authorization.trim());
+    if (match !== null) {
+      const assertion = match[1] ?? "";
+      if (assertion.trim() !== "") return assertion;
+    }
+  }
+  throw new MissingAssertionError();
 }
 
 function findJwk(keySet: jose.JSONWebKeySet, kid: string | undefined): jose.JWK | undefined {

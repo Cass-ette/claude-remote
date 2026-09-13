@@ -96,8 +96,9 @@ function assertValid<T>(validate: ValidateFunction<T>, body: T): T {
  * Build the Bridge HTTP/WS server.
  *
  * Returns a Fastify instance that is NOT yet listening; callers own
- * `listen()`/`close()`. The server only serves paths under `/api/v1/`;
- * everything else is a plain 404.
+ * `listen()`/`close()`. This module serves `/api/v1/health|capabilities`;
+ * the API, WS, and OAuth (revised §10.2) routes are registered by main.ts.
+ * Anything unregistered is a plain 404.
  */
 export function startHttpServer(
   config: BridgeConfig,

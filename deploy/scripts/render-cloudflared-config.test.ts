@@ -149,14 +149,20 @@ describe("renderConfigYml (assertion 1)", () => {
 // ---------------------------------------------------------------------------
 
 describe("renderAccessApp (assertion 2)", () => {
-  it("defines one self_hosted app on the same hostname with the assetlinks exact-path bypass", () => {
+  it("defines one self_hosted app on the same hostname with the revised-§10.2 bypass set", () => {
     const app = JSON.parse(renderAccessApp(validConfig()));
     expect(app.name).toBe("Claude Remote Bridge");
     expect(app.domain).toBe("bridge.example.com");
     expect(app.type).toBe("self_hosted");
     expect(app.aud).toBe("0e9a5b2f7dbf4e1b9a17d8e0c3f2a1b0");
     expect(app.app_launcher_visible).toBe(false);
-    expect(app.bypass).toEqual([{ type: "exact_path", value: "/.well-known/assetlinks.json" }]);
+    expect(app.bypass).toEqual([
+      { type: "exact_path", value: "/.well-known/assetlinks.json" },
+      { type: "exact_path", value: "/.well-known/oauth-authorization-server" },
+      { type: "exact_path", value: "/auth/registration" },
+      { type: "exact_path", value: "/auth/token" },
+      { type: "path", value: "/api/v1" },
+    ]);
   });
 
   it("policy allows exactly the user-supplied email subjects and nothing else", () => {
@@ -414,13 +420,17 @@ describe("renderTunnelFiles", () => {
 
   it("writes config.yml and access-app.json with mode 0600 under ~/.cloudflared", () => {
     const home = scratchHome();
+    // This machine may carry a REAL deployment in ~/.cloudflared; the no-leak
+    // check must be "the real file is untouched", not "it does not exist".
+    const realConfig = join(homedir(), ".cloudflared", "config.yml");
+    const before = existsSync(realConfig) ? readFileSync(realConfig, "utf8") : null;
     const result = renderTunnelFiles(VALID, options(home));
     const dir = join(home, ".cloudflared");
     expect(result.configYmlPath).toBe(join(dir, "config.yml"));
     expect(result.accessAppPath).toBe(join(dir, "access-app.json"));
     expect(modeOf(result.configYmlPath)).toBe(0o600);
     expect(modeOf(result.accessAppPath)).toBe(0o600);
-    expect(existsSync(join(homedir(), ".cloudflared", "config.yml"))).toBe(false);
+    expect(existsSync(realConfig) ? readFileSync(realConfig, "utf8") : null).toBe(before);
     const yaml = readFileSync(result.configYmlPath, "utf8");
     expect(yaml).toContain("hostname: bridge.example.com");
   });

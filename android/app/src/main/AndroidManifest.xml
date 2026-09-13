@@ -11,12 +11,34 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.ClaudeRemote">
 
+        <!-- singleTask: the OAuth App Link redirect (https://<bridge host>/auth/callback)
+             and the pairing deep link (claude-remote://pair) must land on the ONE
+             activity instance via onNewIntent, so a flow started before the browser
+             trip keeps its in-memory pending state. -->
         <activity
             android:name=".ui.MainActivity"
-            android:exported="true">
+            android:exported="true"
+            android:launchMode="singleTask">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Pairing QR payload: claude-remote://pair?host=<bridge host>&token=<one-time token>.
+                 Delivered by a QR scanner app or manual entry; prefill only. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="claude-remote" android:host="pair" />
+            </intent-filter>
+            <!-- OAuth redirect: the verified HTTPS App Link of the bridge host
+                 (revised §10.2). autoVerify requires the bridge to serve
+                 /.well-known/assetlinks.json for this APK's signing fingerprint. -->
+            <intent-filter android:autoVerify="true">
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="https" android:host="${bridgeAppLinkHost}" android:pathPrefix="/auth" />
             </intent-filter>
         </activity>
     </application>

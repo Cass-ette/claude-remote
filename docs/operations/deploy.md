@@ -149,7 +149,7 @@ npm run deploy:render-cloudflared
 1. 新建 **Self-hosted** 应用，domain 填 `<public-host>`。创建后在应用详情里能看到 **aud tag**——把它回填到 env 文件的 `BRIDGE_CLOUDFLARE_AUD` 与第 4 步安装参数（保持一致），并重跑一次 `npm run deploy:render-cloudflared` 让 `access-app.json` 的 `aud` 与实际应用一致。
 2. 按 `~/.cloudflared/access-app.json` 核对/填写其余字段：
    - `app_launcher_visible: false`
-   - bypass 仅一条 exact-path：`/.well-known/assetlinks.json`（Android App Link 验证用，其余路径一律在 Access 之后）
+   - bypass 恰好五条（修订 spec §10.2）：exact-path `/.well-known/assetlinks.json`、`/.well-known/oauth-authorization-server`、`/auth/registration`、`/auth/token`，以及 path 前缀 `/api/v1`。**`/auth/authorize` 不 bypass**——它是邮箱 OTP 登录门，必须留在 Access 之后；`/api/v1/*` 的认证由 Bridge 在 origin 校验同一 Access JWT（Bearer 回退），边缘 bypass 不降低安全性
    - 唯一 policy：`allow`，include 只列 `CF_ACCESS_SUBJECTS` 里的邮箱（owner only）
    - `allowed_idps` 仅 One-time PIN（设置了 `CF_ACCESS_EMAIL_IDP` 时）
 3. 或者直接走 API：`PUT https://api.cloudflare.com/client/v4/zones/<zone-id>/access/apps/<app-id>`，body 即渲染出的 `access-app.json`。
@@ -209,15 +209,32 @@ npm run deploy:preflight -- --data-dir <data-dir>
 
 ## 7. 安装 Android App
 
-构建并安装 debug APK：
+构建并安装 debug APK（`bridgeAppLinkHost` 把 OAuth 回调 App Link 的 host 烧进 manifest，autoVerify 必需）：
 
 ```bash
-cd android && ./gradlew app:assembleDebug && cd ..
+cd android && ./gradlew app:assembleDebug -PbridgeAppLinkHost=<public-host> && cd ..
 adb install -r android/app/build/outputs/apk/debug/app-debug.apk
 ```
 
-- `applicationId` 为 `dev.clauderemote.android`，`minSdk 28` / `targetSdk 34`。
+- `applicationId` 为 `dev.clauderemote.android`，`minSdk 28` / `targetSdk 34`。不传 `-PbridgeAppLinkHost` 时默认 `bridge.wql.me`。
 - debug APK 使用 debug keystore 签名；**release 签名是后续工作**（见 spec §16），发布前请勿分发 debug APK。
+
+App Link 验证需要 Bridge 服务 `/.well-known/assetlinks.json`，而该路由**仅在配置了 APK 证书指纹时注册**。取 debug keystore 的 SHA-256 指纹并写入 env 文件，然后重启 Bridge：
+
+```bash
+keytool -list -v -keystore ~/.android/debug.keystore -alias androiddebugkey -storepass android | grep "SHA256:"
+# 形如 5B:54:BC:...:C1C（冒号可有可无）
+
+echo 'BRIDGE_ASSETLINKS_FINGERPRINT=<sha256 指纹>' >> ~/Library/LaunchAgents/dev.clauderemote.bridge.env
+chmod 600 ~/Library/LaunchAgents/dev.clauderemote.bridge.env
+launchctl bootout gui/$(id -u)/dev.clauderemote.bridge 2>/dev/null; \
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/dev.clauderemote.bridge.plist
+
+curl -s http://127.0.0.1:43111/.well-known/assetlinks.json   # 应返回 JSON 且 target SHA-256 匹配
+adb shell pm verify-app-links --re-verify dev.clauderemote.android
+adb shell pm get-app-links dev.clauderemote.android          # host 应显示 verified
+```
+
 - App 首次使用前需要在连接页保存 Bridge 主机名（`<public-host>`）。
 
 ### 真机（尤其 MIUI）注意事项
@@ -241,15 +258,15 @@ BRIDGE_PUBLIC_HOST=<public-host> \
 claude-remote://pair?host=<public-host>&token=<token>
 ```
 
-手机端流程（spec §10.2/§10.3）：
+手机端流程（修订 spec §10.2/§10.3）：
 
-1. App 连接页完成 **Cloudflare Access 登录**（Managed OAuth，Authorization Code + PKCE；只允许 `CF_ACCESS_SUBJECTS` 里的身份）。
-2. 连接页点 **扫码配对**，扫上面的二维码。设备在 Keystore 生成不可导出的 P-256 密钥，提交 `publicKeySpki` 与 `deviceId`，Bridge 原子消费 token 并把设备绑定到当前 Access subject。
+1. App 连接页完成登录：App 经 `/.well-known/oauth-authorization-server` 发现元数据、`/auth/registration` 动态注册 public client，然后浏览器 Custom Tab 打开 `/auth/authorize`——该路径在 Access 之后，**在这里输入邮箱收到的 One-time PIN**（只允许 `CF_ACCESS_SUBJECTS` 里的身份），通过后 Bridge 302 回 App Link，App 以 PKCE verifier 换取令牌。Bridge 本身就是 OAuth 授权服务器（修订 §10.2），Access 只是身份门。
+2. 连接页点 **配对**，输入上面 `token:` 后面的配对令牌（首版为手动输入对话框；相机扫二维码为后续版本候选）。设备在 Keystore 生成不可导出的 P-256 密钥，提交 `publicKeySpki` 与 `deviceId`，Bridge 原子消费 token 并把设备绑定到当前 Access subject。
 3. 之后每次连接走 challenge → ECDSA 签名 → 15 分钟设备会话。
 
-首版**只允许一个未撤销设备**：换手机前先 `admin revoke-device <deviceId>`（或 `revoke-all-devices`），再生成新二维码。
+首版**只允许一个未撤销设备**：换手机前先 `admin revoke-device <deviceId>`（或 `revoke-all-devices`），再生成新配对令牌。
 
-当前实现状态（交接说明）：Mac 侧 `pairing-qrcode` 与 `POST /api/v1/auth/pair|challenge|verify` 已实现并有测试；App 内"扫码配对"按钮的扫码 UI 还是占位（`MainActivity.onScanPair` 待接线），端到端真机验收由 instrumented 测试（`app:connectedDebugAndroidTest`）与 `RUN_E2E=1` 环境承担。
+实现状态：登录（发现/注册/PKCE/refresh）、手动配对与 `POST /api/v1/auth/pair|challenge|verify` 均已实现并有测试；真机端到端验收由 `RUN_E2E=1` 环境承担（需先按第 5 步配好五条 bypass，否则 discovery/registration/token 与 `/api/v1` 都会被 Access 边缘拦截）。
 
 ## 9. 第一个会话
 

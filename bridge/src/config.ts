@@ -70,6 +70,14 @@ export interface BridgeConfig {
    */
   readonly publicHost?: string | undefined;
   /**
+   * APK signing certificate SHA-256 fingerprint
+   * (BRIDGE_ASSETLINKS_FINGERPRINT), e.g. `AA:BB:…` (colons optional,
+   * normalized to colon-separated uppercase hex). Optional: when set the
+   * server serves `/.well-known/assetlinks.json` declaring Android App Link
+   * verification for the app against the public host.
+   */
+  readonly assetlinksFingerprint?: string | undefined;
+  /**
    * Claude Code configuration directory (CLAUDE_CONFIG_DIR). The spawned
    * CLI processes inherit it via the environment, and the history layer
    * reads transcripts from `<claudeConfigDir>/projects/<encoded-project>/`.
@@ -294,6 +302,25 @@ function parseCloudflareTeamDomain(env: EnvSource): string | undefined {
 }
 
 /**
+ * Optional APK signing certificate SHA-256 fingerprint
+ * (BRIDGE_ASSETLINKS_FINGERPRINT): 64 hex digits, with or without the
+ * `AA:BB:…` colons, normalized to colon-separated uppercase for
+ * assetlinks.json. Optional; absent disables the assetlinks route.
+ */
+function parseAssetlinksFingerprint(env: EnvSource): string | undefined {
+  const raw = readString(env, "BRIDGE_ASSETLINKS_FINGERPRINT");
+  if (raw === undefined) return undefined;
+  const hex = raw.replace(/:/g, "");
+  if (!/^[0-9a-fA-F]{64}$/.test(hex)) {
+    throw new Error(
+      `BRIDGE_ASSETLINKS_FINGERPRINT must be the APK signing certificate SHA-256 fingerprint ` +
+        `(64 hex digits, colons optional); got ${JSON.stringify(raw)}.`,
+    );
+  }
+  return (hex.match(/.{2}/g) ?? []).map((pair) => pair.toUpperCase()).join(":");
+}
+
+/**
  * Validate environment variables and produce an immutable
  * {@link BridgeConfig}. Creates {@link BRIDGE_DATA_DIR} recursively with
  * owner-only permissions after validation succeeds. When BRIDGE_ENV_FILE is
@@ -313,6 +340,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const cloudflareAud = readString(source, "BRIDGE_CLOUDFLARE_AUD");
   const deviceSessionTtlSeconds = parseDeviceSessionTtlSeconds(source);
   const publicHost = readString(source, "BRIDGE_PUBLIC_HOST");
+  const assetlinksFingerprint = parseAssetlinksFingerprint(source);
   const claudeConfigDir = parseClaudeConfigDir(source);
 
   mkdirSync(dataDir, { recursive: true, mode: 0o700 });
@@ -331,6 +359,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     cloudflareAud,
     deviceSessionTtlSeconds,
     publicHost,
+    assetlinksFingerprint,
     claudeConfigDir,
   });
 }

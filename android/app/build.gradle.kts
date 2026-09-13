@@ -28,6 +28,16 @@ android {
         // (net.openid.appauth.RedirectUriReceiverActivity uses
         // ${appAuthRedirectScheme} as the redirect URI scheme).
         manifestPlaceholders["appAuthRedirectScheme"] = "dev.clauderemote.android"
+
+        // The verified Android App Link host of the bridge's OAuth redirect
+        // (https://<host>/auth/callback, MainActivity's autoVerify filter).
+        // Android verifies App Links only for hosts declared at install time,
+        // so this is baked per deployment: -PbridgeAppLinkHost=<host> overrides
+        // the default, and the bridge must serve the matching
+        // /.well-known/assetlinks.json for the APK signing fingerprint.
+        val bridgeHost = (project.findProperty("bridgeAppLinkHost") as String?)
+            ?.trim()?.takeIf { it.isNotBlank() } ?: "bridge.wql.me"
+        manifestPlaceholders["bridgeAppLinkHost"] = bridgeHost
     }
 
     buildTypes {

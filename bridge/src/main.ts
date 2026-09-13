@@ -32,6 +32,7 @@ import {
 import type { PersistedEvent } from "./events/event-journal-types.js";
 import { startHttpServer } from "./server/http-server.js";
 import { registerApiRoutes } from "./server/http-routes.js";
+import { createOAuthStore, registerOAuthRoutes } from "./auth/oauth-server.js";
 import {
   registerWebSocket,
   CLOSE_CODE,
@@ -374,6 +375,22 @@ export async function startBridge(
     hostAscii: config.publicHost ?? "",
     now,
   });
+
+  // Revised §10.2: the Bridge is the OAuth authorization server fronting
+  // Cloudflare Access (the edge keeps /auth/authorize; everything the app
+  // calls directly is origin-verified). Local-only boots expose nothing.
+  if (verifier !== null && config.publicHost !== undefined) {
+    registerOAuthRoutes(app, {
+      verifier,
+      store: createOAuthStore(db),
+      publicHost: config.publicHost,
+      audit,
+      now,
+      ...(config.assetlinksFingerprint !== undefined
+        ? { fingerprint: config.assetlinksFingerprint }
+        : {}),
+    });
+  }
 
   // --- WebSocket: real two-layer auth, replay, and command dispatch -------
 

@@ -26,11 +26,13 @@
 #   - Keep credentials-file readable only by this user (cloudflared tunnel
 #     create writes it 0600; do not relax that).
 #   - The Access application (rendered next to this file as access-app.json)
-#     must keep the exact-path bypass limited to /.well-known/assetlinks.json
-#     so Android App Link verification stays HTTPS-authenticated while every
-#     API route stays behind Cloudflare Access.
+#     must keep the exact-path bypasses limited to the revised-§10.2 set
+#     (assetlinks.json, OAuth discovery + registration + token, /api/v1
+#     prefix). /auth/authorize STAYS behind Access: it is the human email-OTP
+#     gate of the Bridge's own OAuth authorization server (spec §10.2).
 #   - Cloudflare service tokens are never used anywhere in this deployment:
-#     authentication is per-device Access Managed OAuth (spec §10.2).
+#     authentication is per-device Access identity + Bridge-issued tokens
+#     (revised spec §10.2/§10.3).
 tunnel: {{CF_TUNNEL_ID}}
 credentials-file: {{CF_TUNNEL_CREDENTIALS_FILE}}
 ingress:

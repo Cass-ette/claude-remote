@@ -1,5 +1,7 @@
 package dev.clauderemote.android.ui
 
+import android.content.Intent
+import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -17,17 +19,20 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import dev.clauderemote.android.BuildConfig
 import dev.clauderemote.android.ClaudeRemoteApp
+import dev.clauderemote.android.auth.PairingController
 import dev.clauderemote.android.network.ConnectionState
 import dev.clauderemote.android.protocol.v1.PROTOCOL_VERSION
 import dev.clauderemote.android.protocol.v1.SessionCreateCommand
 import dev.clauderemote.android.protocol.v1.SessionCreatePayload
 import dev.clauderemote.android.ui.connection.ConnectionScreen
 import dev.clauderemote.android.ui.connection.ConnectionUiState
+import dev.clauderemote.android.ui.connection.PairingDialog
 import dev.clauderemote.android.ui.conversation.ConversationScreen
 import dev.clauderemote.android.ui.import_.ImportSessionScreen
 import dev.clauderemote.android.ui.sessions.SessionGroupUi
@@ -47,8 +52,19 @@ import kotlinx.coroutines.launch
  * ConnectionCoordinator, the real ConversationRepository/CommandSender seams.
  *
  * Nav graph: connection → sessions → (conversation | import).
+ *
+ * Deep links (singleTask, revised §10.2): the OAuth App Link redirect
+ * (https://<bridge host>/auth/callback) and the pairing payload link
+ * (claude-remote://pair?host=…&token=…) both land here via
+ * [onNewIntent]/[onCreate] and route into the [PairingController].
  */
 class MainActivity : ComponentActivity() {
+
+    /** Prefill from a claude-remote://pair link; opens the pairing dialog. */
+    val pairPrefill = mutableStateOf<PairingController.PairPrefill?>(null)
+
+    /** Last login/pairing outcome line shown in the dialog and on the connection screen. */
+    val pairingStatus = mutableStateOf<String?>(null)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -56,6 +72,33 @@ class MainActivity : ComponentActivity() {
             ClaudeRemoteTheme {
                 ClaudeRemoteNavGraph()
             }
+        }
+        handleIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        handleIntent(intent)
+    }
+
+    private fun handleIntent(intent: Intent?) {
+        val uri: Uri = intent?.data ?: return
+        val app = application as ClaudeRemoteApp
+        when {
+            app.pairingController.isOAuthRedirect(uri) -> lifecycleScope.launch {
+                runCatching { app.pairingController.onRedirect(uri) }
+                    .onSuccess { outcome ->
+                        pairingStatus.value = when (outcome) {
+                            is PairingController.Outcome.Paired ->
+                                "配对成功（设备 ${outcome.deviceId.take(8)}…），已连接 Bridge"
+                            PairingController.Outcome.LoggedIn -> "登录成功"
+                        }
+                    }
+                    .onFailure { e ->
+                        pairingStatus.value = "配对/登录失败：${e.message ?: e.javaClass.simpleName}"
+                    }
+            }
+            else -> app.pairingController.parsePairLink(uri)?.let { pairPrefill.value = it }
         }
     }
 }
@@ -131,12 +174,25 @@ private object Routes {
 @Composable
 private fun ClaudeRemoteNavGraph() {
     val app = LocalContext.current.applicationContext as ClaudeRemoteApp
+    val activity = LocalContext.current as? MainActivity
     val graph = app.graph ?: return
     val navController = rememberNavController()
     val scope = rememberCoroutineScope()
 
     val connectionState by graph.coordinator.state.collectAsState()
     var hostInput by remember { mutableStateOf(app.hostStore.bridgeHost() ?: "") }
+
+    // Pairing dialog state; the prefill (deep link) and the outcome line come
+    // from the activity's states so onNewIntent-driven updates recompose here.
+    val prefill by activity?.pairPrefill ?: remember { mutableStateOf(null) }
+    val status by activity?.pairingStatus ?: remember { mutableStateOf(null) }
+    var pairDialogOpen by remember { mutableStateOf(false) }
+    LaunchedEffect(prefill) {
+        if (prefill != null) {
+            pairDialogOpen = true
+            prefill?.host?.takeIf { it.isNotBlank() }?.let { hostInput = it }
+        }
+    }
 
     // The session list is a read over the same Room projection the event
     // pipeline writes; it reloads whenever a session's projection changes.
@@ -147,14 +203,49 @@ private fun ClaudeRemoteNavGraph() {
         }
     }
 
+    /** Launches the interactive browser login (optionally with a pairing token). */
+    fun startInteractiveLogin(host: String, pairingToken: String?) {
+        scope.launch {
+            activity?.pairingStatus?.value = "正在打开浏览器登录…"
+            runCatching { app.pairingController.begin(host, pairingToken) }
+                .onSuccess { intent ->
+                    activity?.pairingStatus?.value = "请在浏览器中完成 Cloudflare 登录"
+                    app.startActivity(intent)
+                }
+                .onFailure { e ->
+                    activity?.pairingStatus?.value =
+                        "无法开始登录：${e.message ?: e.javaClass.simpleName}"
+                }
+        }
+    }
+
     NavHost(navController = navController, startDestination = Routes.CONNECTION) {
         composable(Routes.CONNECTION) {
+            if (pairDialogOpen) {
+                PairingDialog(
+                    initialHost = prefill?.host ?: hostInput,
+                    initialToken = prefill?.pairingToken.orEmpty(),
+                    status = status,
+                    onDismiss = {
+                        pairDialogOpen = false
+                        activity?.pairPrefill?.value = null
+                    },
+                    onSubmit = { host, token ->
+                        pairDialogOpen = false
+                        activity?.pairPrefill?.value = null
+                        hostInput = host
+                        app.saveBridgeHost(host)
+                        startInteractiveLogin(host, token.ifBlank { null })
+                    },
+                )
+            }
+            // Reading `status` here recomputes the identity/pairing reads on
+            // every login/pairing outcome.
             ConnectionScreen(
                 state = ConnectionUiState(
-                    // The signed-in identity becomes available once the
-                    // interactive OAuth login (Task 29 browser flow) has run
-                    // on this install; until then no assertion is fabricated.
-                    signedInAs = null,
+                    // Display-only decode of the Access token's `sub` claim
+                    // (verification already happened at exchange/refresh).
+                    signedInAs = decodeJwtSubject(graph.tokenStore.getAccessToken()?.token),
                     paired = graph.tokenStore.getDeviceSessionToken() != null,
                     deviceIdentity = runCatching { graph.deviceKeys.deviceId() }
                         .getOrElse { "设备密钥不可用" },
@@ -165,22 +256,24 @@ private fun ClaudeRemoteNavGraph() {
                     claudeCodeVersion = null,
                     expiryWarning = null,
                     bridgeHost = hostInput,
+                    pairingStatus = status,
                 ),
                 onReLogin = {
-                    // Programmatic half of the re-login path: force an Access
-                    // refresh through the real OAuthManager, then restart the
-                    // connect loop. The interactive browser flow requires a
-                    // verified App Link host and lands with the login wiring.
                     scope.launch {
-                        runCatching { graph.oauth.getValidAccessToken(forceRefresh = true) }
-                        graph.coordinator.start()
+                        if (graph.tokenStore.getRefreshToken() == null) {
+                            // No completed login on this install: interactive.
+                            startInteractiveLogin(hostInput, null)
+                        } else {
+                            runCatching { graph.oauth.getValidAccessToken(forceRefresh = true) }
+                                .onFailure { e ->
+                                    activity?.pairingStatus?.value =
+                                        "刷新失败，需重新登录：${e.message ?: e.javaClass.simpleName}"
+                                }
+                            graph.coordinator.start()
+                        }
                     }
                 },
-                onScanPair = {
-                    // Pairing needs the one-time token from the Mac-side QR;
-                    // the enrollment itself goes through the real
-                    // DeviceSessionManager once the scanner is wired.
-                },
+                onScanPair = { pairDialogOpen = true },
                 onBridgeHostChange = { hostInput = it },
                 onSaveBridgeHost = { app.saveBridgeHost(hostInput) },
                 onOpenSessions = { navController.navigate(Routes.SESSIONS) },
@@ -318,6 +411,24 @@ private fun sessionRowOf(session: dev.clauderemote.android.data.local.SessionEnt
     status = session.status,
     lastActivity = relativeActivity(session.updatedAt),
 )
+
+/**
+ * DISPLAY-ONLY JWT `sub` decode (no signature check — verification already
+ * happened at exchange/refresh; this never gates any decision).
+ */
+private fun decodeJwtSubject(token: String?): String? {
+    if (token == null) return null
+    val parts = token.split(".")
+    if (parts.size != 3) return null
+    return runCatching {
+        val payload = String(java.util.Base64.getUrlDecoder().decode(parts[1]), Charsets.UTF_8)
+        (kotlinx.serialization.json.Json.parseToJsonElement(payload) as? kotlinx.serialization.json.JsonObject)
+            ?.get("sub")
+            ?.let { it as? kotlinx.serialization.json.JsonPrimitive }
+            ?.takeIf { it.isString }
+            ?.content
+    }.getOrNull()
+}
 
 private fun relativeActivity(instant: Instant, now: Instant = Instant.now()): String {
     val minutes = Duration.between(instant, now).toMinutes()

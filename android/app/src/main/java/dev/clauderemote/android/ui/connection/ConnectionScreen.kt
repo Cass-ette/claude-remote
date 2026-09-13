@@ -50,6 +50,8 @@ data class ConnectionUiState(
     val expiryWarning: ExpiryWarning?,
     /** Currently saved bridge host (bare host or full base URL); null = debug default. */
     val bridgeHost: String?,
+    /** Last interactive login/pairing outcome line (null = nothing to report). */
+    val pairingStatus: String? = null,
 )
 
 @Composable
@@ -75,6 +77,13 @@ fun ConnectionScreen(
                 text = state.signedInAs?.let { "已登录：$it" } ?: "未登录",
                 style = MaterialTheme.typography.bodyMedium,
             )
+            state.pairingStatus?.let { status ->
+                Text(
+                    text = status,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             OutlinedButton(onClick = onReLogin) { Text("重新登录") }
         }
 
@@ -176,6 +185,66 @@ private fun Section(title: String, content: @Composable () -> Unit) {
         Text(title, style = MaterialTheme.typography.titleMedium)
         content()
     }
+}
+
+/**
+ * Manual pairing dialog (revised §10.2): the operator copies the one-time
+ * token from the Mac-side `admin pairing-qrcode` output (QR camera scanning
+ * is future work); submitting opens the browser login, and the pairing token
+ * rides along with the authorization request until the redirect.
+ */
+@Composable
+fun PairingDialog(
+    initialHost: String?,
+    initialToken: String,
+    status: String?,
+    onDismiss: () -> Unit,
+    onSubmit: (host: String, pairingToken: String) -> Unit,
+) {
+    var host by remember { mutableStateOf(initialHost.orEmpty()) }
+    var token by remember { mutableStateOf(initialToken) }
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("扫码配对") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "在 Mac 上运行 admin pairing-qrcode 生成配对信息，" +
+                        "把 host 和一次性 token 粘贴到下面（token 五分钟内有效、单次使用）。",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+                OutlinedTextField(
+                    value = host,
+                    onValueChange = { host = it },
+                    label = { Text("Bridge 主机") },
+                    placeholder = { Text("bridge.example.com") },
+                    singleLine = true,
+                )
+                OutlinedTextField(
+                    value = token,
+                    onValueChange = { token = it },
+                    label = { Text("配对 token") },
+                    singleLine = true,
+                )
+                status?.let {
+                    Text(
+                        text = it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onSubmit(host.trim(), token.trim()) },
+                enabled = host.isNotBlank(),
+            ) { Text("开始配对") }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) { Text("取消") }
+        },
+    )
 }
 
 @Composable

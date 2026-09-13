@@ -6,7 +6,11 @@
   "allowed_idps": ["{{CF_ACCESS_EMAIL_IDP}}"],
   "app_launcher_visible": false,
   "bypass": [
-    { "type": "exact_path", "value": "/.well-known/assetlinks.json" }
+    { "type": "exact_path", "value": "/.well-known/assetlinks.json" },
+    { "type": "exact_path", "value": "/.well-known/oauth-authorization-server" },
+    { "type": "exact_path", "value": "/auth/registration" },
+    { "type": "exact_path", "value": "/auth/token" },
+    { "type": "path", "value": "/api/v1" }
   ],
   "policies": [
     {

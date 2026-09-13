@@ -214,6 +214,40 @@ describe("AccessJwtVerifier — failure modes", () => {
     await expectInvalid(verifier.verifyRequest(headersFor(assertion)), "signature");
   });
 
+  it("falls back to Authorization: Bearer when the edge header is absent", async () => {
+    const { verifier } = makeVerifier([jwksWithKids(KID)]);
+    const assertion = await signAccessJwt();
+    // Lowercase scheme, and case-insensitive header name, must both work.
+    const identity = await verifier.verifyRequest({ authorization: `bearer ${assertion}` });
+    expect(identity.subject).toBe(SUBJECT);
+    await expect(
+      verifier.verifyRequest({ Authorization: `Bearer ${assertion}` }),
+    ).resolves.toMatchObject({ subject: SUBJECT });
+  });
+
+  it("prefers the edge header over a Bearer credential", async () => {
+    const { verifier } = makeVerifier([jwksWithKids(KID)]);
+    const edge = await signAccessJwt();
+    const otherPair = await jose.generateKeyPair("RS256", { extractable: true });
+    const bogusBearer = await signAccessJwt({ key: otherPair.privateKey });
+    const identity = await verifier.verifyRequest({
+      "cf-access-jwt-assertion": edge,
+      authorization: `Bearer ${bogusBearer}`,
+    });
+    expect(identity.subject).toBe(SUBJECT);
+  });
+
+  it("rejects blank or non-Bearer authorization values as missing", async () => {
+    const { verifier } = makeVerifier([jwksWithKids(KID)]);
+    for (const headers of [
+      { authorization: "" },
+      { authorization: "Bearer " },
+      { authorization: "Basic Zm9vOmJhcg==" },
+    ]) {
+      await expect(verifier.verifyRequest(headers)).rejects.toBeInstanceOf(MissingAssertionError);
+    }
+  });
+
   it("rejects a wrong issuer", async () => {
     const { verifier } = makeVerifier([jwksWithKids(KID)]);
     const assertion = await signAccessJwt({

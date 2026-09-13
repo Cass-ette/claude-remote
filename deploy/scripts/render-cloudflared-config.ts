@@ -25,7 +25,8 @@
 //   3. Never a service token: CF_SERVICE_TOKEN / CF_ACCESS_CLIENT_ID /
 //      CF_ACCESS_CLIENT_SECRET keys and bearer-style values are rejected at
 //      input validation — the rendered files cannot carry them. Per-device
-//      Access Managed OAuth is the only supported authentication (§10.2).
+//      Access identity via the Bridge OAuth authorization server is the only
+//      supported authentication (revised §10.2).
 //   4. Never an empty variable: every required input must resolve non-empty;
 //      the error names the variable. Leftover {{PLACEHOLDER}} tokens in the
 //      rendered output are a typed error too.
@@ -134,7 +135,8 @@ export function assertNoServiceTokens(record: Record<string, string>): void {
       throw new RenderError(
         "SERVICE_TOKEN_REJECTED",
         `refusing service-token style input ${JSON.stringify(key)}: the Bridge never uses Cloudflare ` +
-          "service tokens; remote authentication is per-device Access Managed OAuth (spec §10.2).",
+          "service tokens; remote authentication is per-device Access identity via the Bridge OAuth " +
+          "authorization server (revised spec §10.2).",
       );
     }
     if (typeof value === "string" && SERVICE_TOKEN_VALUE_PATTERN.test(value)) {
@@ -490,11 +492,17 @@ function assertAccessAppInvariants(app: AccessApp, config: TunnelConfig): void {
       `access app aud must match BRIDGE_CLOUDFLARE_AUD; got ${JSON.stringify(app.aud)}.`,
     );
   }
-  const expectedBypass = [{ type: "exact_path", value: "/.well-known/assetlinks.json" }];
+  const expectedBypass = [
+    { type: "exact_path", value: "/.well-known/assetlinks.json" },
+    { type: "exact_path", value: "/.well-known/oauth-authorization-server" },
+    { type: "exact_path", value: "/auth/registration" },
+    { type: "exact_path", value: "/auth/token" },
+    { type: "path", value: "/api/v1" },
+  ];
   if (JSON.stringify(app.bypass) !== JSON.stringify(expectedBypass)) {
     throw new RenderError(
       "ACCESS_APP_INVARIANT_VIOLATED",
-      "the only bypass must be the exact path /.well-known/assetlinks.json (Android App Link verification).",
+      "the bypass list must be exactly the revised-§10.2 set: App Link verification + OAuth discovery/registration/token + the /api/v1 prefix (origin verifies the Access JWT as Bearer); /auth/authorize stays behind Access.",
     );
   }
   const expectedInclude = config.subjects.map((email) => ({ email: { email } }));

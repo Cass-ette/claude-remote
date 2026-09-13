@@ -1,6 +1,7 @@
 package dev.clauderemote.android
 
 import android.app.Application
+import dev.clauderemote.android.auth.PairingController
 
 /**
  * Application entry point and graph owner. [onCreate] builds the real
@@ -17,11 +18,16 @@ class ClaudeRemoteApp : Application() {
     var graph: AppGraph? = null
         private set
 
+    /** Interactive login + pairing (revised §10.2); survives graph rebuilds. */
+    lateinit var pairingController: PairingController
+        private set
+
     override fun onCreate() {
         super.onCreate()
         hostStore = BridgeHostStore(this)
         graph = AppGraph.build(this, BridgeEndpoints.of(resolveBaseUrl(hostStore.bridgeHost())))
         graph?.start()
+        pairingController = PairingController(this) { graph }
     }
 
     /**

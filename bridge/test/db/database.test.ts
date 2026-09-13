@@ -86,7 +86,7 @@ describe("migrate", () => {
     const rows = db.prepare("SELECT version FROM schema_migrations").all() as {
       version: number;
     }[];
-    expect(rows).toEqual([{ version: 1 }, { version: 2 }]);
+    expect(rows).toEqual([{ version: 1 }, { version: 2 }, { version: 3 }]);
   });
 });
 
