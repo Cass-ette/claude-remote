@@ -7,7 +7,9 @@ import android.net.Uri
 import android.os.Build
 import androidx.annotation.RequiresApi
 import java.io.IOException
+import java.net.HttpURLConnection
 import java.net.URI
+import java.net.URL
 import java.net.URLDecoder
 import java.security.MessageDigest
 import java.security.SecureRandom
@@ -25,6 +27,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import net.openid.appauth.AppAuthConfiguration
 import net.openid.appauth.AuthorizationRequest
 import net.openid.appauth.AuthorizationService
 import net.openid.appauth.AuthorizationServiceConfiguration
@@ -32,6 +35,7 @@ import net.openid.appauth.GrantTypeValues
 import net.openid.appauth.NoClientAuthentication
 import net.openid.appauth.ResponseTypeValues
 import net.openid.appauth.TokenRequest
+import net.openid.appauth.connectivity.ConnectionBuilder
 import okhttp3.Call
 import okhttp3.Callback
 import okhttp3.MediaType
@@ -463,6 +467,29 @@ class OAuthManager(
 // ---------------------------------------------------------------------------
 
 /**
+ * [ConnectionBuilder] that forbids edge compression on every AppAuth HTTP
+ * call. Some OEM HttpURLConnection stacks (observed on MIUI behind Cloudflare)
+ * end up handing gzipped bodies to the JSON parser, which surfaces as
+ * `INVALID_DISCOVERY_DOCUMENT` / token-response parse failures; a request
+ * that explicitly offers `identity` is never compressed, so no transparent
+ * decompression is ever required of the platform stack.
+ */
+object NoCompressionConnectionBuilder : ConnectionBuilder {
+    override fun openConnection(uri: Uri): HttpURLConnection {
+        val connection = URL(uri.toString()).openConnection() as HttpURLConnection
+        connection.setRequestProperty("Accept", "application/json")
+        connection.setRequestProperty("Accept-Encoding", "identity")
+        return connection
+    }
+}
+
+/** [AppAuthConfiguration] routing all AppAuth HTTP through [NoCompressionConnectionBuilder]. */
+val NO_COMPRESSION_APPAUTH_CONFIG: AppAuthConfiguration =
+    AppAuthConfiguration.Builder()
+        .setConnectionBuilder(NoCompressionConnectionBuilder)
+        .build()
+
+/**
  * [AppLinkVerifier] backed by the platform domain-verification state.
  *
  * - Android 12+ (API 31): the host must report
@@ -514,23 +541,41 @@ class PlatformAppLinkVerifier(private val context: Context) : AppLinkVerifier {
  */
 class AppAuthGateway(private val context: Context) {
 
-    private val service: AuthorizationService by lazy { AuthorizationService(context) }
+    private val service: AuthorizationService by lazy {
+        AuthorizationService(context, NO_COMPRESSION_APPAUTH_CONFIG)
+    }
 
-    /** Fetches the RFC 8414 metadata of the OAuth server fronting [host]. */
-    suspend fun fetchServiceConfiguration(host: String): AuthorizationServiceConfiguration =
-        suspendCancellableCoroutine { continuation ->
-            AuthorizationServiceConfiguration.fetchFromUrl(
-                Uri.parse(OAuthFlows.discoveryUri(host)),
-            ) { configuration, exception ->
-                if (configuration != null) {
-                    continuation.resume(configuration)
-                } else {
-                    continuation.resumeWithException(
-                        exception ?: IOException("OAuth discovery failed for \"$host\""),
-                    )
-                }
+    /**
+     * Fetches the RFC 8414 metadata of the OAuth server fronting [host].
+     *
+     * Deliberately NOT [AuthorizationServiceConfiguration.fetchFromUrl]:
+     * AppAuth parses the document with its OIDC discovery parser
+     * (`AuthorizationServiceDiscovery`), which mandates `jwks_uri` — a field
+     * the bridge's RFC 8414 metadata does not carry. OkHttp handles edge
+     * gzip transparently, and the document is validated by the unit-tested
+     * [OAuthFlows.parseDiscoveryDocument] instead.
+     */
+    suspend fun fetchServiceConfiguration(
+        host: String,
+        client: OkHttpClient = OkHttpClient(),
+    ): AuthorizationServiceConfiguration {
+        val request = Request.Builder()
+            .url(OAuthFlows.discoveryUri(host))
+            .header("Accept", "application/json")
+            .build()
+        val body = client.newCall(request).await().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("OAuth discovery failed for \"$host\" (HTTP ${response.code})")
             }
+            response.body?.string().orEmpty()
         }
+        val endpoints = OAuthFlows.parseDiscoveryDocument(body)
+        return AuthorizationServiceConfiguration(
+            Uri.parse(endpoints.authorizationEndpoint),
+            Uri.parse(endpoints.tokenEndpoint),
+            Uri.parse(endpoints.registrationEndpoint),
+        )
+    }
 
     /**
      * Dynamically registers this install as a PUBLIC client (no client
@@ -639,7 +684,9 @@ class AppAuthTokenRefresher(
     private val clientId: String,
 ) : TokenRefresher {
 
-    private val service: AuthorizationService by lazy { AuthorizationService(context) }
+    private val service: AuthorizationService by lazy {
+        AuthorizationService(context, NO_COMPRESSION_APPAUTH_CONFIG)
+    }
 
     override suspend fun refresh(refreshToken: String): AccessTokens {
         val request = TokenRequest.Builder(configuration, configuration.tokenEndpoint.toString())

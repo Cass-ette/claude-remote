@@ -210,7 +210,11 @@ private fun ClaudeRemoteNavGraph() {
             runCatching { app.pairingController.begin(host, pairingToken) }
                 .onSuccess { intent ->
                     activity?.pairingStatus?.value = "请在浏览器中完成 Cloudflare 登录"
-                    app.startActivity(intent)
+                    // Application contexts cannot startActivity without
+                    // FLAG_ACTIVITY_NEW_TASK — that crashes instead of opening
+                    // the Custom Tab, so prefer the activity context.
+                    val starter = activity ?: app.also { intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK) }
+                    starter.startActivity(intent)
                 }
                 .onFailure { e ->
                     activity?.pairingStatus?.value =
