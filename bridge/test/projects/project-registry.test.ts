@@ -98,8 +98,12 @@ describe("revalidate", () => {
     const registry = createProjectRegistry(db);
     const dir = makeProjectDir("zeta");
     const record = registry.authorize(dir, "Zeta", { now: 1_000 });
+    // Allocate the replacement BEFORE removing the original: its inode is
+    // then guaranteed to differ (ext4 reuses a just-freed inode on
+    // rmdir+mkdir, which would make rmSync+mkdirSync flaky here).
+    const replacement = makeProjectDir("zeta-replacement");
     rmSync(dir, { recursive: true });
-    mkdirSync(dir);
+    renameSync(replacement, dir);
     expect(() => registry.revalidate(record.projectId)).toThrow(ProjectIdentityError);
   });
 
