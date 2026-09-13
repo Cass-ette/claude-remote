@@ -2,7 +2,15 @@
  * Project registry identity revalidation tests (spec §6.6, §10.5).
  */
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, renameSync, rmSync, statSync, symlinkSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
@@ -41,7 +49,10 @@ describe("authorize", () => {
 
     expect(record.projectId).toMatch(/^[0-9a-f-]{36}$/);
     const stats = statSync(dir);
-    expect(record.canonicalRealpath).not.toBe(dir); // macOS /tmp -> /private/tmp resolution
+    // Canonicalization is platform-honest: on macOS tmpdir is a symlink
+    // (/tmp -> /private/tmp) so the canonical path differs from `dir`; on
+    // Linux tmpdir is already canonical and they are equal.
+    expect(record.canonicalRealpath).toBe(realpathSync(dir));
     expect(record.deviceNumber).toBe(stats.dev);
     expect(record.inode).toBe(stats.ino);
     expect(record.displayName).toBe("Alpha");

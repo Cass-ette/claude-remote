@@ -1,0 +1,86 @@
+# Deterministic CI only.
+#
+# Real Claude / Cloudflare / device gates are NEVER invoked here: the phase0
+# aggregator only consumes evidence files, and none exist on a fresh CI
+# runner, so every gate synthesizes `not_run` and the step exits 0. Real-gate
+# env vars (ANTHROPIC_API_KEY, REAL_TRANSCRIPT_MANIFEST, RUN_REAL_CLOUDFLARE)
+# are deliberately not set and must never be added to this workflow.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  node:
+    name: Node (typecheck, test, build, phase0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck (root + workspaces)
+        run: npm run typecheck
+
+      - name: Test (root + workspaces; real-gate suites skip without env)
+        run: npm test
+
+      # Root has no build script; the bridge workspace build also copies the
+      # permission-adapter entrypoint into dist (Bridge + Permission Adapter).
+      - name: Build Bridge + Permission Adapter
+        run: npm run build -w bridge
+
+      - name: Phase 0 aggregator (must synthesize not_run and exit 0)
+        run: |
+          npm run phase0
+          node --input-type=module -e "
+            import { readFileSync } from 'node:fs';
+            const summary = JSON.parse(readFileSync('build/phase0/summary.json', 'utf8'));
+            const bad = summary.results.filter((r) => r.status !== 'not_run');
+            if (bad.length > 0) {
+              console.error('gates unexpectedly not not_run:', JSON.stringify(bad));
+              process.exit(1);
+            }
+            console.log('phase0: all gates not_run (', summary.results.map((r) => r.name).join(', '), ')');
+          "
+
+  android:
+    name: Android (JVM unit tests, assembleDebug)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      # Installs cmdline-tools, accepts licenses, exports ANDROID_HOME.
+      # local.properties is gitignored, so Gradle resolves the SDK from env.
+      - uses: android-actions/setup-android@v3
+
+      - name: Gradle cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle.kts', 'android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: gradle-${{ runner.os }}-
+
+      # JVM unit tests only — no emulator, no instrumented tests in CI.
+      - name: Unit tests + debug APK
+        run: ./gradlew -p android app:testDebugUnitTest app:assembleDebug --no-daemon
+        working-directory: android
