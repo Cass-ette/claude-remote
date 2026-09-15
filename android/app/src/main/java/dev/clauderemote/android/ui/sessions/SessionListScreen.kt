@@ -18,6 +18,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -25,6 +26,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import dev.clauderemote.android.sync.BridgeProject
 
 /**
  * §12.1 session list — sessions grouped by lifecycle state (等待批准 /
@@ -61,11 +63,19 @@ data class SessionListUiState(val groups: List<SessionGroupUi>)
 @Composable
 fun SessionListScreen(
     state: SessionListUiState,
+    projects: List<BridgeProject>,
+    onFetchProjects: () -> Unit,
     onOpenSession: (String) -> Unit,
     onNewSession: (projectId: String, displayName: String?) -> Unit,
     onScanImports: () -> Unit,
 ) {
     var showNewSessionDialog by remember { mutableStateOf(false) }
+    // §7.2 step 1: the picker lists what the bridge authorizes, refreshed
+    // every time the dialog opens (never derived from local sessions — a
+    // fresh install has none yet).
+    LaunchedEffect(showNewSessionDialog) {
+        if (showNewSessionDialog) onFetchProjects()
+    }
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         Text("会话", style = MaterialTheme.typography.headlineSmall)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -89,7 +99,7 @@ fun SessionListScreen(
     }
     if (showNewSessionDialog) {
         NewSessionDialog(
-            projects = state.projectsOf(),
+            projects = projects,
             onDismiss = { showNewSessionDialog = false },
             onCreate = { projectId, name ->
                 showNewSessionDialog = false
@@ -140,11 +150,16 @@ private fun SessionRow(row: SessionRowUi, onClick: () -> Unit) {
  */
 @Composable
 private fun NewSessionDialog(
-    projects: List<String>,
+    projects: List<BridgeProject>,
     onDismiss: () -> Unit,
     onCreate: (projectId: String, displayName: String?) -> Unit,
 ) {
-    var selectedProject by remember { mutableStateOf(projects.firstOrNull()) }
+    var selectedProject by remember { mutableStateOf<BridgeProject?>(null) }
+    // The dialog opens before project.list resolves; auto-select the first
+    // entry once it arrives (without clobbering an explicit user choice).
+    LaunchedEffect(projects) {
+        if (selectedProject == null) selectedProject = projects.firstOrNull()
+    }
     var displayName by remember { mutableStateOf("") }
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -152,13 +167,20 @@ private fun NewSessionDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text("项目（仅限 Bridge 授权项目）", style = MaterialTheme.typography.labelMedium)
+                if (projects.isEmpty()) {
+                    Text(
+                        "Bridge 上还没有已授权项目；请在 Mac 上执行 admin authorize-project 后重试",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
                 projects.forEach { project ->
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         androidx.compose.material3.RadioButton(
-                            selected = selectedProject == project,
+                            selected = selectedProject?.projectId == project.projectId,
                             onClick = { selectedProject = project },
                         )
-                        Text(project, style = MaterialTheme.typography.bodyMedium)
+                        Text(project.displayName, style = MaterialTheme.typography.bodyMedium)
                     }
                 }
                 OutlinedTextField(
@@ -171,7 +193,7 @@ private fun NewSessionDialog(
         },
         confirmButton = {
             TextButton(
-                onClick = { onCreate(selectedProject ?: return@TextButton, displayName.ifBlank { null }) },
+                onClick = { onCreate(selectedProject?.projectId ?: return@TextButton, displayName.ifBlank { null }) },
                 enabled = selectedProject != null,
             ) {
                 Text("创建")
@@ -182,7 +204,3 @@ private fun NewSessionDialog(
         },
     )
 }
-
-/** The union of projects across groups (the new-session project picker source). */
-private fun SessionListUiState.projectsOf(): List<String> =
-    groups.flatMap { it.rows.map { row -> row.projectName } }.distinct()

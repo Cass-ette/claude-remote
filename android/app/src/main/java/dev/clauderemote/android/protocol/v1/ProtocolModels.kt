@@ -131,6 +131,7 @@ object Rfc3339Serializer : KSerializer<String> {
 
 /** Section 8.1 commandType enum; values mirror the sealed @SerialName discriminators. */
 enum class CommandType(val wire: String) {
+    PROJECT_LIST("project.list"),
     SESSION_LIST("session.list"),
     SESSION_SCAN_IMPORTS("session.scan_imports"),
     SESSION_IMPORT("session.import"),
@@ -191,6 +192,9 @@ enum class PermissionDecision {
 // ---------------------------------------------------------------------------
 // Command payloads (Section 8.1 $defs)
 // ---------------------------------------------------------------------------
+
+@Serializable
+object ProjectListPayload
 
 @Serializable
 object SessionListPayload
@@ -260,13 +264,26 @@ sealed class ProtocolCommand {
     abstract val requestId: String
     abstract val idempotencyKey: String
 
-    /** Null for global commands (session.list, scan_imports, import, create). */
+    /** Null for global commands (project.list, session.list, scan_imports, import, create). */
     abstract val sessionId: String?
 
     abstract val sentAt: String
 
     /** Wire discriminator of this variant (matches [CommandType.wire]). */
     abstract val commandType: CommandType
+}
+
+@Serializable
+@SerialName("project.list")
+data class ProjectListCommand(
+    override val protocolVersion: String = PROTOCOL_VERSION,
+    override val requestId: String,
+    override val idempotencyKey: String,
+    override val sessionId: String? = null,
+    @Serializable(with = Rfc3339Serializer::class) override val sentAt: String,
+    val payload: ProjectListPayload = ProjectListPayload,
+) : ProtocolCommand() {
+    override val commandType: CommandType get() = CommandType.PROJECT_LIST
 }
 
 @Serializable

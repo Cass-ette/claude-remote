@@ -358,12 +358,34 @@ class E2eFakeBridgeServer {
         val command = json.parseToJsonElement(body).jsonObject
         val requestId = command["requestId"]?.jsonPrimitive?.contentOrNull ?: ""
         return when (command["commandType"]?.jsonPrimitive?.contentOrNull) {
+            "project.list" -> projectList(requestId)
             "session.snapshot.begin" -> snapshotBegin(requestId)
             "session.snapshot.page" -> snapshotPage(requestId)
             "session.snapshot.commit" -> snapshotCommit(requestId, command["payload"]?.jsonObject)
             else -> notFound()
         }
     }
+
+    /** Projects the §7.2 picker lists; tests may replace the list. */
+    @Volatile
+    var projects: List<Pair<String, String>> = emptyList() // (projectId, displayName)
+
+    private fun projectList(requestId: String): MockResponse = commandResult(
+        requestId,
+        buildJsonObject {
+            put(
+                "projects",
+                kotlinx.serialization.json.JsonArray(
+                    projects.map { (id, name) ->
+                        buildJsonObject {
+                            put("projectId", id)
+                            put("displayName", name)
+                        }
+                    },
+                ),
+            )
+        },
+    )
 
     private fun snapshotBegin(requestId: String): MockResponse {
         val script = snapshotScriptQueue.poll() ?: nextSnapshot

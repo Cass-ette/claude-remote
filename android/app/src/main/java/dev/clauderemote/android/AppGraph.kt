@@ -22,7 +22,9 @@ import dev.clauderemote.android.network.HttpBridgeApi
 import dev.clauderemote.android.network.ManagerCredentialSource
 import dev.clauderemote.android.network.OkHttpBridgeTransport
 import dev.clauderemote.android.security.DeviceKeyManager
+import dev.clauderemote.android.sync.BridgeProjectApi
 import dev.clauderemote.android.sync.BridgeSnapshotApi
+import dev.clauderemote.android.sync.ProjectListApi
 import dev.clauderemote.android.sync.SessionRepository
 import dev.clauderemote.android.sync.SnapshotCoordinator
 import dev.clauderemote.android.ui.ConversationRepository
@@ -75,6 +77,7 @@ class AppGraph private constructor(
     val deviceSessions: DeviceSessionManager,
     val coordinator: ConnectionCoordinator,
     val snapshotCoordinator: SnapshotCoordinator,
+    val projectApi: ProjectListApi,
     val repository: SessionRepository,
     val conversationRepository: ConversationRepository,
     val tokenExpirySource: TokenExpirySource,
@@ -218,6 +221,7 @@ class AppGraph private constructor(
                 deviceSessions = deviceSessions,
                 coordinator = coordinator,
                 snapshotCoordinator = snapshotCoordinator,
+                projectApi = BridgeProjectApi(commandsApi),
                 repository = sessionRepository,
                 conversationRepository = RoomConversationRepository(db),
                 tokenExpirySource = StoreTokenExpirySource(tokenStore),

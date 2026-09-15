@@ -41,6 +41,7 @@ import dev.clauderemote.android.ui.sessions.SessionListScreen
 import dev.clauderemote.android.ui.sessions.SessionListUiState
 import dev.clauderemote.android.ui.sessions.SessionRowUi
 import dev.clauderemote.android.ui.sessions.sessionListGroupOf
+import dev.clauderemote.android.sync.BridgeProject
 import java.time.Duration
 import java.time.Instant
 import java.util.UUID
@@ -203,6 +204,17 @@ private fun ClaudeRemoteNavGraph() {
         }
     }
 
+    // §7.2 step 1: the bridge-authorized project list (NOT derived from the
+    // local session projection — a fresh install has no sessions yet). Fetched
+    // when the new-session dialog opens and when the import screen is entered.
+    var bridgeProjects by remember { mutableStateOf<List<BridgeProject>>(emptyList()) }
+    val fetchProjects: () -> Unit = {
+        scope.launch {
+            runCatching { graph.projectApi.listProjects() }
+                .onSuccess { bridgeProjects = it }
+        }
+    }
+
     /** Launches the interactive browser login (optionally with a pairing token). */
     fun startInteractiveLogin(host: String, pairingToken: String?) {
         scope.launch {
@@ -249,7 +261,11 @@ private fun ClaudeRemoteNavGraph() {
                 state = ConnectionUiState(
                     // Display-only decode of the Access token's `sub` claim
                     // (verification already happened at exchange/refresh).
-                    signedInAs = decodeJwtSubject(graph.tokenStore.getAccessToken()?.token),
+                    // Bridge-issued access tokens are opaque (not JWTs), so a
+                    // null subject decode is expected while still signed in.
+                    signedInAs = graph.tokenStore.getAccessToken()?.let { stored ->
+                        decodeJwtSubject(stored.token) ?: "Bridge 令牌"
+                    },
                     paired = graph.tokenStore.getDeviceSessionToken() != null,
                     deviceIdentity = runCatching { graph.deviceKeys.deviceId() }
                         .getOrElse { "设备密钥不可用" },
@@ -269,11 +285,15 @@ private fun ClaudeRemoteNavGraph() {
                             startInteractiveLogin(hostInput, null)
                         } else {
                             runCatching { graph.oauth.getValidAccessToken(forceRefresh = true) }
+                                .onSuccess { graph.coordinator.start() }
                                 .onFailure { e ->
+                                    // A dead refresh token must fall through to
+                                    // the browser — never leave the user stuck
+                                    // with no in-app path forward.
                                     activity?.pairingStatus?.value =
-                                        "刷新失败，需重新登录：${e.message ?: e.javaClass.simpleName}"
+                                        "刷新失败，改为浏览器重新登录：${e.message ?: e.javaClass.simpleName}"
+                                    startInteractiveLogin(hostInput, null)
                                 }
-                            graph.coordinator.start()
                         }
                     }
                 },
@@ -286,6 +306,8 @@ private fun ClaudeRemoteNavGraph() {
         composable(Routes.SESSIONS) {
             SessionListScreen(
                 state = sessionListState(sessionRows.map(::sessionRowOf)),
+                projects = bridgeProjects,
+                onFetchProjects = fetchProjects,
                 onOpenSession = { sessionId ->
                     navController.navigate(Routes.CONVERSATION.replace("{sessionId}", sessionId))
                 },
@@ -319,10 +341,12 @@ private fun ClaudeRemoteNavGraph() {
                 )
             }
             val importState by viewModel.importState.collectAsState()
-            LaunchedEffect(sessionRows) {
-                // The project picker lists the projects this install already
-                // tracks in the projection (Bridge-authorized projects).
-                viewModel.setKnownProjects(sessionRows.map { it.projectId }.distinct())
+            LaunchedEffect(Unit) { fetchProjects() }
+            LaunchedEffect(bridgeProjects) {
+                // The import picker lists the bridge-authorized projects
+                // (§12.4), not the local projection. The picker value feeds
+                // session.scan_imports verbatim, so it must stay the projectId.
+                viewModel.setKnownProjects(bridgeProjects.map { it.projectId })
             }
             ImportSessionScreen(
                 state = importState,

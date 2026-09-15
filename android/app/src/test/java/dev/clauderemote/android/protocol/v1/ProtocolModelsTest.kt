@@ -68,6 +68,7 @@ class ProtocolModelsTest {
     @Test
     fun everyCommandVariantRoundTripsWithDiscriminatorAndProtocolVersion() {
         val cases: List<Pair<ProtocolCommand, String>> = listOf(
+            ProjectListCommand(requestId = uuid, idempotencyKey = "idem-1", sentAt = rfc3339Z) to "project.list",
             SessionListCommand(requestId = uuid, idempotencyKey = "idem-1", sentAt = rfc3339Z) to "session.list",
             SessionScanImportsCommand(
                 requestId = uuid, idempotencyKey = "idem-1", sentAt = rfc3339Z,
@@ -144,7 +145,7 @@ class ProtocolModelsTest {
                 payload = EventsAckPayload(sessionId = uuid, lastEventId = 42L),
             ) to "events.ack",
         )
-        assertEquals(17, cases.size) // 16 variants, session.create twice (displayName optional)
+        assertEquals(18, cases.size) // 17 variants, session.create twice (displayName optional)
 
         for ((command, wire) in cases) {
             val tree = roundTrip(command)
@@ -170,8 +171,9 @@ class ProtocolModelsTest {
     }
 
     @Test
-    fun commandTypeEnumMirrorsTheSixteenSchemaWireNames() {
+    fun commandTypeEnumMirrorsTheSeventeenSchemaWireNames() {
         val expected = setOf(
+            "project.list",
             "session.list",
             "session.scan_imports",
             "session.import",
@@ -189,7 +191,7 @@ class ProtocolModelsTest {
             "permission.resolve",
             "events.ack",
         )
-        assertEquals(16, CommandType.values().size)
+        assertEquals(17, CommandType.values().size)
         assertEquals(expected, CommandType.values().map { it.wire }.toSet())
     }
 
