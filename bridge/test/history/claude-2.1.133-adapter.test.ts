@@ -167,6 +167,24 @@ describe("readSnapshot", () => {
     }
   });
 
+  it("drops thinking-only records and emits no empty text row for tool-only turns", async () => {
+    // GLM-class transcripts interleave `thinking`-only assistant records
+    // around tool calls; those must materialize nothing (an empty text row
+    // renders as a blank bubble downstream), and a tool-only record yields
+    // only its tool_use row.
+    const path = placeFixture("thinking-turn.jsonl", SESSION_B);
+    const { items } = await adapter.readSnapshot(path, Number.MAX_SAFE_INTEGER);
+
+    expect(items.find((i) => i.historyItemId === "bbbbbbbb-0000-4000-8000-000000000002")).toBeUndefined();
+    expect(items.find((i) => i.historyItemId === "bbbbbbbb-0000-4000-8000-000000000005")).toBeUndefined();
+    expect(items.find((i) => i.historyItemId === "bbbbbbbb-0000-4000-8000-000000000003")).toBeUndefined();
+    expect(items.find((i) => i.historyItemId === "toolu_bbbbbbbb-0000-4000-8000-000000000003")).toBeDefined();
+    expect(items.every((i) => i.contentBlocks.length > 0)).toBe(true);
+    const final = items.find((i) => i.historyItemId === "bbbbbbbb-0000-4000-8000-000000000006");
+    expect(final?.role).toBe("assistant");
+    expect(final?.contentBlocks).toEqual([{ kind: "text", text: "17 entries." }]);
+  });
+
   it("cuts mid-record when byteLimit falls inside a complete record", async () => {
     const path = placeFixture("complete.jsonl", SESSION_A);
     const full = await adapter.readSnapshot(path, Number.MAX_SAFE_INTEGER);

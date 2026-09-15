@@ -505,13 +505,17 @@ function toHistoryItems(rec: ParsedRecord): HistoryItem[] {
     const uuid = asString((rec.json as { uuid?: unknown }).uuid);
     const msg = (rec.json as { message?: unknown }).message as { content?: unknown } | undefined;
     const blocks = normalizeContent(msg?.content);
-    items.push({
-      historyItemId: uuid ?? `offset-${baseOffset}`,
-      role: "assistant",
-      contentBlocks: blocks.userBlocks,
-      createdAt,
-      sourceTranscriptOffset: baseOffset,
-    });
+    // Thinking-only / tool-only turns have no user-visible text block; an
+    // empty text row would render as a blank bubble downstream.
+    if (blocks.userBlocks.length > 0) {
+      items.push({
+        historyItemId: uuid ?? `offset-${baseOffset}`,
+        role: "assistant",
+        contentBlocks: blocks.userBlocks,
+        createdAt,
+        sourceTranscriptOffset: baseOffset,
+      });
+    }
     for (const tu of blocks.toolUses) {
       items.push({
         historyItemId: tu.toolUseId,
