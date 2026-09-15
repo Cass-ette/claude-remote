@@ -30,6 +30,16 @@ export interface VerifiedAccessIdentity {
   readonly expiresAt: string;
 }
 
+/**
+ * What /api/v1 routes and the WS endpoint need from an access credential:
+ * headers in, verified identity out, throw on failure. Implemented by
+ * AccessJwtVerifier (Cloudflare assertions) and by the bridge's own opaque
+ * token resolver (oauth-server's createBridgeAccessVerifier).
+ */
+export interface AccessIdentitySource {
+  verifyRequest(headers: Record<string, string | string[] | undefined>): Promise<VerifiedAccessIdentity>;
+}
+
 /** Function that fetches the JWKS document for a team domain. */
 export type JwksFetcher = (teamDomain: string) => Promise<jose.JSONWebKeySet>;
 

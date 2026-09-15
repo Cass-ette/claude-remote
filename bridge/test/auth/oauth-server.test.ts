@@ -10,6 +10,7 @@ import {
   type JwksFetcher,
 } from "../../src/auth/access-jwt-verifier.js";
 import {
+  createBridgeAccessVerifier,
   createOAuthStore,
   isValidRedirectUri,
   registerOAuthRoutes,
@@ -259,7 +260,7 @@ describe("GET /auth/authorize", () => {
 });
 
 describe("POST /auth/token", () => {
-  it("exchanges a code for the Access assertion as the Bearer access_token", async () => {
+  it("exchanges a code for a bridge-issued opaque access token", async () => {
     const client = await registerClient();
     const { location, assertion, pkceVerifier } = await authorizeCode(client);
     const code = location.searchParams.get("code") ?? "";
@@ -277,15 +278,22 @@ describe("POST /auth/token", () => {
     });
     expect(res.statusCode).toBe(200);
     const body = res.json() as { access_token: string; token_type: string; expires_in: number; refresh_token: string };
-    expect(body.access_token).toBe(assertion);
+    expect(body.access_token).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+    expect(body.access_token).not.toBe(assertion);
     expect(body.token_type).toBe("Bearer");
-    expect(body.expires_in).toBeGreaterThan(0);
+    expect(body.expires_in).toBeGreaterThan(6 * 24 * 3600);
+    expect(body.expires_in).toBeLessThanOrEqual(7 * 24 * 3600);
     expect(body.refresh_token).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+    // The minted token is exactly what the app-facing Bearer verifier accepts.
+    const identity = await createBridgeAccessVerifier({ store, now: () => nowMs }).verifyRequest({
+      authorization: `Bearer ${body.access_token}`,
+    });
+    expect(identity.subject).toBe(SUBJECT);
   });
 
-  it("re-serves the same assertion via the refresh token while it is valid", async () => {
+  it("refresh mints a new access token and outlives the Access assertion", async () => {
     const client = await registerClient();
-    const { location, assertion, pkceVerifier } = await authorizeCode(client);
+    const { location, pkceVerifier } = await authorizeCode(client);
     const exchange = await app!.inject({
       method: "POST",
       url: "/auth/token",
@@ -298,7 +306,10 @@ describe("POST /auth/token", () => {
         code_verifier: pkceVerifier,
       }).toString(),
     });
-    const issued = exchange.json() as { refresh_token: string };
+    const issued = exchange.json() as { access_token: string; refresh_token: string };
+    // Idle far past the assertion's one-hour lifetime (the incident the
+    // bridge-issued tokens fix): the refresh must still work.
+    nowMs += 3 * 24 * 3600 * 1000;
     const refresh = await app!.inject({
       method: "POST",
       url: "/auth/token",
@@ -311,9 +322,14 @@ describe("POST /auth/token", () => {
     });
     expect(refresh.statusCode).toBe(200);
     const body = refresh.json() as { access_token: string; refresh_token: string; expires_in: number };
-    expect(body.access_token).toBe(assertion);
+    expect(body.access_token).toMatch(/^[A-Za-z0-9_-]{40,}$/);
+    expect(body.access_token).not.toBe(issued.access_token);
     expect(body.refresh_token).toBe(issued.refresh_token);
     expect(body.expires_in).toBeGreaterThan(0);
+    const identity = await createBridgeAccessVerifier({ store, now: () => nowMs }).verifyRequest({
+      authorization: `Bearer ${body.access_token}`,
+    });
+    expect(identity.subject).toBe(SUBJECT);
   });
 
   it("never lets a code be used twice", async () => {
@@ -343,19 +359,13 @@ describe("POST /auth/token", () => {
     expect((right.json() as { error: string }).error).toBe("invalid_grant");
   });
 
-  it("re-serves the assertion on refresh_token and invalidates once it is unusable", async () => {
+  it("rejects an expired refresh token and deletes the row", async () => {
     const client = await registerClient();
-    // Insert a refresh row directly holding an assertion signed by a
-    // stranger's key: verification must fail, the row must be deleted.
-    const stranger = await jose.generateKeyPair("RS256", { extractable: true });
-    const nowSec = Math.floor(nowMs / 1000);
-    const bogus = await new jose.SignJWT({ iss: ISSUER, aud: AUDIENCE, sub: SUBJECT, exp: nowSec + 999 })
-      .setProtectedHeader({ alg: "RS256", kid: KID })
-      .sign(stranger.privateKey);
+    const dead = "dead-refresh-token-value";
     store.insertRefreshToken(
-      { clientId: client.clientId, subject: SUBJECT, assertion: bogus, expiresAt: nowMs + 999_000 },
-      sha256Hex(bogus),
-      nowMs,
+      { clientId: client.clientId, subject: SUBJECT, assertion: "irrelevant", expiresAt: nowMs - 1 },
+      sha256Hex(dead),
+      nowMs - 1000,
     );
     const res = await app!.inject({
       method: "POST",
@@ -364,12 +374,29 @@ describe("POST /auth/token", () => {
       payload: new URLSearchParams({
         grant_type: "refresh_token",
         client_id: client.clientId,
-        refresh_token: bogus,
+        refresh_token: dead,
       }).toString(),
     });
     expect(res.statusCode).toBe(400);
     expect((res.json() as { error: string }).error).toBe("invalid_grant");
-    expect(store.findRefreshToken(sha256Hex(bogus))).toBeNull();
+    expect(store.findRefreshToken(sha256Hex(dead))).toBeNull();
+  });
+
+  it("rejects an unknown refresh token without side effects", async () => {
+    const client = await registerClient();
+    const res = await app!.inject({
+      method: "POST",
+      url: "/auth/token",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      payload: new URLSearchParams({
+        grant_type: "refresh_token",
+        client_id: client.clientId,
+        refresh_token: "never-issued",
+      }).toString(),
+    });
+    expect(res.statusCode).toBe(400);
+    expect((res.json() as { error: string; error_description: string }).error).toBe("invalid_grant");
+    expect((res.json() as { error_description: string }).error_description).toContain("unknown");
   });
 
   it("rejects unsupported grant types", async () => {
@@ -381,6 +408,28 @@ describe("POST /auth/token", () => {
     });
     expect(res.statusCode).toBe(400);
     expect((res.json() as { error: string }).error).toBe("invalid_client");
+  });
+});
+
+describe("createBridgeAccessVerifier (app-facing Bearer gate)", () => {
+  it("resolves a minted token, rejects unknown and expired ones", async () => {
+    const verifier = createBridgeAccessVerifier({ store, now: () => nowMs });
+    const client = await registerClient();
+    const token = "bridge-access-token-under-test";
+    store.insertAccessToken(
+      { clientId: client.clientId, subject: SUBJECT, expiresAt: nowMs + 60_000 },
+      sha256Hex(token),
+      nowMs,
+    );
+    const identity = await verifier.verifyRequest({ authorization: `Bearer ${token}` });
+    expect(identity).toMatchObject({ subject: SUBJECT, audience: "bridge" });
+
+    await expect(verifier.verifyRequest({ authorization: "Bearer never-minted" })).rejects.toThrow();
+    await expect(verifier.verifyRequest({})).rejects.toThrow();
+
+    // Past expiry the row is invisible — same lookup, no identity.
+    nowMs += 61_000;
+    await expect(verifier.verifyRequest({ authorization: `Bearer ${token}` })).rejects.toThrow();
   });
 });
 

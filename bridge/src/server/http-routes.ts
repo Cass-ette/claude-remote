@@ -23,7 +23,7 @@
  * values are never passed to the audit log.
  */
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import type { AccessJwtVerifier, VerifiedAccessIdentity } from "../auth/access-jwt-verifier.js";
+import type { AccessIdentitySource, VerifiedAccessIdentity } from "../auth/access-jwt-verifier.js";
 import type { DeviceAuth } from "../auth/device-auth.js";
 import type { AuditLog } from "../audit/audit-log.js";
 import type { CommandDispatcher } from "../commands/command-dispatcher.js";
@@ -39,8 +39,11 @@ export interface AuthenticatedCommand {
 }
 
 export interface ApiRoutesDeps {
-  /** Verified Access identity source; null in local-only mode (auth impossible). */
-  readonly verifier: AccessJwtVerifier | null;
+  /**
+   * Verified Access identity source — the bridge's opaque-token resolver in
+   * production; null in local-only mode (auth impossible).
+   */
+  readonly verifier: AccessIdentitySource | null;
   readonly devices: DeviceAuth;
   readonly dispatcher: CommandDispatcher;
   /** §10.6 audit sink for auth request events. */

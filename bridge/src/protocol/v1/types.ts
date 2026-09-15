@@ -17,6 +17,7 @@ export type Uint64String = string;
 export const UINT64_STRING_PATTERN = "^[0-9]{1,20}$";
 
 export const COMMAND_TYPES = [
+  "project.list",
   "session.list",
   "session.scan_imports",
   "session.import",
@@ -66,6 +67,10 @@ export type CommandStatus = (typeof COMMAND_STATUSES)[number];
 // ---------------------------------------------------------------------------
 // Command payloads (discriminated on commandType)
 // ---------------------------------------------------------------------------
+
+export interface ProjectListPayload {
+  readonly projectId?: undefined;
+}
 
 export interface SessionListPayload {
   readonly projectId?: undefined;
@@ -123,6 +128,7 @@ export interface EventsAckPayload {
 }
 
 export interface CommandEnvelopeMap {
+  readonly "project.list": ProjectListPayload;
   readonly "session.list": SessionListPayload;
   readonly "session.scan_imports": SessionScanImportsPayload;
   readonly "session.import": SessionImportPayload;

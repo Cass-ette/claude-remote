@@ -159,6 +159,16 @@ export function createCommandDispatcher(deps: CommandDispatcherDeps) {
   async function run(envelope: Command, deviceId: string): Promise<unknown> {
     const payload = envelope.payload as Record<string, unknown>;
     switch (envelope.commandType) {
+      case "project.list": {
+        // §7.2 step 1: the client-safe subset only — canonicalRealpath and
+        // filesystem identity never leave the bridge.
+        return {
+          projects: deps.registry.list().map((project) => ({
+            projectId: project.projectId,
+            displayName: project.displayName,
+          })),
+        };
+      }
       case "session.list": {
         const rows = deps.db
           .prepare(

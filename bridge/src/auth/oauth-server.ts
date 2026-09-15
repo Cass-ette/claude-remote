@@ -23,12 +23,14 @@
  * bound to (client, redirect_uri, PKCE challenge, subject, the raw
  * assertion), and 302s back to the https redirect URI. The Android App Link
  * delivers the code to the app, which exchanges it at /auth/token with the
- * PKCE verifier. The Access assertion itself IS the access_token: the app
- * then presents it as `Authorization: Bearer` on /api/v1 and the WS
- * endpoint, whose Access edge policies are bypassed (origin-side
- * verification via AccessJwtVerifier — the same JWT the edge would have
- * injected). A refresh token re-serves the assertion while it is still
- * valid; once Cloudflare expires it the device must re-run the flow.
+ * PKCE verifier. The Bridge then mints its OWN opaque access token (7 days,
+ * stored hashed) plus a refresh token (30 days); the app presents the access
+ * token as `Authorization: Bearer` on /api/v1 and the WS endpoint (verified
+ * by createBridgeAccessVerifier — a hash lookup, not a JWT). The Access
+ * assertion is verified exactly once, at the code exchange; the refresh
+ * grant re-mints access tokens without touching the assertion, so sessions
+ * survive the assertion's ~hours lifetime. Once the refresh token itself
+ * expires the device must re-run the flow.
  *
  * SECURITY INVARIANTS:
  * - Codes and refresh tokens are stored HASHED (sha256 hex) exactly like
@@ -48,12 +50,23 @@
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { FastifyInstance, FastifyRequest } from "fastify";
-import { extractRawAssertion, type AccessJwtVerifier, type VerifiedAccessIdentity } from "./access-jwt-verifier.js";
+import {
+  extractRawAssertion,
+  InvalidAssertionError,
+  type AccessIdentitySource,
+  type AccessJwtVerifier,
+  type VerifiedAccessIdentity,
+} from "./access-jwt-verifier.js";
 import type { SqliteDatabase } from "../db/database.js";
 import type { AuditLog } from "../audit/audit-log.js";
 
 /** Authorization-code lifetime (single use): five minutes. */
 const AUTH_CODE_TTL_MS = 5 * 60 * 1000;
+/** Bridge-issued access token lifetime: seven days. */
+export const BRIDGE_ACCESS_TOKEN_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+/** Refresh token lifetime: thirty days (longer than the access token, so an
+ * idle app can always mint a fresh access token; past it, re-run the flow). */
+export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** Dynamic-registration cap; a single-owner deployment needs far fewer. */
 const MAX_OAUTH_CLIENTS = 64;
 /** Android application whose App Link verification assetlinks.json declares. */
@@ -103,6 +116,16 @@ export interface OAuthStore {
   insertRefreshToken(row: OAuthRefreshRow, tokenHash: string, now: number): void;
   findRefreshToken(tokenHash: string): OAuthRefreshRow | null;
   deleteRefreshToken(tokenHash: string): void;
+  /** Insert a freshly minted bridge access token (hash-stored). */
+  insertAccessToken(row: OAuthAccessTokenRow, tokenHash: string, now: number): void;
+  /** Resolve an unexpired bridge access token; null for unknown/expired. */
+  findAccessToken(tokenHash: string, now: number): { subject: string; expiresAt: number } | null;
+}
+
+export interface OAuthAccessTokenRow {
+  readonly clientId: string;
+  readonly subject: string;
+  readonly expiresAt: number;
 }
 
 export function createOAuthStore(db: SqliteDatabase): OAuthStore {
@@ -128,6 +151,14 @@ export function createOAuthStore(db: SqliteDatabase): OAuthStore {
     "SELECT clientId, subject, assertion, expiresAt FROM oauth_refresh_tokens WHERE tokenHash = ?",
   );
   const deleteRefresh = db.prepare("DELETE FROM oauth_refresh_tokens WHERE tokenHash = ?");
+  const insertAccess = db.prepare(
+    `INSERT INTO oauth_access_tokens (tokenHash, clientId, subject, expiresAt, createdAt)
+     VALUES (?, ?, ?, ?, ?)`,
+  );
+  const selectAccess = db.prepare(
+    "SELECT subject, expiresAt FROM oauth_access_tokens WHERE tokenHash = ? AND expiresAt > ?",
+  );
+  const deleteExpiredAccess = db.prepare("DELETE FROM oauth_access_tokens WHERE expiresAt <= ?");
 
   return {
     registerClient(redirectUri, now) {
@@ -174,6 +205,13 @@ export function createOAuthStore(db: SqliteDatabase): OAuthStore {
     },
     deleteRefreshToken(tokenHash) {
       deleteRefresh.run(tokenHash);
+    },
+    insertAccessToken(row, tokenHash, now) {
+      deleteExpiredAccess.run(now);
+      insertAccess.run(tokenHash, row.clientId, row.subject, row.expiresAt, now);
+    },
+    findAccessToken(tokenHash, now) {
+      return (selectAccess.get(tokenHash, now) as { subject: string; expiresAt: number } | undefined) ?? null;
     },
   };
 }
@@ -297,9 +335,47 @@ async function requireAccess(
   }
 }
 
-/** Seconds until the verified assertion expires (min 1). */
-function expiresInSeconds(identity: VerifiedAccessIdentity, now: number): number {
-  return Math.max(1, Math.ceil((Date.parse(identity.expiresAt) - now) / 1000));
+/** Mint and persist a bridge access token bound to (client, subject). */
+function mintAccessToken(
+  store: OAuthStore,
+  clientId: string,
+  subject: string,
+  now: number,
+): { accessToken: string; expiresAt: number } {
+  const accessToken = randomToken();
+  const expiresAt = now + BRIDGE_ACCESS_TOKEN_TTL_MS;
+  store.insertAccessToken({ clientId, subject, expiresAt }, sha256Hex(accessToken), now);
+  return { accessToken, expiresAt };
+}
+
+export interface BridgeAccessVerifierDeps {
+  readonly store: OAuthStore;
+  readonly now: () => number;
+}
+
+/**
+ * The app-facing `Authorization: Bearer` verifier: resolves the presented
+ * bridge-issued opaque access token by SHA-256 hash lookup (expired rows are
+ * invisible). Throws the same Missing/InvalidAssertionError contract as
+ * AccessJwtVerifier, so /api/v1 and the WS endpoint map failures to uniform
+ * 401s unchanged. Raw Cloudflare assertions are NOT accepted here — they are
+ * only ever verified at /auth/authorize and the code exchange.
+ */
+export function createBridgeAccessVerifier(deps: BridgeAccessVerifierDeps): AccessIdentitySource {
+  return {
+    async verifyRequest(headers): Promise<VerifiedAccessIdentity> {
+      const raw = extractRawAssertion(headers);
+      const row = deps.store.findAccessToken(sha256Hex(raw), deps.now());
+      if (row === null) {
+        throw new InvalidAssertionError("signature", "bridge access token is unknown, expired, or revoked");
+      }
+      return {
+        subject: row.subject,
+        audience: "bridge",
+        expiresAt: new Date(row.expiresAt).toISOString(),
+      };
+    },
+  };
 }
 
 export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps): void {
@@ -453,20 +529,22 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
       if (expectedChallenge !== row.codeChallenge) {
         return badGrant("invalid_grant", "PKCE verification failed");
       }
-      let identity: VerifiedAccessIdentity;
+      // The assertion is verified exactly once, here: a code may only be
+      // exchanged while its underlying Access session is still live.
       try {
-        identity = await deps.verifier.verifyAssertion(row.assertion);
+        await deps.verifier.verifyAssertion(row.assertion);
       } catch {
         // The Access assertion expired inside the 5-minute code window.
         return badGrant("invalid_grant", "the Access assertion behind this code is no longer valid");
       }
+      const { accessToken, expiresAt } = mintAccessToken(deps.store, client.clientId, row.subject, deps.now());
       const refreshToken = randomToken();
       deps.store.insertRefreshToken(
         {
           clientId: client.clientId,
           subject: row.subject,
           assertion: row.assertion,
-          expiresAt: Date.parse(identity.expiresAt),
+          expiresAt: deps.now() + REFRESH_TOKEN_TTL_MS,
         },
         sha256Hex(refreshToken),
         deps.now(),
@@ -478,9 +556,9 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
         committed: true,
       });
       return reply.code(200).send({
-        access_token: row.assertion,
+        access_token: accessToken,
         token_type: "Bearer",
-        expires_in: expiresInSeconds(identity, deps.now()),
+        expires_in: Math.floor((expiresAt - deps.now()) / 1000),
         refresh_token: refreshToken,
       });
     }
@@ -489,31 +567,27 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
       if (refreshToken === null) {
         return badGrant("invalid_request", "refresh_token is required");
       }
-      const row = deps.store.findRefreshToken(sha256Hex(refreshToken));
+      const tokenHash = sha256Hex(refreshToken);
+      const row = deps.store.findRefreshToken(tokenHash);
       if (row === null || row.clientId !== client.clientId) {
         return badGrant("invalid_grant", "refresh token is unknown");
       }
-      let identity: VerifiedAccessIdentity;
-      try {
-        identity = await deps.verifier.verifyAssertion(row.assertion);
-      } catch {
-        deps.store.deleteRefreshToken(sha256Hex(refreshToken));
-        deps.audit.write({
-          operationType: "oauth.token",
-          accessSubject: row.subject,
-          resultCode: "invalid_grant",
-        });
-        return badGrant("invalid_grant", "the Access assertion behind this refresh token is no longer valid");
+      if (row.expiresAt <= deps.now()) {
+        deps.store.deleteRefreshToken(tokenHash);
+        return badGrant("invalid_grant", "refresh token is expired");
       }
+      // No assertion re-verification: the refresh token's own TTL governs, so
+      // sessions outlive the Cloudflare Access JWT by weeks.
+      const { accessToken, expiresAt } = mintAccessToken(deps.store, client.clientId, row.subject, deps.now());
       deps.audit.write({
         operationType: "oauth.token",
         accessSubject: row.subject,
         resultCode: "ok",
       });
       return reply.code(200).send({
-        access_token: row.assertion,
+        access_token: accessToken,
         token_type: "Bearer",
-        expires_in: expiresInSeconds(identity, deps.now()),
+        expires_in: Math.floor((expiresAt - deps.now()) / 1000),
         refresh_token: refreshToken,
       });
     }

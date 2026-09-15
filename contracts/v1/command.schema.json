@@ -19,6 +19,7 @@
     "idempotencyKey": { "type": "string", "minLength": 1 },
     "commandType": {
       "enum": [
+        "project.list",
         "session.list",
         "session.scan_imports",
         "session.import",
@@ -43,6 +44,10 @@
   },
   "additionalProperties": false,
   "allOf": [
+    {
+      "if": { "properties": { "commandType": { "const": "project.list" } } },
+      "then": { "properties": { "payload": { "$ref": "#/$defs/payload.project_list" } } }
+    },
     {
       "if": { "properties": { "commandType": { "const": "session.list" } } },
       "then": { "properties": { "payload": { "$ref": "#/$defs/payload.session_list" } } }
@@ -111,6 +116,11 @@
   "$defs": {
     "uuid": { "type": "string", "format": "uuid" },
     "uint64String": { "type": "string", "pattern": "^[0-9]{1,20}$" },
+    "payload.project_list": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
     "payload.session_list": {
       "type": "object",
       "properties": {},

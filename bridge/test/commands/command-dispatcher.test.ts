@@ -37,6 +37,7 @@ import type { SessionSupervisor, TurnEvidence } from "../../src/sessions/session
 import { InvalidSessionStateError } from "../../src/sessions/session-supervisor.js";
 import type { AuditLog, AuditEntry } from "../../src/audit/audit-log.js";
 import { TranscriptNotFoundError } from "../../src/history/claude-2.1.133-adapter.js";
+import { createProjectRegistry } from "../../src/projects/project-registry.js";
 
 // Same in-table journal port as command-ledger.test.ts (real tables).
 function makeJournalPort(): EventJournalPort {
@@ -270,5 +271,45 @@ describe("audit trail", () => {
     const retryOps = auditEntries.filter((e) => e.operationType === "command.retry_indeterminate");
     expect(retryOps).toHaveLength(1);
     expect(retryOps[0]!.resultCode).toBe("ok");
+  });
+});
+
+describe("project.list (§7.2)", () => {
+  it("returns every authorized project as the client-safe subset, leaking no path/fs identity", async () => {
+    db.prepare(
+      `INSERT INTO projects (projectId, canonicalRealpath, deviceNumber, inode, displayName, createdAt, authorizedAt)
+       VALUES ('proj-2', '/tmp/proj-2', 3, 4, 'second', 0, 0)`,
+    ).run();
+    const withRegistry = createCommandDispatcher({
+      db,
+      ledger,
+      journal: {} as never,
+      supervisor: { sendMessage: async () => undefined } as unknown as SessionSupervisor,
+      snapshots: {} as never,
+      broker: {} as never,
+      registry: createProjectRegistry(db),
+      audit: { filePath: "/dev/null", write: () => undefined } as unknown as AuditLog,
+      importer: {} as never,
+      findTurnEvidence: async () => ({ kind: "absent" }),
+      now: () => T0,
+      noteWriter: () => undefined,
+      clearWriter: () => undefined,
+    });
+    const outcome = await withRegistry.dispatch(
+      envelope({ commandType: "project.list", sessionId: null, payload: {} }),
+      "device-1",
+    );
+    expect(outcome.httpStatus).toBe(200);
+    expect(outcome.response.responseType).toBe("command.status");
+    const result = (outcome.response as { result?: { projects: Array<Record<string, unknown>> } }).result;
+    expect(result?.projects).toEqual([
+      { projectId: "proj-1", displayName: "proj" },
+      { projectId: "proj-2", displayName: "second" },
+    ]);
+    const serialized = JSON.stringify(result);
+    expect(serialized).not.toContain("canonicalRealpath");
+    expect(serialized).not.toContain("/tmp/proj");
+    expect(serialized).not.toContain("deviceNumber");
+    expect(serialized).not.toContain("inode");
   });
 });

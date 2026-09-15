@@ -4,6 +4,7 @@ import { dirname } from "node:path";
 import { MIGRATION_001_SQL } from "./migrations/001_initial.js";
 import { MIGRATION_002_SQL } from "./migrations/002_commands_payload.js";
 import { MIGRATION_003_SQL } from "./migrations/003_oauth_server.js";
+import { MIGRATION_004_SQL } from "./migrations/004_bridge_access_tokens.js";
 
 export type SqliteDatabase = Database.Database;
 
@@ -21,6 +22,7 @@ export const MIGRATIONS: readonly MigrationRecord[] = [
   { version: 1, sql: MIGRATION_001_SQL },
   { version: 2, sql: MIGRATION_002_SQL },
   { version: 3, sql: MIGRATION_003_SQL },
+  { version: 4, sql: MIGRATION_004_SQL },
 ];
 
 export interface DatabaseOptions {

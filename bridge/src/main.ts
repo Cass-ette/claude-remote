@@ -9,7 +9,7 @@ import { createEventJournal, type EventJournal } from "./events/event-journal.js
 import { createCommandLedger, type CommandLedger } from "./commands/command-ledger.js";
 import { createAuditLog, type AuditLog } from "./audit/audit-log.js";
 import { createProjectRegistry, type ProjectRegistry } from "./projects/project-registry.js";
-import { AccessJwtVerifier } from "./auth/access-jwt-verifier.js";
+import { AccessIdentitySource, AccessJwtVerifier } from "./auth/access-jwt-verifier.js";
 import { createDeviceAuth, type DeviceAuth } from "./auth/device-auth.js";
 import { createRealProcessFactory } from "./claude/process-factory.js";
 import {
@@ -32,7 +32,7 @@ import {
 import type { PersistedEvent } from "./events/event-journal-types.js";
 import { startHttpServer } from "./server/http-server.js";
 import { registerApiRoutes } from "./server/http-routes.js";
-import { createOAuthStore, registerOAuthRoutes } from "./auth/oauth-server.js";
+import { createBridgeAccessVerifier, createOAuthStore, registerOAuthRoutes } from "./auth/oauth-server.js";
 import {
   registerWebSocket,
   CLOSE_CODE,
@@ -99,8 +99,12 @@ export interface BridgeHandle {
 }
 
 export interface StartBridgeOverrides {
-  /** Injectable Access verifier (tests supply a local-JWKS instance). */
-  readonly accessVerifier?: AccessJwtVerifier;
+  /**
+   * Injectable API/WS access verifier (tests supply a local-JWKS instance
+   * that verifies assertions directly; production never sets this and gets
+   * the bridge's opaque-token resolver instead).
+   */
+  readonly accessVerifier?: AccessIdentitySource;
   /** Revocation poll interval override (tests use a few ms). */
   readonly revocationPollIntervalMs?: number;
 }
@@ -145,7 +149,7 @@ async function probeClaudeVersion(claudeBin: string, timeoutMs = 1500): Promise<
 function defaultPermissionAdapterEntry(): string {
   const sibling = fileURLToPath(new URL("./permission-adapter/main.mjs", import.meta.url));
   if (existsSync(sibling)) return sibling;
-  return fileURLToPath(new URL("../../permission-adapter/main.mjs", import.meta.url));
+  return fileURLToPath(new URL("../permission-adapter/main.mjs", import.meta.url));
 }
 
 /**
@@ -181,13 +185,21 @@ export async function startBridge(
   const ledger = createCommandLedger(db, journal);
   const registry = createProjectRegistry(db);
 
-  const verifier =
-    overrides.accessVerifier ??
-    (config.cloudflareTeamDomain !== undefined && config.cloudflareAud !== undefined
+  const cfVerifier =
+    config.cloudflareTeamDomain !== undefined && config.cloudflareAud !== undefined
       ? new AccessJwtVerifier({
           teamDomain: config.cloudflareTeamDomain,
           audience: config.cloudflareAud,
         })
+      : null;
+  const oauthStore = createOAuthStore(db);
+  // API/WS Bearer credentials are bridge-issued opaque tokens (7-day TTL,
+  // minted at /auth/token); the Cloudflare assertion is only ever verified at
+  // /auth/authorize and the code exchange. Local-only boots keep auth off.
+  const bridgeVerifier =
+    overrides.accessVerifier ??
+    (cfVerifier !== null && config.publicHost !== undefined
+      ? createBridgeAccessVerifier({ store: oauthStore, now })
       : null);
 
   const devices = createDeviceAuth(db, {
@@ -368,7 +380,7 @@ export async function startBridge(
 
   const app = startHttpServer(config, { claudeCodeVersion });
   registerApiRoutes(app, {
-    verifier,
+    verifier: bridgeVerifier,
     devices,
     dispatcher,
     audit,
@@ -379,10 +391,10 @@ export async function startBridge(
   // Revised §10.2: the Bridge is the OAuth authorization server fronting
   // Cloudflare Access (the edge keeps /auth/authorize; everything the app
   // calls directly is origin-verified). Local-only boots expose nothing.
-  if (verifier !== null && config.publicHost !== undefined) {
+  if (cfVerifier !== null && config.publicHost !== undefined) {
     registerOAuthRoutes(app, {
-      verifier,
-      store: createOAuthStore(db),
+      verifier: cfVerifier,
+      store: oauthStore,
       publicHost: config.publicHost,
       audit,
       now,
@@ -413,13 +425,13 @@ export async function startBridge(
       const auditWsDenied = (resultCode: string, fields: { deviceId?: string; accessSubject?: string } = {}): void => {
         audit.write({ operationType: "auth.ws", resultCode, ...fields });
       };
-      if (verifier === null) {
+      if (bridgeVerifier === null) {
         auditWsDenied("unauthorized");
         return { code: CLOSE_CODE.AUTH_INVALID, reason: "access verification is not configured" };
       }
       let identity;
       try {
-        identity = await verifier.verifyRequest(headers);
+        identity = await bridgeVerifier.verifyRequest(headers);
       } catch {
         auditWsDenied("unauthorized");
         return { code: CLOSE_CODE.AUTH_INVALID, reason: "invalid or missing access assertion" };
