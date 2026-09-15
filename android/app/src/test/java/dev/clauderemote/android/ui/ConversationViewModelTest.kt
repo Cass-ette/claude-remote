@@ -98,6 +98,41 @@ class ConversationViewModelTest {
         assertEquals(MessageBadge.FAILED, item.badge)
     }
 
+    @Test
+    fun toolOnlyAssistantMessageProjectsAsToolCard_notBlankText() {
+        // GLM-class turns whose content is only tool_use must render as a
+        // tool card, never as a blank （无内容） text bubble.
+        val repo = FakeConversationRepository()
+        repo.session = session(SESSION_STATUS_IDLE)
+        repo.messages += userMessage("m1", requestId = null, position = 0)
+        repo.messages += assistantToolOnlyMessage("m2", position = 1)
+
+        val vm = conversationViewModel(repo)
+
+        val tool = vm.uiState.value.items[1] as ConversationItem.ToolCall
+        assertEquals("Grep", tool.toolName)
+        assertEquals("complete", tool.status)
+        assertTrue(tool.preview.contains("\"pattern\":\"foo\""))
+    }
+
+    @Test
+    fun blankAssistantRowWithoutBadgeIsOmitted_notBlankPlaceholder() {
+        // Thinking-only turns (GLM) and legacy empty rows project to nothing
+        // rather than a （无内容） bubble; badge-bearing rows survive for
+        // Safe Retry / Resume.
+        val repo = FakeConversationRepository()
+        repo.session = session(SESSION_STATUS_IDLE)
+        repo.messages += userMessage("m1", requestId = null, position = 0)
+        repo.messages += assistantToolOnlyMessage("m2", position = 1).copy(
+            contentJson = """[{"kind":"text","text":""}]""",
+        )
+
+        val vm = conversationViewModel(repo)
+
+        assertEquals(1, vm.uiState.value.items.size)
+        assertEquals("text-m1", (vm.uiState.value.items.single() as ConversationItem.Text).text)
+    }
+
     // -------------------------------------------------------------------
     // 2. Safe retry / resume / send-continue actions
     // -------------------------------------------------------------------
@@ -488,6 +523,24 @@ class ConversationViewModelTest {
             sourceIdsJson = "[]",
             status = "complete",
             requestId = requestId,
+            position = position,
+            createdAt = "2026-01-01T00:00:00Z",
+            updatedAt = t0,
+        )
+
+    private fun assistantToolOnlyMessage(id: String, position: Long) =
+        MessageEntity(
+            historyItemId = id,
+            sessionId = SESSION_ID,
+            historyRevision = "live",
+            role = "assistant",
+            contentJson = (
+                """[{"kind":"text","text":""},""" +
+                    """{"kind":"tool_use","toolUseId":"call_1","toolName":"Grep","input":{"pattern":"foo"}}]"""
+                ),
+            sourceIdsJson = "[]",
+            status = "complete",
+            requestId = null,
             position = position,
             createdAt = "2026-01-01T00:00:00Z",
             updatedAt = t0,

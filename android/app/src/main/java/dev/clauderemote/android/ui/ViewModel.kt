@@ -331,7 +331,7 @@ class ConversationViewModel(
         val commands = repository.commandEvents(sessionId)
         val statusByRequestId = commands.associate { it.requestId to it.status }
 
-        val items = messages.map { message -> projectItem(message, statusByRequestId) }
+        val items = messages.mapNotNull { message -> projectItem(message, statusByRequestId) }
 
         return ConversationUiState(
             session = session,
@@ -355,15 +355,26 @@ class ConversationViewModel(
     }
 
     /** Badge + per-badge actions derivation (§12.2). */
-    private fun projectItem(message: MessageEntity, statusByRequestId: Map<String, String>): ConversationItem {
+    private fun projectItem(message: MessageEntity, statusByRequestId: Map<String, String>): ConversationItem? {
         if (message.role == ROLE_TOOL) return projectToolItem(message)
+        val text = extractText(message)
+        // Tool-only assistant turns (no text block) project as a tool card —
+        // an empty Text item would render as a blank bubble.
+        if (text.isBlank() && blocksOf(message).any { it[BLOCK_KIND]?.jsonPrimitive?.contentOrNull == BLOCK_TOOL_USE }) {
+            return projectToolItem(message)
+        }
         val badge = message.requestId
             ?.let { statusByRequestId[it] }
             ?.let(MessageBadge::fromWire)
+        // Thinking-only turns (GLM reasoning blocks) and legacy empty rows
+        // carry nothing displayable; a blank bubble just renders as the
+        // （无内容） placeholder. Badge-bearing rows survive — they still
+        // offer Safe Retry / Resume.
+        if (text.isBlank() && badge == null) return null
         return ConversationItem.Text(
             id = message.historyItemId,
             role = message.role,
-            text = extractText(message),
+            text = text,
             requestId = message.requestId,
             badge = badge,
             actions = badgeActions(badge),
@@ -488,11 +499,16 @@ class ConversationViewModel(
             null
         }
 
-    private val lenientJson = Json { ignoreUnknownKeys = true }
-
     companion object {
         /** §12.5: warn when a token has less than five minutes left. */
         const val EXPIRY_WARNING_THRESHOLD_MS = 5 * 60_000L
+
+        /**
+         * Companion-level on purpose: `init { refresh() }` runs before class
+         * properties declared below it, so an instance-level val here would
+         * be null during the first projection.
+         */
+        val lenientJson = Json { ignoreUnknownKeys = true }
 
         /** §12.2 send-continue affordance text. */
         const val CONTINUE_MESSAGE_TEXT = "continue"

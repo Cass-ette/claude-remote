@@ -319,6 +319,11 @@ class EventReducer(
         }
         val deltaText = extractDeltaText(frame)
         if (existing == null) {
+            // The turn tail (content_block_stop / message_delta / message_stop)
+            // arrives AFTER assistant.message.completed dropped the streaming
+            // partial; those no-text frames must not resurrect an empty
+            // "生成中…" row that nothing will ever complete.
+            if (deltaText.isEmpty() && frame?.get("type")?.jsonPrimitive?.contentOrNull != "message_start") return
             upsertBlocks(
                 daos, event, stableId = stableId, role = ROLE_ASSISTANT, status = STATUS_STREAMING,
                 sourceId = stableId, blocks = textBlocks(deltaText),
@@ -335,10 +340,23 @@ class EventReducer(
         val fallbackId = fallbackStreamingId(event.sessionId)
         val stableId = p.messageUuid ?: fallbackId
         val existing = daos.messages.getByHistoryItemId(stableId)
+        val blocks = messageBlocks(p.message)
+        if (blocks.none { it[KIND]?.jsonPrimitive?.contentOrNull == BLOCK_TOOL_USE } &&
+            blocks.all { it["text"]?.jsonPrimitive?.contentOrNull.isNullOrBlank() }
+        ) {
+            // Thinking-only turn (GLM emits `thinking` blocks the block
+            // vocabulary does not model): persisting it would render a blank
+            // bubble. Drop the turn's fallback streaming partial too so no
+            // dangling "生成中…" row remains.
+            daos.messages.getByHistoryItemId(fallbackId)
+                ?.takeIf { it.status == STATUS_STREAMING }
+                ?.let { daos.messages.deleteByHistoryItemId(fallbackId) }
+            return
+        }
         upsertBlocks(
             daos, event, stableId = stableId, role = ROLE_ASSISTANT, status = STATUS_COMPLETE,
             sourceId = stableId,
-            blocks = textBlocks(extractMessageText(p.message)),
+            blocks = blocks,
             createdAt = existing?.createdAt,
             position = existing?.position,
         )
@@ -512,12 +530,30 @@ class EventReducer(
         return delta["text"]?.jsonPrimitive?.contentOrNull ?: ""
     }
 
-    /** Completed assistant message → concatenated text blocks. */
-    private fun extractMessageText(message: JsonElement?): String {
-        val content = (message as? JsonObject)?.get("content") as? JsonArray ?: return ""
-        return content.filterIsInstance<JsonObject>()
-            .filter { it["type"]?.jsonPrimitive?.contentOrNull == "text" }
-            .joinToString(separator = "") { it["text"]?.jsonPrimitive?.contentOrNull ?: "" }
+    /**
+     * Completed assistant message → text block + one tool_use block per tool
+     * call. GLM-class models emit tool-only turns (content is all tool_use);
+     * dropping the tool blocks would leave a blank row that renders as an
+     * empty bubble.
+     */
+    private fun messageBlocks(message: JsonElement?): List<JsonObject> {
+        val content = (message as? JsonObject)?.get("content") as? JsonArray ?: return textBlocks("")
+        val text = StringBuilder()
+        val toolUses = mutableListOf<JsonObject>()
+        for (item in content.filterIsInstance<JsonObject>()) {
+            when (item["type"]?.jsonPrimitive?.contentOrNull) {
+                "text" -> text.append(item["text"]?.jsonPrimitive?.contentOrNull ?: "")
+                "tool_use" -> toolUses.add(
+                    buildJsonObject {
+                        put(KIND, BLOCK_TOOL_USE)
+                        item["id"]?.jsonPrimitive?.contentOrNull?.let { put("toolUseId", it) }
+                        item["name"]?.jsonPrimitive?.contentOrNull?.let { put("toolName", it) }
+                        item["input"]?.let { put("input", it) }
+                    },
+                )
+            }
+        }
+        return listOf(textBlocks(text.toString()).single()) + toolUses
     }
 
     private fun outputText(output: JsonElement): String =

@@ -207,6 +207,110 @@ class EventReducerTest {
     }
 
     @Test
+    fun assistantMessageCompleted_trailingNoTextFramesDoNotResurrectTheStreamingRow() {
+        sessions.rows[SESSION_ID] = session(status = "running", lastAckEventId = 0)
+        reducer.apply(daos, event(1, "assistant.message.delta", """{"frame":{"type":"content_block_delta","delta":{"type":"text_delta","text":"part"}}}"""))
+        reducer.apply(
+            daos,
+            event(
+                2,
+                "assistant.message.completed",
+                """{"messageUuid":"msg-9","message":{"id":"msg-9","content":[{"type":"text","text":"Full answer"}]}}""",
+            ),
+        )
+
+        // Real-claude turn tail: the closing frames stream AFTER the completed
+        // message (verified on-device against claude 2.1.133) — none of them
+        // may open a new empty "生成中…" row.
+        reducer.apply(daos, event(3, "assistant.message.delta", """{"frame":{"type":"content_block_stop","index":1}}"""))
+        reducer.apply(daos, event(4, "assistant.message.delta", """{"frame":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":152}}}"""))
+        reducer.apply(daos, event(5, "assistant.message.delta", """{"frame":{"type":"message_stop"}}"""))
+
+        assertEquals(setOf("msg-9"), messages.rows.keys)
+    }
+
+    @Test
+    fun assistantMessageCompleted_thinkingOnlyTurnIsNotPersisted() {
+        // GLM-class turn: content is ONLY `thinking` blocks (reasoning) —
+        // persisting it would render a blank （无内容） bubble.
+        sessions.rows[SESSION_ID] = session(status = "running", lastAckEventId = 0)
+        reducer.apply(
+            daos,
+            event(
+                1,
+                "assistant.message.completed",
+                """{"messageUuid":"msg-t","message":{"id":"msg-t","content":""" +
+                    """[{"type":"thinking","thinking":"internal reasoning"}]}}""",
+            ),
+        )
+
+        assertTrue(messages.rows.isEmpty())
+    }
+
+    @Test
+    fun assistantMessageCompleted_thinkingOnlyTurnDropsFallbackStreamingRow() {
+        sessions.rows[SESSION_ID] = session(status = "running", lastAckEventId = 0)
+        // message_start opens the per-session streaming row for the turn...
+        reducer.apply(daos, event(1, "assistant.message.delta", """{"frame":{"type":"message_start","message":{"id":"msg-t","role":"assistant"}}}"""))
+        assertEquals(1, messages.rows.size)
+        // ...a thinking-only completion must not leave it dangling.
+        reducer.apply(
+            daos,
+            event(
+                2,
+                "assistant.message.completed",
+                """{"messageUuid":"msg-t","message":{"id":"msg-t","content":""" +
+                    """[{"type":"thinking","thinking":"internal reasoning"}]}}""",
+            ),
+        )
+
+        assertTrue(messages.rows.isEmpty())
+    }
+
+    @Test
+    fun assistantMessageCompleted_persistsToolUseBlocksFromToolOnlyTurns() {
+        // GLM-class turn: content is ONLY tool_use — no text block at all.
+        // Dropping the tool blocks would leave a blank bubble row.
+        sessions.rows[SESSION_ID] = session(status = "running", lastAckEventId = 0)
+        reducer.apply(
+            daos,
+            event(
+                1,
+                "assistant.message.completed",
+                """{"messageUuid":"msg-11","message":{"id":"msg-11","content":""" +
+                    """[{"type":"tool_use","id":"call_1","name":"Grep","input":{"pattern":"foo"}}]}}""",
+            ),
+        )
+
+        assertEquals(
+            """[{"kind":"text","text":""},""" +
+                """{"kind":"tool_use","toolUseId":"call_1","toolName":"Grep","input":{"pattern":"foo"}}]""",
+            messages.rows["msg-11"]?.contentJson,
+        )
+    }
+
+    @Test
+    fun assistantMessageCompleted_keepsTextAlongsideToolUseBlocks() {
+        sessions.rows[SESSION_ID] = session(status = "running", lastAckEventId = 0)
+        reducer.apply(
+            daos,
+            event(
+                1,
+                "assistant.message.completed",
+                """{"messageUuid":"msg-12","message":{"id":"msg-12","content":[""" +
+                    """{"type":"text","text":"Looking…"},""" +
+                    """{"type":"tool_use","id":"call_2","name":"Bash","input":{"command":"ls"}}]}}""",
+            ),
+        )
+
+        assertEquals(
+            """[{"kind":"text","text":"Looking…"},""" +
+                """{"kind":"tool_use","toolUseId":"call_2","toolName":"Bash","input":{"command":"ls"}}]""",
+            messages.rows["msg-12"]?.contentJson,
+        )
+    }
+
+    @Test
     fun assistantMessageCompleted_upsertsSnapshotRowBySharedStableId() {
         // §6.7: snapshot items and live events share the message UUID; the
         // upsert on the stable id prevents snapshot/live duplicates.
