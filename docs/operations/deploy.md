@@ -222,6 +222,16 @@ npm run deploy:doctor
 | `bridge-health` | 无 built entry：回第 1 步 `npm run build -w bridge`；"another process … answered"：端口被旧 launchd job 或其他进程占用——`npm run deploy:uninstall-launchd`（或 `launchctl bootout gui/$(id -u)/dev.clauderemote.bridge`）后重试；子进程提前退出：看 FAIL 详情里的 child stderr 摘要。 |
 | `tunnel-only` | 恒为 PASS 的说明项。 |
 
+## 6.6 Admin API（本机管理接口）
+
+Bridge 在启动时会在 loopback（`127.0.0.1`）上额外监听一个管理端口，默认 **43112**，可通过 `BRIDGE_ADMIN_PORT` 环境变量配置。该端口**永远只绑定 loopback，绝不经 Cloudflare Tunnel 暴露**——仅供同一台 Mac 上的本地工具使用。
+
+首次启动时，Bridge 会在 `<data-dir>/admin-api-token` 生成随机令牌（0600 权限），客户端通过 `Authorization: Bearer <token>` 认证。删除该文件即可轮转令牌——Bridge 下次启动时重新生成，已连接的 GUI 客户端会被锁定，需重新读取新令牌。
+
+Admin API 由 **BridgeBar** 菜单栏应用消费（见 `macos/BridgeBar/README.md`），用于实时查询 Bridge 运行状态、会话列表、设备管理等操作，无需通过公网 tunnel。
+
+launchd plist 无需为 Admin API 添加额外配置——默认值已足够，只有需要更换端口时才显式设置 `BRIDGE_ADMIN_PORT`。
+
 ## 7. 安装 Android App
 
 构建并安装 debug APK（`bridgeAppLinkHost` 把 OAuth 回调 App Link 的 host 烧进 manifest，autoVerify 必需）：
