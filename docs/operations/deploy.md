@@ -154,13 +154,20 @@ npm run deploy:render-cloudflared
    - `allowed_idps` 仅 One-time PIN（设置了 `CF_ACCESS_EMAIL_IDP` 时）
 3. 或者直接走 API：`PUT https://api.cloudflare.com/client/v4/zones/<zone-id>/access/apps/<app-id>`，body 即渲染出的 `access-app.json`。
 
-最后，**另起一个进程**运行 tunnel connector（与 Bridge 的 launchd 互不管理）：
+最后，运行 tunnel connector。调试阶段可以前台手动跑：
 
 ```bash
 cloudflared tunnel run --config ~/.cloudflared/config.yml
 ```
 
-调试阶段保持前台即可；长期运行方式（例如 `cloudflared service install` 注册系统服务）由操作者自行选择，不要并入 Bridge 的 plist。
+长期运行用**独立**的用户级 LaunchAgent（与 Bridge 的 launchd 互不管理，绝不并入 Bridge 的 plist；也不需要 root 的 `cloudflared service install`）：
+
+```bash
+npm run deploy:install-tunnel-launchd        # 装好后 RunAtLoad 自启 + 崩溃自动拉起
+npm run deploy:uninstall-tunnel-launchd      # 卸载（tunnel/config/凭据/日志均保留）
+```
+
+安装器会预检（cloudflared 可执行、config.yml 含 `tunnel:` + `credentials-file:`、凭据可读），只写 `~/Library/LaunchAgents/dev.clauderemote.cloudflared.plist`，日志落在 `<data-dir>/logs/cloudflared.{out,err}.log`。注意：手动前台的 connector 与 LaunchAgent 的 connector 可以并存（同一 tunnel 多 connector 官方支持），验证 agent 正常后停掉手动的那个即可。
 
 ## 6. 预检（Preflight）
 
@@ -191,6 +198,14 @@ npm run deploy:preflight -- --data-dir <data-dir>
 | `tunnel-only` | 说明性检查：Bridge 只绑 loopback，公网暴露只能来自外部 tunnel |
 
 `deploy:install-launchd` 在写入任何文件之前会自动运行同一套检查（内部以 `admin preflight --json` 拉起）。**任何一项 FAIL，安装器拒绝写入与 bootstrap——fail closed，不存在"带病上线"。**
+
+## 6.5 运行时体检（Doctor）
+
+```bash
+npm run deploy:doctor
+```
+
+检查**此刻**的运行态（preflight 检查的是安装前配置，doctor 检查的是活着没有）：bridge / cloudflared 两个 LaunchAgent 的 `launchctl print` 状态、loopback 与公网 `GET /api/v1/health`、系统睡眠设置、自动登录。任何 FAIL 退出码 1。睡眠与自动登录只能由用户在系统设置里改（无 sudo 改不了 `pmset`），脚本只负责标 WARN。
 
 ### Fail-closed 排查清单（每个 FAIL 的对策）
 

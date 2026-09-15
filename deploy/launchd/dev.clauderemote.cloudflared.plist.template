@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  claude-remote Cloudflare Tunnel connector user LaunchAgent (spec §5, §10.2;
+  docs/operations/deploy.md step 5).
+
+  This agent runs the SAME connector command the operator would run by hand
+  (deploy/scripts/render-cloudflared-config.ts output + `cloudflared tunnel
+  --config … run`) so the tunnel survives reboots without `cloudflared
+  service install` (which needs root and registers a system-wide daemon).
+
+  INVARIANTS (enforced by deploy/scripts/install-tunnel-launchd.ts and its
+  tests — do not weaken without updating them):
+
+  1. The connector opens NO local port: it only makes OUTBOUND connections to
+     Cloudflare and forwards to the Bridge loopback listener named inside the
+     tunnel config (config.yml ingress: 127.0.0.1 only).
+  2. Per-user LaunchAgent under ~/Library/LaunchAgents — never a system-wide
+     LaunchDaemon, never root.
+  3. No secrets here (plist is 0644): the tunnel credentials live in the
+     credentials-file named by the config, written 0600 by `cloudflared
+     tunnel create`.
+  4. ProgramArguments uses the ABSOLUTE cloudflared path captured at install
+     time — launchd agents do not inherit the user's shell PATH.
+  5. --no-autoupdate: under launchd the binary is Homebrew-managed; letting
+     cloudflared self-replace would break the agent.
+
+  KeepAlive semantics: { SuccessfulExit = false } restarts the connector
+  unless the previous run exited 0 (graceful SIGTERM shutdown stays stopped;
+  crashes and network deaths are restarted).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{{LABEL}}</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>{{CLOUDFLARED_BIN}}</string>
+        <string>tunnel</string>
+        <string>--config</string>
+        <string>{{TUNNEL_CONFIG}}</string>
+        <string>--no-autoupdate</string>
+        <string>run</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>{{STDOUT_PATH}}</string>
+    <key>StandardErrorPath</key>
+    <string>{{STDERR_PATH}}</string>
+
+    <key>ProcessType</key>
+    <string>Background</string>
+</dict>
+</plist>
