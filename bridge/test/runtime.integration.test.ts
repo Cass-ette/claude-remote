@@ -122,6 +122,7 @@ async function makeWorld(opts: { noResult?: boolean } = {}): Promise<World> {
     BRIDGE_DATA_DIR: dataDir,
     BRIDGE_HOST: "127.0.0.1",
     BRIDGE_PORT: String(await freePort()),
+    BRIDGE_ADMIN_PORT: String(await freePort()),
     BRIDGE_CLAUDE_BIN: FAKE_CLAUDE,
     BRIDGE_PERMISSION_ADAPTER_ENTRY: FAKE_ADAPTER,
     BRIDGE_PUBLIC_HOST: HOST_ASCII,
@@ -1081,8 +1082,9 @@ describe("runtime integration (Task 24)", () => {
       // "Kill" the bridge: start a second instance on the same data dir
       // WITHOUT closing the first (a graceful close would stop the session).
       const port2 = await freePort();
+      const adminPort2 = await freePort();
       const bridge2 = await startBridge(
-        { ...world.env, BRIDGE_PORT: String(port2) },
+        { ...world.env, BRIDGE_PORT: String(port2), BRIDGE_ADMIN_PORT: String(adminPort2) },
         { accessVerifier: verifier },
       );
       // The second instance adopts the same world for helpers.

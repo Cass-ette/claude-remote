@@ -31,10 +31,12 @@ async function freePort(): Promise<number> {
 async function boot(): Promise<{ bridge: BridgeHandle; baseUrl: string; wsUrl: string }> {
   dataDir = mkdtempSync(join(tmpdir(), "bridge-smoke-"));
   const port = await freePort();
+  const adminPort = await freePort();
   const env = {
     BRIDGE_DATA_DIR: dataDir,
     BRIDGE_HOST: "127.0.0.1",
     BRIDGE_PORT: String(port),
+    BRIDGE_ADMIN_PORT: String(adminPort),
   };
   const handle = await startBridge(env);
   bridge = handle;

@@ -10,7 +10,10 @@ import { createCommandLedger, type CommandLedger } from "./commands/command-ledg
 import { createAuditLog, type AuditLog } from "./audit/audit-log.js";
 import { createProjectRegistry, type ProjectRegistry } from "./projects/project-registry.js";
 import { AccessIdentitySource, AccessJwtVerifier } from "./auth/access-jwt-verifier.js";
-import { createDeviceAuth, type DeviceAuth } from "./auth/device-auth.js";
+import { createDeviceAuth, type DeviceAuth, type RevocationHooks } from "./auth/device-auth.js";
+import { ensureAdminToken } from "./admin/admin-token.js";
+import { createAdminServer } from "./admin/api-server.js";
+import { createAdminReads } from "./admin/admin-reads.js";
 import { createRealProcessFactory } from "./claude/process-factory.js";
 import {
   createSessionSupervisor,
@@ -74,6 +77,7 @@ export const REVOCATION_POLL_INTERVAL_MS = 30_000;
 export interface BridgeHandle {
   readonly config: BridgeConfig;
   readonly app: FastifyInstance;
+  readonly adminApp: FastifyInstance;
   readonly wsService: WebSocketService;
   readonly db: SqliteDatabase;
   readonly journal: EventJournal;
@@ -542,15 +546,43 @@ export async function startBridge(
 
   app.log.info({ host: config.host, port: config.port }, "bridge listening");
 
+  const buildRevocationHooks = (): RevocationHooks => ({
+    denyPendingPermissions: (target) => {
+      void broker.denyAllForDevice(target, "device revoked").catch(() => undefined);
+    },
+    closeSockets: (target) => {
+      wsService.closeDevice(target, CLOSE_CODE.AUTH_INVALID, "device revoked");
+    },
+  });
+
+  // --- Loopback admin API (never proxied by the tunnel) ---------------------
+  const adminToken = ensureAdminToken(config.dataDir);
+  const adminApp = createAdminServer({
+    config,
+    token: adminToken.token,
+    registry,
+    devices,
+    audit,
+    reads: createAdminReads(db, { databasePath: config.databasePath }),
+    revocationHooks: buildRevocationHooks(),
+    now,
+    uptimeSeconds: () => process.uptime(),
+    probePublicHealth: async () => {
+      if (config.publicHost === undefined) return null;
+      try {
+        // Any HTTP answer (including Cloudflare Access 401/302) proves the
+        // tunnel path is up; only network failure means down.
+        await fetch(`https://${config.publicHost}/api/v1/health`, { signal: AbortSignal.timeout(3000) });
+        return true;
+      } catch {
+        return false;
+      }
+    },
+  });
+  await adminApp.listen({ host: config.host, port: config.adminPort });
+
   const revokeDevice = (deviceId: string): void => {
-    devices.revokeDevice(deviceId, now(), {
-      denyPendingPermissions: (target) => {
-        void broker.denyAllForDevice(target, "device revoked").catch(() => undefined);
-      },
-      closeSockets: (target) => {
-        wsService.closeDevice(target, CLOSE_CODE.AUTH_INVALID, "device revoked");
-      },
-    });
+    devices.revokeDevice(deviceId, now(), buildRevocationHooks());
     handledRevocations.add(deviceId);
     audit.write({
       operationType: "device.revoke",
@@ -577,8 +609,8 @@ export async function startBridge(
   }
   const applyRevocation = (deviceId: string): void => {
     handledRevocations.add(deviceId);
-    wsService.closeDevice(deviceId, CLOSE_CODE.AUTH_INVALID, "device revoked");
     void broker.denyAllForDevice(deviceId, "device revoked").catch(() => undefined);
+    wsService.closeDevice(deviceId, CLOSE_CODE.AUTH_INVALID, "device revoked");
   };
   const revocationPollMs = overrides.revocationPollIntervalMs ?? REVOCATION_POLL_INTERVAL_MS;
   const revocationTimer = setInterval(() => {
@@ -623,6 +655,11 @@ export async function startBridge(
     } catch (error) {
       app.log.warn({ err: error }, "http server close failed");
     }
+    try {
+      await adminApp.close();
+    } catch (error) {
+      app.log.warn({ err: error }, "admin server close failed");
+    }
     // The database is deliberately NOT closed: callers own its lifetime
     // (main() closes it; tests keep it open to assert post-close state).
   };
@@ -630,6 +667,7 @@ export async function startBridge(
   return {
     config,
     app,
+    adminApp,
     wsService,
     db,
     journal,
