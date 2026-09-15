@@ -17,6 +17,8 @@ export interface BridgeConfig {
   readonly host: "127.0.0.1" | "::1";
   /** Listen port. Privileged ports (<1024) and port 0 are rejected. */
   readonly port: number;
+  /** Loopback port of the local admin API (never proxied by the tunnel). */
+  readonly adminPort: number;
   /** Absolute path of the Bridge data directory (created with mode 0o700). */
   readonly dataDir: string;
   /** SQLite database file inside {@link BridgeConfig.dataDir}. */
@@ -91,6 +93,7 @@ const LOOPBACK_HOSTS: ReadonlySet<string> = new Set(["127.0.0.1", "::1"]);
 
 export const DEFAULT_BRIDGE_HOST = "127.0.0.1";
 export const DEFAULT_BRIDGE_PORT = 43111;
+export const DEFAULT_BRIDGE_ADMIN_PORT = 43112;
 
 /**
  * How long undelivered pending events are retained before deletion.
@@ -207,13 +210,18 @@ function parseHost(env: EnvSource): "127.0.0.1" | "::1" {
   return host as "127.0.0.1" | "::1";
 }
 
-function parsePort(env: EnvSource): number {
-  const raw = readString(env, "BRIDGE_PORT") ?? String(DEFAULT_BRIDGE_PORT);
+/** Exported so the admin server reuses identical validation (loopback rule stays private to parseHost). */
+export function parsePortValue(env: EnvSource, key: string, defaultPort: number): number {
+  const raw = readString(env, key) ?? String(defaultPort);
   const port = Number(raw);
   if (!Number.isInteger(port) || port < 1024 || port > 65535) {
-    throw new Error(`BRIDGE_PORT must be an integer between 1024 and 65535; got ${JSON.stringify(raw)}.`);
+    throw new Error(`${key} must be an integer between 1024 and 65535; got ${JSON.stringify(raw)}.`);
   }
   return port;
+}
+
+function parsePort(env: EnvSource): number {
+  return parsePortValue(env, "BRIDGE_PORT", DEFAULT_BRIDGE_PORT);
 }
 
 function parseDataDir(env: EnvSource): string {
@@ -331,6 +339,10 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const source = layerEnvFile(env);
   const host = parseHost(source);
   const port = parsePort(source);
+  const adminPort = parsePortValue(source, "BRIDGE_ADMIN_PORT", DEFAULT_BRIDGE_ADMIN_PORT);
+  if (adminPort === port) {
+    throw new Error(`BRIDGE_ADMIN_PORT must differ from BRIDGE_PORT (both are ${port}).`);
+  }
   const dataDir = parseDataDir(source);
   const pendingEventsByteBudget = parsePendingEventsByteBudget(source);
   const claudeBin = readString(source, "BRIDGE_CLAUDE_BIN");
@@ -348,6 +360,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   return Object.freeze({
     host,
     port,
+    adminPort,
     dataDir,
     databasePath: join(dataDir, "bridge.db"),
     auditLogPath: join(dataDir, "audit.jsonl"),

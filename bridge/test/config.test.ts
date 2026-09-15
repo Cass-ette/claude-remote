@@ -229,4 +229,27 @@ describe("loadConfig", () => {
       ).toThrow(/BRIDGE_ENV_FILE/);
     });
   });
+
+  describe("adminPort", () => {
+    it("defaults to 43112", () => {
+      const cfg = loadConfig({ BRIDGE_DATA_DIR: dataDir() });
+      expect(cfg.adminPort).toBe(43112);
+    });
+
+    it("reads BRIDGE_ADMIN_PORT", () => {
+      const cfg = loadConfig({ BRIDGE_DATA_DIR: dataDir(), BRIDGE_ADMIN_PORT: "50000" });
+      expect(cfg.adminPort).toBe(50000);
+    });
+
+    it("rejects garbage and privileged ports", () => {
+      expect(() => loadConfig({ BRIDGE_DATA_DIR: dataDir(), BRIDGE_ADMIN_PORT: "nope" })).toThrow(/BRIDGE_ADMIN_PORT/);
+      expect(() => loadConfig({ BRIDGE_DATA_DIR: dataDir(), BRIDGE_ADMIN_PORT: "80" })).toThrow(/BRIDGE_ADMIN_PORT/);
+    });
+
+    it("rejects adminPort equal to the public port", () => {
+      expect(() =>
+        loadConfig({ BRIDGE_DATA_DIR: dataDir(), BRIDGE_PORT: "43111", BRIDGE_ADMIN_PORT: "43111" }),
+      ).toThrow(/BRIDGE_ADMIN_PORT must differ from BRIDGE_PORT/);
+    });
+  });
 });
