@@ -157,13 +157,14 @@ export interface SessionSupervisor {
    */
   sendMessage(input: { sessionId: string; requestId: string; text: string }): Promise<void>;
   /**
-   * Complete the active turn after its `result` record: transitions the
-   * dispatched command to `completed`/`failed` WITH a command.status.changed
-   * event, then flips the session running → idle.
+   * Complete the session's active dispatched turn after its `result` record:
+   * transitions the command (resolved from the dispatch-time record, not from
+   * stdout echoes) to `completed`/`failed` WITH a command.status.changed
+   * event, then flips the session running → idle. No-op when no turn is
+   * in flight.
    */
   completeMessage(input: {
     sessionId: string;
-    requestId: string;
     outcome: "completed" | "failed";
     result?: unknown;
   }): Promise<void>;
@@ -264,6 +265,14 @@ export function createSessionSupervisor(
 
   /** Live handles started by THIS supervisor instance, keyed by sessionId. */
   const processes = new Map<string, ClaudeProcessHandle>();
+
+  /**
+   * requestId of each session's in-flight dispatched turn. The event pump's
+   * `result` handler resolves the command here instead of trusting the uuid of
+   * stdout `user` echoes: the CLI also echoes records the bridge never wrote
+   * (CLI-generated uuids), and binding those wedged turns at completion.
+   */
+  const activeRequestIds = new Map<string, string>();
 
   function getSession(sessionId: string): SessionRow {
     const row = getSessionStmt.get(sessionId) as SessionRow | undefined;
@@ -416,14 +425,13 @@ export function createSessionSupervisor(
     let handle: ClaudeProcessHandle | undefined;
     try {
       handle = await options.processFactory.start({ sessionId, mode: "create", cwd });
-      const init = await handle.awaitInit(initTimeoutMs);
-      if (init.session_id !== sessionId) {
-        throw new InitSessionMismatchError(sessionId, init.session_id);
-      }
     } catch (error) {
       await failStartup(sessionId, handle);
       throw error;
     }
+    // The real CLI emits system/init only when the FIRST turn starts, not at
+    // process startup — awaiting it here deadlocks against a live claude that
+    // has no input yet. The session-echo check lives in sendMessage instead.
     processes.set(sessionId, handle);
     recordProcessInLock(handle);
     setStatus(sessionId, "idle");
@@ -458,8 +466,10 @@ export function createSessionSupervisor(
     }
 
     // A new --resume process must be spawned: the session enters `starting`
-    // (awaiting system/init) — from both `interrupted` and `idle` (our own
-    // process died) — so an init failure correctly goes starting → failed.
+    // then returns to idle once spawned — from both `interrupted` and `idle`
+    // (our own process died). The system/init session-echo check runs at the
+    // first sendMessage, not here (the real CLI only emits init once the
+    // first turn starts).
     setStatus(input.sessionId, "starting");
     let handle: ClaudeProcessHandle | undefined;
     try {
@@ -468,10 +478,6 @@ export function createSessionSupervisor(
         mode: "resume",
         cwd,
       });
-      const init = await handle.awaitInit(initTimeoutMs);
-      if (init.session_id !== input.sessionId) {
-        throw new InitSessionMismatchError(input.sessionId, init.session_id);
-      }
     } catch (error) {
       await failStartup(input.sessionId, handle);
       throw error;
@@ -586,21 +592,41 @@ export function createSessionSupervisor(
     setStatus(input.sessionId, "running");
     try {
       handle.sendUser(input.requestId, input.text);
+      activeRequestIds.set(input.sessionId, input.requestId);
     } catch (error) {
       // The write failed before the turn existed: revert to idle and rethrow
       // (the dispatcher classifies the command as indeterminate per §7.4).
       setStatus(input.sessionId, "idle");
       throw error;
     }
+    // The real CLI emits system/init right after the first user message
+    // reaches it, so the session-echo check runs here; the init promise is
+    // already settled — and this await is a no-op — for every later message.
+    try {
+      const init = await handle.awaitInit(initTimeoutMs);
+      if (init.session_id !== input.sessionId) {
+        throw new InitSessionMismatchError(input.sessionId, init.session_id);
+      }
+    } catch (error) {
+      // Mismatch, or the process died before producing init: the turn cannot
+      // be trusted. Kill, fail the session, drop the lock.
+      await failStartup(input.sessionId, handle);
+      throw error;
+    }
   }
 
   async function completeMessage(input: {
     sessionId: string;
-    requestId: string;
     outcome: "completed" | "failed";
     result?: unknown;
   }): Promise<void> {
-    await options.ledger.transitionWithStatusEvent(input.requestId, input.outcome, {
+    // Resolve the command from the dispatch-time record, never from stdout
+    // echoes. No entry means the result belongs to a turn this bridge did not
+    // dispatch (replayed history, CLI-internal turn): nothing to complete.
+    const requestId = activeRequestIds.get(input.sessionId);
+    if (requestId === undefined) return;
+    activeRequestIds.delete(input.sessionId);
+    await options.ledger.transitionWithStatusEvent(requestId, input.outcome, {
       now: now(),
       buildEventPayload: (record) => ({
         requestId: record.requestId,

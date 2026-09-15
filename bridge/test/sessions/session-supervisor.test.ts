@@ -263,20 +263,54 @@ describe("createSession", () => {
     expect(JSON.parse(events[1]!.payloadJson)).toMatchObject({ status: "idle", previousStatus: "starting" });
   });
 
-  it("rejects when system/init.session_id does not match, kills the process, and marks the session failed", async () => {
+  it("reaches idle without init; a mismatched init session_id fails the session at the first message", async () => {
     factory.onNextStart((opts) => ({ ...opts, initSessionId: "not-the-expected-id" }));
     const supervisor = buildSupervisor();
-    await expect(supervisor.createSession({ projectId: "proj-1" })).rejects.toBeInstanceOf(
-      InitSessionMismatchError,
-    );
-    const row = db.prepare("SELECT sessionId, status FROM sessions").get() as {
-      sessionId: string;
-      status: string;
-    };
-    expect(row.status).toBe("failed");
+    const { sessionId } = await supervisor.createSession({ projectId: "proj-1" });
+    expect(sessionStatus(sessionId)).toBe("idle");
+    await expect(
+      supervisor.sendMessage({ sessionId, requestId: "req-1", text: "hi" }),
+    ).rejects.toBeInstanceOf(InitSessionMismatchError);
+    expect(sessionStatus(sessionId)).toBe("failed");
     expect(factory.handles[0]!.signals).toContain("SIGKILL");
     expect(factory.handles[0]!.alive()).toBe(false);
-    expect(lockRow(row.sessionId)).toBeUndefined();
+    expect(lockRow(sessionId)).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// completeMessage (turn completion resolved from dispatch-time record)
+// ---------------------------------------------------------------------------
+
+describe("completeMessage", () => {
+  it("completes the dispatched command and flips the session idle", async () => {
+    const supervisor = buildSupervisor();
+    const { sessionId } = await supervisor.createSession({ projectId: "proj-1" });
+    db.prepare(
+      `INSERT INTO commands (requestId, deviceId, sessionId, idempotencyKey, commandType, payloadHash, status, createdAt, updatedAt)
+       VALUES ('req-1', 'dev-1', ?, 'idem-1', 'message.send', 'hash', 'dispatched', 0, 0)`,
+    ).run(sessionId);
+    await supervisor.sendMessage({ sessionId, requestId: "req-1", text: "hi" });
+    expect(sessionStatus(sessionId)).toBe("running");
+
+    await supervisor.completeMessage({ sessionId, outcome: "completed", result: { result: "done" } });
+
+    expect(sessionStatus(sessionId)).toBe("idle");
+    const command = db.prepare("SELECT status FROM commands WHERE requestId = 'req-1'").get() as {
+      status: string;
+    };
+    expect(command.status).toBe("completed");
+    const events = db
+      .prepare("SELECT eventType FROM pending_events WHERE sessionId = ? ORDER BY eventId")
+      .all(sessionId) as Array<{ eventType: string }>;
+    expect(events.map((e) => e.eventType)).toContain("command.status.changed");
+  });
+
+  it("is a no-op when no turn is in flight (result records for undeployed turns)", async () => {
+    const supervisor = buildSupervisor();
+    const { sessionId } = await supervisor.createSession({ projectId: "proj-1" });
+    await supervisor.completeMessage({ sessionId, outcome: "completed" });
+    expect(sessionStatus(sessionId)).toBe("idle");
   });
 });
 
@@ -305,7 +339,7 @@ describe("resumeSession", () => {
     expect(sessionStatus(sessionId)).toBe("idle");
   });
 
-  it("starts --resume from interrupted and validates init session_id", async () => {
+  it("starts --resume from interrupted and returns to idle", async () => {
     const supervisor = buildSupervisor();
     const { sessionId } = await supervisor.createSession({ projectId: "proj-1" });
     // push to running, then stop → interrupted
@@ -318,14 +352,18 @@ describe("resumeSession", () => {
     expect(sessionStatus(sessionId)).toBe("idle");
   });
 
-  it("fails the session when resume init reports a different session_id", async () => {
+  it("fails the session at the first message when a resumed init reports a different session_id", async () => {
     const supervisor = buildSupervisor();
     const { sessionId } = await supervisor.createSession({ projectId: "proj-1" });
     db.prepare("UPDATE sessions SET status = 'running' WHERE sessionId = ?").run(sessionId);
     await supervisor.stop({ sessionId });
 
     factory.onNextStart((opts) => ({ ...opts, initSessionId: "someone-elses-session" }));
-    await expect(supervisor.resumeSession({ sessionId })).rejects.toBeInstanceOf(InitSessionMismatchError);
+    await supervisor.resumeSession({ sessionId });
+    expect(sessionStatus(sessionId)).toBe("idle");
+    await expect(
+      supervisor.sendMessage({ sessionId, requestId: "req-1", text: "hi" }),
+    ).rejects.toBeInstanceOf(InitSessionMismatchError);
     expect(sessionStatus(sessionId)).toBe("failed");
     expect(lockRow(sessionId)).toBeUndefined();
   });
@@ -352,16 +390,18 @@ describe("resumeSession", () => {
     ).toEqual(["starting", "idle"]);
   });
 
-  it("fails an idle dead-process resume whose init reports a different session_id", async () => {
+  it("fails an idle dead-process resume at the first message when init reports a different session_id", async () => {
     db.prepare(
       `INSERT INTO sessions (sessionId, projectId, displayName, status, source, lastActivityAt, createdAt)
        VALUES ('sess-idle-mm', 'proj-1', 's', 'idle', 'bridge', 0, 0)`,
     ).run();
     factory.onNextStart((opts) => ({ ...opts, initSessionId: "wrong-session-id" }));
     const supervisor = buildSupervisor();
-    await expect(supervisor.resumeSession({ sessionId: "sess-idle-mm" })).rejects.toBeInstanceOf(
-      InitSessionMismatchError,
-    );
+    await supervisor.resumeSession({ sessionId: "sess-idle-mm" });
+    expect(sessionStatus("sess-idle-mm")).toBe("idle");
+    await expect(
+      supervisor.sendMessage({ sessionId: "sess-idle-mm", requestId: "req-1", text: "hi" }),
+    ).rejects.toBeInstanceOf(InitSessionMismatchError);
     expect(sessionStatus("sess-idle-mm")).toBe("failed");
     expect(lockRow("sess-idle-mm")).toBeUndefined();
     expect(factory.handles[0]!.signals).toContain("SIGKILL");
