@@ -48,6 +48,12 @@ if (pkgPath === undefined) {
   throw new Error("cannot locate bridge package.json for bridgeVersion");
 }
 const bridgeVersion: string = require(pkgPath).version as string;
+
+/** Package version, reused by the admin API status route. */
+export function getBridgeVersion(): string {
+  return bridgeVersion;
+}
+
 // ajv-formats ships CJS with an esModule default; NodeNext cannot express
 // that callable default import cleanly, so require it like runtime ESM would.
 const addFormats = require("ajv-formats").default as (ajv: Ajv2020) => Ajv2020;
