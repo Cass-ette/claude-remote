@@ -12,6 +12,8 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -32,6 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
 import dev.clauderemote.android.data.local.SessionEntity
 import dev.clauderemote.android.ui.ConversationBanner
@@ -331,27 +334,38 @@ private fun InputBar(
     onRelease: () -> Unit,
 ) {
     var input by remember { mutableStateOf("") }
+    val send: () -> Unit = {
+        if (sendEnabled && input.isNotBlank()) {
+            onSendMessage(input)
+            input = ""
+        }
+    }
     Surface(color = MaterialTheme.colorScheme.surface) {
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
-            OutlinedTextField(
-                value = input,
-                onValueChange = { input = it },
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text(if (sendEnabled) "输入消息…" else "会话运行中，停止后才能发送") },
-                enabled = sendEnabled,
-                maxLines = 4,
-            )
-            Spacer(Modifier.height(8.dp))
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+            // Send lives in the same row as the input so it stays reachable
+            // while the IME is open (the IME's enter key also sends).
+            Row(verticalAlignment = Alignment.Bottom) {
+                OutlinedTextField(
+                    value = input,
+                    onValueChange = { input = it },
+                    modifier = Modifier.weight(1f),
+                    placeholder = { Text(if (sendEnabled) "输入消息…" else "会话运行中，停止后才能发送") },
+                    enabled = sendEnabled,
+                    maxLines = 4,
+                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
+                    keyboardActions = KeyboardActions(onSend = { send() }),
+                )
+                Spacer(Modifier.width(8.dp))
                 Button(
-                    onClick = {
-                        onSendMessage(input)
-                        input = ""
-                    },
+                    onClick = send,
                     enabled = sendEnabled && input.isNotBlank(),
+                    modifier = Modifier.height(56.dp),
                 ) {
                     Text("发送")
                 }
+            }
+            Spacer(Modifier.height(8.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
                 OutlinedButton(onClick = onStop, enabled = !sendEnabled) {
                     Text("停止")
                 }
