@@ -94,8 +94,10 @@ export function createAdminServer(deps: AdminApiDeps): FastifyInstance {
   app.delete("/admin/v1/projects/:projectId", async (request, reply) => {
     const { projectId } = request.params as { projectId: string };
     const existing = deps.registry.get(projectId);
-    if (existing === undefined) return sendError(reply, 404, "project_not_found", `no authorized project ${projectId}`);
-    deps.registry.remove(projectId);
+    if (existing === undefined || existing.revokedAt !== null) {
+      return sendError(reply, 404, "project_not_found", `no authorized project ${projectId}`);
+    }
+    deps.registry.remove(projectId, deps.now());
     deps.audit.write({ operationType: "admin.revoke_project", resultCode: "ok", projectId, detail: { source: "admin_api" } });
     return reply.code(204).send();
   });

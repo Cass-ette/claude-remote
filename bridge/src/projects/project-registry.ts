@@ -44,6 +44,7 @@ export interface ProjectRecord {
   readonly displayName: string;
   readonly createdAt: number;
   readonly authorizedAt: number;
+  readonly revokedAt: number | null;
 }
 
 export interface AuthorizeOptions {
@@ -66,11 +67,11 @@ export interface ProjectRegistry {
    */
   revalidate(projectId: string): ProjectRecord;
 
-  /** All currently authorized projects. */
+  /** All currently authorized projects (excludes revoked). */
   list(): ProjectRecord[];
 
-  /** Remove (de-authorize) a project. Idempotent. */
-  remove(projectId: string): void;
+  /** Remove (de-authorize) a project via soft delete. Idempotent. */
+  remove(projectId: string, now: number): void;
 
   get(projectId: string): ProjectRecord | undefined;
 }
@@ -83,6 +84,7 @@ interface ProjectRow {
   displayName: string;
   createdAt: number;
   authorizedAt: number;
+  revokedAt: number | null;
 }
 
 function rowToRecord(row: ProjectRow): ProjectRecord {
@@ -95,8 +97,8 @@ export function createProjectRegistry(db: SqliteDatabase): ProjectRegistry {
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   const getById = db.prepare("SELECT * FROM projects WHERE projectId = ?");
-  const listStmt = db.prepare("SELECT * FROM projects ORDER BY createdAt, projectId");
-  const deleteStmt = db.prepare("DELETE FROM projects WHERE projectId = ?");
+  const listStmt = db.prepare("SELECT * FROM projects WHERE revokedAt IS NULL ORDER BY createdAt, projectId");
+  const softDeleteStmt = db.prepare("UPDATE projects SET revokedAt = ? WHERE projectId = ? AND revokedAt IS NULL");
 
   function load(projectId: string): ProjectRow {
     const row = getById.get(projectId) as ProjectRow | undefined;
@@ -174,8 +176,8 @@ export function createProjectRegistry(db: SqliteDatabase): ProjectRegistry {
       return (listStmt.all() as ProjectRow[]).map(rowToRecord);
     },
 
-    remove(projectId) {
-      deleteStmt.run(projectId);
+    remove(projectId, now) {
+      softDeleteStmt.run(now, projectId);
     },
 
     get(projectId) {

@@ -152,7 +152,7 @@ describe("list and remove", () => {
     expect(ids).toContain(a.projectId);
     expect(ids).toContain(b.projectId);
 
-    registry.remove(a.projectId);
+    registry.remove(a.projectId, 2_000);
     ids = registry.list().map((p) => p.projectId);
     expect(ids).not.toContain(a.projectId);
     expect(ids).toContain(b.projectId);
@@ -160,6 +160,6 @@ describe("list and remove", () => {
     // A removed project no longer revalidates.
     expect(() => registry.revalidate(a.projectId)).toThrow(ProjectIdentityError);
     // Removing the same project again is a no-op (idempotent).
-    expect(() => registry.remove(a.projectId)).not.toThrow();
+    expect(() => registry.remove(a.projectId, 3_000)).not.toThrow();
   });
 });

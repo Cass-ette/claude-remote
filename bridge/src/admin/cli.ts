@@ -233,10 +233,10 @@ export function buildAdminProgram(deps: AdminCliDeps): Command {
       const ctx = openAdminContext(deps);
       try {
         const existing = ctx.registry.get(projectId);
-        if (existing === undefined) {
-          throw new AdminCommandError(`unknown projectId ${projectId}`);
+        if (existing === undefined || existing.revokedAt !== null) {
+          throw new AdminCommandError(`unknown authorized project ${projectId}`);
         }
-        ctx.registry.remove(projectId);
+        ctx.registry.remove(projectId, Date.now());
         ctx.openAudit().write({
           operationType: "admin.revoke_project",
           projectId,
