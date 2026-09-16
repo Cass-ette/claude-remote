@@ -38,3 +38,11 @@ import Testing
     #expect(IconState.from(status: far, bridgeReachable: true, nowMs: nowMs) == .green)
     #expect(IconState.red.symbolName == "xmark.octagon.fill")
 }
+
+@Test func expiryTextFormats() {
+    let nowMs = Date.now.timeIntervalSince1970 * 1000
+    #expect(MenuPanelView.expiryText(nil) == "无会话")
+    #expect(MenuPanelView.expiryText(nowMs - 1_000) == "已过期")
+    #expect(MenuPanelView.expiryText(nowMs + 30 * 60_000 + 30_000) == "会话 30 分钟后过期")
+    #expect(MenuPanelView.expiryText(nowMs + 5 * 3_600_000 + 30_000) == "会话 5 小时后过期")
+}
