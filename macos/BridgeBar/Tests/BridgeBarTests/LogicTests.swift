@@ -36,6 +36,11 @@ import Testing
                            device: .init(deviceId: "d", displayName: "P", pairedAt: 0, sessionExpiresAt: nowMs + 7 * 86_400_000),
                            dbSizeBytes: 0, version: "0")
     #expect(IconState.from(status: far, bridgeReachable: true, nowMs: nowMs) == .green)
+    // device paired but sessionExpiresAt is null (all sessions expired) → yellow
+    let expired = BridgeStatus(uptimeSeconds: 1, publicReachable: true, activeSessions: 0,
+                               device: .init(deviceId: "d", displayName: "P", pairedAt: 0, sessionExpiresAt: nil),
+                               dbSizeBytes: 0, version: "0")
+    #expect(IconState.from(status: expired, bridgeReachable: true, nowMs: nowMs) == .yellow)
     #expect(IconState.red.symbolName == "xmark.octagon.fill")
 }
 
