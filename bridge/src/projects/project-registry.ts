@@ -97,8 +97,13 @@ export function createProjectRegistry(db: SqliteDatabase): ProjectRegistry {
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
   const getById = db.prepare("SELECT * FROM projects WHERE projectId = ?");
+  const getByPath = db.prepare("SELECT * FROM projects WHERE canonicalRealpath = ?");
   const listStmt = db.prepare("SELECT * FROM projects WHERE revokedAt IS NULL ORDER BY createdAt, projectId");
   const softDeleteStmt = db.prepare("UPDATE projects SET revokedAt = ? WHERE projectId = ? AND revokedAt IS NULL");
+  const reauthorizeStmt = db.prepare(
+    `UPDATE projects SET revokedAt = NULL, displayName = ?, authorizedAt = ?, deviceNumber = ?, inode = ?
+     WHERE canonicalRealpath = ? AND revokedAt IS NOT NULL`,
+  );
 
   function load(projectId: string): ProjectRow {
     const row = getById.get(projectId) as ProjectRow | undefined;
@@ -131,6 +136,14 @@ export function createProjectRegistry(db: SqliteDatabase): ProjectRegistry {
       // revalidation later relies on.
       const canonical = resolveCanonicalSync(path);
       const stats = statSync(canonical);
+
+      // Check if a revoked project exists at this path — if so, reauthorize it.
+      const existing = getByPath.get(canonical) as ProjectRow | undefined;
+      if (existing !== undefined && existing.revokedAt !== null) {
+        reauthorizeStmt.run(displayName, options.now, stats.dev, stats.ino, canonical);
+        return rowToRecord(getByPath.get(canonical) as ProjectRow);
+      }
+
       const projectId = randomUUID();
       try {
         insertStmt.run(
