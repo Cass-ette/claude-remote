@@ -9,12 +9,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -27,6 +28,10 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.clauderemote.android.sync.BridgeProject
+import dev.clauderemote.android.ui.theme.EnhancedCard
+import dev.clauderemote.android.ui.theme.PrimaryButton
+import dev.clauderemote.android.ui.theme.SecondaryButton
+import dev.clauderemote.android.ui.theme.StatusBadge
 
 /**
  * §12.1 session list — sessions grouped by lifecycle state (等待批准 /
@@ -76,13 +81,27 @@ fun SessionListScreen(
     LaunchedEffect(showNewSessionDialog) {
         if (showNewSessionDialog) onFetchProjects()
     }
-    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        Text("会话", style = MaterialTheme.typography.headlineSmall)
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Button(onClick = { showNewSessionDialog = true }) { Text("新建会话") }
-            OutlinedButton(onClick = onScanImports) { Text("扫描旧会话") }
+    Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        Text("会话", style = MaterialTheme.typography.headlineMedium)
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            PrimaryButton(
+                onClick = { showNewSessionDialog = true },
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.padding(4.dp))
+                Text("新建会话")
+            }
+            SecondaryButton(
+                onClick = onScanImports,
+                modifier = Modifier.weight(1f),
+            ) {
+                Icon(Icons.Default.Search, contentDescription = null)
+                Spacer(Modifier.padding(4.dp))
+                Text("扫描旧会话")
+            }
         }
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        LazyColumn(verticalArrangement = Arrangement.spacedBy(16.dp)) {
             state.groups.forEach { group ->
                 item(key = "group-${group.group.name}") {
                     Text(
@@ -111,25 +130,32 @@ fun SessionListScreen(
 
 @Composable
 private fun SessionRow(row: SessionRowUi, onClick: () -> Unit) {
-    Surface(
-        shape = MaterialTheme.shapes.medium,
-        color = MaterialTheme.colorScheme.surfaceVariant,
-        modifier = Modifier.fillMaxWidth(),
+    EnhancedCard(
         onClick = onClick,
+        modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-            Text(row.projectName, style = MaterialTheme.typography.labelSmall)
-            Text(row.title, style = MaterialTheme.typography.bodyLarge)
-            Row(horizontalArrangement = Arrangement.spacedBy(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text(
-                    text = "模型：${row.model}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(
+                text = row.projectName,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
+            )
+            Text(
+                text = row.title,
+                style = MaterialTheme.typography.titleMedium,
+            )
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                StatusBadge(
+                    text = row.status,
+                    color = statusColor(row.status),
                 )
                 Text(
-                    text = "状态：${row.status}",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.primary,
+                    text = row.model,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 Spacer(Modifier.weight(1f))
                 Text(
@@ -140,6 +166,13 @@ private fun SessionRow(row: SessionRowUi, onClick: () -> Unit) {
             }
         }
     }
+}
+
+@Composable
+private fun statusColor(status: String) = when (sessionListGroupOf(status)) {
+    SessionListGroup.AWAITING_APPROVAL -> MaterialTheme.colorScheme.tertiary
+    SessionListGroup.RUNNING -> MaterialTheme.colorScheme.primary
+    SessionListGroup.STOPPED -> MaterialTheme.colorScheme.onSurfaceVariant
 }
 
 /**

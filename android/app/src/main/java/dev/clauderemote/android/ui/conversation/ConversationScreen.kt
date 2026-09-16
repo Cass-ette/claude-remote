@@ -1,5 +1,8 @@
 package dev.clauderemote.android.ui.conversation
 
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateDpAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -12,15 +15,16 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.material3.Button
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -33,6 +37,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.dp
@@ -44,6 +49,8 @@ import dev.clauderemote.android.ui.ExpiryWarning
 import dev.clauderemote.android.ui.MessageAction
 import dev.clauderemote.android.ui.MessageBadge
 import dev.clauderemote.android.ui.permission.PermissionSheet
+import dev.clauderemote.android.ui.theme.PrimaryButton
+import dev.clauderemote.android.ui.theme.SecondaryButton
 
 /**
  * §12.2 conversation screen — a thin Compose collector over the
@@ -209,33 +216,59 @@ private fun MessageRow(
     onSendContinue: () -> Unit,
 ) {
     val fromUser = item.role == "user"
+    val elevation by animateDpAsState(
+        targetValue = if (item.streaming) 4.dp else 2.dp,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessLow,
+        ),
+        label = "message-elevation"
+    )
+
     Column(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
         horizontalAlignment = if (fromUser) Alignment.End else Alignment.Start,
     ) {
-        Surface(
-            shape = RoundedCornerShape(12.dp),
-            color = when {
-                fromUser -> MaterialTheme.colorScheme.primary
-                item.role == "system" -> MaterialTheme.colorScheme.surfaceVariant
-                else -> MaterialTheme.colorScheme.surfaceVariant
-            },
+        Card(
+            modifier = Modifier
+                .widthIn(max = 320.dp)
+                .shadow(
+                    elevation = elevation,
+                    shape = RoundedCornerShape(
+                        topStart = 16.dp,
+                        topEnd = 16.dp,
+                        bottomStart = if (fromUser) 16.dp else 4.dp,
+                        bottomEnd = if (fromUser) 4.dp else 16.dp,
+                    ),
+                ),
+            shape = RoundedCornerShape(
+                topStart = 16.dp,
+                topEnd = 16.dp,
+                bottomStart = if (fromUser) 16.dp else 4.dp,
+                bottomEnd = if (fromUser) 4.dp else 16.dp,
+            ),
+            colors = CardDefaults.cardColors(
+                containerColor = when {
+                    fromUser -> MaterialTheme.colorScheme.primaryContainer
+                    item.role == "system" -> MaterialTheme.colorScheme.surfaceVariant
+                    else -> MaterialTheme.colorScheme.surfaceContainerHigh
+                },
+            ),
         ) {
-            Column(Modifier.padding(10.dp)) {
+            Column(Modifier.padding(12.dp)) {
                 Text(
                     text = item.text.ifBlank { "（无内容）" },
                     style = MaterialTheme.typography.bodyMedium,
-                    color = if (fromUser) {
-                        MaterialTheme.colorScheme.onPrimary
-                    } else {
-                        MaterialTheme.colorScheme.onSurface
+                    color = when {
+                        fromUser -> MaterialTheme.colorScheme.onPrimaryContainer
+                        else -> MaterialTheme.colorScheme.onSurface
                     },
                 )
                 if (item.streaming) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         CircularProgressIndicator(
                             modifier = Modifier.width(12.dp).height(12.dp),
-                            strokeWidth = 1.dp,
+                            strokeWidth = 1.5.dp,
                         )
                         Spacer(Modifier.width(6.dp))
                         Text("生成中…", style = MaterialTheme.typography.labelSmall)
@@ -248,13 +281,13 @@ private fun MessageRow(
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 val retryTarget = item.requestId
                 if (MessageAction.SAFE_RETRY in item.actions && retryTarget != null) {
-                    TextButton(onClick = { onSafeRetry(retryTarget) }) { Text("安全重试") }
+                    SecondaryButton(onClick = { onSafeRetry(retryTarget) }) { Text("安全重试") }
                 }
                 if (MessageAction.RESUME in item.actions) {
-                    TextButton(onClick = onResume) { Text("恢复会话") }
+                    SecondaryButton(onClick = onResume) { Text("恢复会话") }
                 }
                 if (MessageAction.SEND_CONTINUE in item.actions) {
-                    OutlinedButton(onClick = onSendContinue) { Text("发送「继续」") }
+                    SecondaryButton(onClick = onSendContinue) { Text("发送「继续」") }
                 }
             }
         }
@@ -344,7 +377,7 @@ private fun InputBar(
         Column(Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 8.dp)) {
             // Send lives in the same row as the input so it stays reachable
             // while the IME is open (the IME's enter key also sends).
-            Row(verticalAlignment = Alignment.Bottom) {
+            Row(verticalAlignment = Alignment.Bottom, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedTextField(
                     value = input,
                     onValueChange = { input = it },
@@ -352,11 +385,11 @@ private fun InputBar(
                     placeholder = { Text(if (sendEnabled) "输入消息…" else "会话运行中，停止后才能发送") },
                     enabled = sendEnabled,
                     maxLines = 4,
+                    shape = MaterialTheme.shapes.large,
                     keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
                     keyboardActions = KeyboardActions(onSend = { send() }),
                 )
-                Spacer(Modifier.width(8.dp))
-                Button(
+                PrimaryButton(
                     onClick = send,
                     enabled = sendEnabled && input.isNotBlank(),
                     modifier = Modifier.height(56.dp),
@@ -366,7 +399,7 @@ private fun InputBar(
             }
             Spacer(Modifier.height(8.dp))
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                OutlinedButton(onClick = onStop, enabled = !sendEnabled) {
+                SecondaryButton(onClick = onStop, enabled = !sendEnabled) {
                     Text("停止")
                 }
                 Spacer(Modifier.weight(1f))
