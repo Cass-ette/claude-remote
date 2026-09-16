@@ -3,6 +3,7 @@ package dev.clauderemote.android.ui.theme
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.spring
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.RowScope
@@ -14,7 +15,6 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
-import androidx.compose.material3.contentColorFor
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -23,15 +23,16 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 
 /**
- * Enhanced card with elevation and animated size changes.
+ * Enhanced card with Catppuccin styling and animation.
  */
 @Composable
 fun EnhancedCard(
     onClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
     shape: Shape = MaterialTheme.shapes.large,
-    elevation: Dp = 2.dp,
-    containerColor: Color = MaterialTheme.colorScheme.surfaceContainerLow,
+    elevation: Dp = 0.dp,  // Flat by default, GitHub style
+    containerColor: Color = MaterialTheme.colorScheme.surfaceContainer,
+    borderColor: Color = AppColors.Border,
     content: @Composable () -> Unit,
 ) {
     val cardModifier = modifier.animateContentSize(
@@ -47,7 +48,11 @@ fun EnhancedCard(
             modifier = cardModifier,
             shape = shape,
             colors = CardDefaults.cardColors(containerColor = containerColor),
-            elevation = CardDefaults.cardElevation(defaultElevation = elevation),
+            elevation = CardDefaults.cardElevation(
+                defaultElevation = elevation,
+                pressedElevation = elevation + 2.dp,
+            ),
+            border = BorderStroke(1.dp, borderColor),
         ) {
             Box(Modifier.padding(16.dp)) {
                 content()
@@ -59,6 +64,7 @@ fun EnhancedCard(
             shape = shape,
             colors = CardDefaults.cardColors(containerColor = containerColor),
             elevation = CardDefaults.cardElevation(defaultElevation = elevation),
+            border = BorderStroke(1.dp, borderColor),
         ) {
             Box(Modifier.padding(16.dp)) {
                 content()
@@ -68,7 +74,7 @@ fun EnhancedCard(
 }
 
 /**
- * Primary button with enhanced styling.
+ * Primary button with Catppuccin Lavender styling.
  */
 @Composable
 fun PrimaryButton(
@@ -82,10 +88,16 @@ fun PrimaryButton(
         onClick = onClick,
         modifier = modifier,
         enabled = enabled,
-        shape = MaterialTheme.shapes.large,
+        shape = MaterialTheme.shapes.medium,
+        colors = ButtonDefaults.buttonColors(
+            containerColor = AppColors.Primary,
+            contentColor = AppColors.BackgroundDeepest,
+            disabledContainerColor = AppColors.Surface,
+            disabledContentColor = AppColors.TextTertiary,
+        ),
         elevation = ButtonDefaults.buttonElevation(
-            defaultElevation = 2.dp,
-            pressedElevation = 8.dp,
+            defaultElevation = 0.dp,
+            pressedElevation = 0.dp,
             disabledElevation = 0.dp,
         ),
         contentPadding = contentPadding,
@@ -94,7 +106,7 @@ fun PrimaryButton(
 }
 
 /**
- * Secondary button with enhanced styling.
+ * Secondary button with border styling.
  */
 @Composable
 fun SecondaryButton(
@@ -108,7 +120,12 @@ fun SecondaryButton(
         onClick = onClick,
         modifier = modifier,
         enabled = enabled,
-        shape = MaterialTheme.shapes.large,
+        shape = MaterialTheme.shapes.medium,
+        colors = ButtonDefaults.outlinedButtonColors(
+            contentColor = AppColors.TextPrimary,
+            disabledContentColor = AppColors.TextTertiary,
+        ),
+        border = BorderStroke(1.dp, if (enabled) AppColors.Border else AppColors.Divider),
         contentPadding = contentPadding,
         content = content,
     )
@@ -126,7 +143,8 @@ fun StatusBadge(
     Surface(
         modifier = modifier,
         shape = MaterialTheme.shapes.small,
-        color = color.copy(alpha = 0.12f),
+        color = color.copy(alpha = 0.15f),
+        border = BorderStroke(1.dp, color.copy(alpha = 0.3f)),
     ) {
         Box(Modifier.padding(horizontal = 8.dp, vertical = 4.dp)) {
             androidx.compose.material3.Text(

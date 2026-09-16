@@ -5,10 +5,6 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.compose.foundation.isSystemInDarkTheme
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -17,7 +13,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.lifecycleScope
 import androidx.navigation.compose.NavHost
@@ -41,6 +36,7 @@ import dev.clauderemote.android.ui.sessions.SessionListScreen
 import dev.clauderemote.android.ui.sessions.SessionListUiState
 import dev.clauderemote.android.ui.sessions.SessionRowUi
 import dev.clauderemote.android.ui.sessions.sessionListGroupOf
+import dev.clauderemote.android.ui.theme.AppTheme
 import dev.clauderemote.android.sync.BridgeProject
 import java.time.Duration
 import java.time.Instant
@@ -70,7 +66,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContent {
-            ClaudeRemoteTheme {
+            AppTheme {
                 ClaudeRemoteNavGraph()
             }
         }
@@ -105,66 +101,8 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
- * §12.5 dark-first theming: the DARK scheme is the app's base palette; a
- * light scheme exists as a secondary option for light-system users.
+ * §12.5 dark-first theming with Catppuccin Macchiato palette
  */
-@Composable
-fun ClaudeRemoteTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    content: @Composable () -> Unit,
-) {
-    MaterialTheme(
-        colorScheme = if (darkTheme) DarkColorScheme else LightColorScheme,
-        content = content,
-    )
-}
-
-private val DarkColorScheme = darkColorScheme(
-    primary = Color(0xFF9EC6FF),
-    onPrimary = Color(0xFF00325B),
-    primaryContainer = Color(0xFF1B4A78),
-    onPrimaryContainer = Color(0xFFD3E4FF),
-    secondary = Color(0xFFBAC7DC),
-    onSecondary = Color(0xFF243140),
-    secondaryContainer = Color(0xFF3B4857),
-    onSecondaryContainer = Color(0xFFD6E3F8),
-    tertiary = Color(0xFFDFBBFD),
-    onTertiary = Color(0xFF40255E),
-    tertiaryContainer = Color(0xFF583B76),
-    onTertiaryContainer = Color(0xFFF4DAFF),
-    error = Color(0xFFFFB4AB),
-    onError = Color(0xFF690005),
-    errorContainer = Color(0xFF93000A),
-    onErrorContainer = Color(0xFFFFDAD6),
-    background = Color(0xFF1A1C1E),
-    onBackground = Color(0xFFE3E2E6),
-    surface = Color(0xFF1A1C1E),
-    onSurface = Color(0xFFE3E2E6),
-    surfaceVariant = Color(0xFF43474E),
-    onSurfaceVariant = Color(0xFFC4C6CF),
-)
-
-private val LightColorScheme = lightColorScheme(
-    primary = Color(0xFF2A5E97),
-    onPrimary = Color(0xFFFFFFFF),
-    primaryContainer = Color(0xFFD3E4FF),
-    onPrimaryContainer = Color(0xFF001C36),
-    secondary = Color(0xFF526070),
-    onSecondary = Color(0xFFFFFFFF),
-    secondaryContainer = Color(0xFFD6E3F8),
-    onSecondaryContainer = Color(0xFF0F1D2A),
-    tertiary = Color(0xFF6F567F),
-    onTertiary = Color(0xFFFFFFFF),
-    tertiaryContainer = Color(0xFFF9D8FD),
-    onTertiaryContainer = Color(0xFF291336),
-    background = Color(0xFFFDFBFF),
-    onBackground = Color(0xFF1A1C1E),
-    surface = Color(0xFFFDFBFF),
-    onSurface = Color(0xFF1A1C1E),
-    surfaceVariant = Color(0xFFDFE2EB),
-    onSurfaceVariant = Color(0xFF43474E),
-)
-
 private object Routes {
     const val CONNECTION = "connection"
     const val SESSIONS = "sessions"

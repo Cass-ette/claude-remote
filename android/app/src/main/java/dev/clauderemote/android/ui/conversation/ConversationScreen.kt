@@ -49,6 +49,7 @@ import dev.clauderemote.android.ui.ExpiryWarning
 import dev.clauderemote.android.ui.MessageAction
 import dev.clauderemote.android.ui.MessageBadge
 import dev.clauderemote.android.ui.permission.PermissionSheet
+import dev.clauderemote.android.ui.theme.AppColors
 import dev.clauderemote.android.ui.theme.PrimaryButton
 import dev.clauderemote.android.ui.theme.SecondaryButton
 
@@ -249,9 +250,9 @@ private fun MessageRow(
             ),
             colors = CardDefaults.cardColors(
                 containerColor = when {
-                    fromUser -> MaterialTheme.colorScheme.primaryContainer
-                    item.role == "system" -> MaterialTheme.colorScheme.surfaceVariant
-                    else -> MaterialTheme.colorScheme.surfaceContainerHigh
+                    fromUser -> AppColors.Primary.copy(alpha = 0.15f)
+                    item.role == "system" -> AppColors.SurfaceElevated
+                    else -> AppColors.Surface
                 },
             ),
         ) {
@@ -260,8 +261,8 @@ private fun MessageRow(
                     text = item.text.ifBlank { "（无内容）" },
                     style = MaterialTheme.typography.bodyMedium,
                     color = when {
-                        fromUser -> MaterialTheme.colorScheme.onPrimaryContainer
-                        else -> MaterialTheme.colorScheme.onSurface
+                        fromUser -> AppColors.Primary
+                        else -> AppColors.TextPrimary
                     },
                 )
                 if (item.streaming) {

@@ -28,6 +28,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import dev.clauderemote.android.sync.BridgeProject
+import dev.clauderemote.android.ui.theme.AppColors
 import dev.clauderemote.android.ui.theme.EnhancedCard
 import dev.clauderemote.android.ui.theme.PrimaryButton
 import dev.clauderemote.android.ui.theme.SecondaryButton
@@ -170,9 +171,9 @@ private fun SessionRow(row: SessionRowUi, onClick: () -> Unit) {
 
 @Composable
 private fun statusColor(status: String) = when (sessionListGroupOf(status)) {
-    SessionListGroup.AWAITING_APPROVAL -> MaterialTheme.colorScheme.tertiary
-    SessionListGroup.RUNNING -> MaterialTheme.colorScheme.primary
-    SessionListGroup.STOPPED -> MaterialTheme.colorScheme.onSurfaceVariant
+    SessionListGroup.AWAITING_APPROVAL -> AppColors.Warning
+    SessionListGroup.RUNNING -> AppColors.Success
+    SessionListGroup.STOPPED -> AppColors.TextTertiary
 }
 
 /**
