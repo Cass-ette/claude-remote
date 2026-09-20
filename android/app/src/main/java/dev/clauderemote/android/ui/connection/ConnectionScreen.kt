@@ -32,7 +32,7 @@ import dev.clauderemote.android.network.ConnectionState
 import dev.clauderemote.android.ui.ExpiryWarning
 
 /**
- * §12.5 connection screen — the app's front door. Shows the Cloudflare OAuth
+ * §12.5 connection screen — the app's front door. Shows the Bridge OAuth
  * login state and re-login entry, the scan-to-pair entry, the tunnel/bridge
  * state, all four versions (app, bridge, protocol, Claude Code), the current
  * device identity, the Access/device-session expiry warning, and the re-pair
@@ -63,16 +63,20 @@ fun ConnectionScreen(
     onBridgeHostChange: (String) -> Unit = {},
     onSaveBridgeHost: () -> Unit = {},
 ) {
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .verticalScroll(rememberScrollState())
-            .padding(20.dp),
-        verticalArrangement = Arrangement.spacedBy(16.dp),
+    Surface(
+        modifier = Modifier.fillMaxSize(),
+        color = MaterialTheme.colorScheme.background,
     ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .verticalScroll(rememberScrollState())
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
         Text("连接", style = MaterialTheme.typography.headlineSmall)
 
-        Section("Cloudflare 登录") {
+        Section("Bridge 登录") {
             Text(
                 text = state.signedInAs?.let { "已登录：$it" } ?: "未登录",
                 style = MaterialTheme.typography.bodyMedium,
@@ -120,6 +124,13 @@ fun ConnectionScreen(
                     MaterialTheme.colorScheme.onSurfaceVariant
                 },
             )
+            if (state.connectionState != ConnectionState.CONNECTED) {
+                Text(
+                    text = "提示：需要完成登录和配对后才能连接到 Bridge",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             // The production bridge host is user-entered here and persisted
             // (BridgeHostStore); an empty value keeps the debug default.
             var hostInput by remember(state.bridgeHost) {
@@ -176,6 +187,7 @@ fun ConnectionScreen(
             Text("进入会话列表")
         }
         Spacer(Modifier.height(24.dp))
+        }
     }
 }
 

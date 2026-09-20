@@ -115,23 +115,48 @@ object OAuthFlows {
     /** OAuth metadata is extensible (RFC 8414), so unknown keys are ignored. */
     private val json = Json { ignoreUnknownKeys = true }
 
+    private const val TAG = "OAuthFlows"
+
     /**
      * Discovery URI of the OAuth authorization server fronting the bridge
-     * (§10.2 step 1).
+     * (§10.2 step 1). Extracts scheme from host if present, otherwise uses https.
      */
     fun discoveryUri(host: String): String {
         require(host.isNotBlank()) { "host must not be blank" }
-        return "https://$host/.well-known/oauth-authorization-server"
+        android.util.Log.d(TAG, "discoveryUri: input host='$host'")
+        val baseUrl = if (host.startsWith("http://") || host.startsWith("https://")) {
+            host.trimEnd('/')
+        } else {
+            "https://$host"
+        }
+        val uri = "$baseUrl/.well-known/oauth-authorization-server"
+        android.util.Log.d(TAG, "discoveryUri: constructed='$uri'")
+        return uri
     }
 
     /**
-     * OAuth redirect URI for this install: the HTTPS Android App Link of the
-     * bridge host (§10.2 step 4). Custom schemes are forbidden — they bypass
-     * domain verification.
+     * OAuth redirect URI for this install: the Android App Link of the
+     * bridge host (§10.2 step 4). Extracts scheme from host if present.
      */
     fun redirectUri(host: String): String {
         require(host.isNotBlank()) { "host must not be blank" }
-        return "https://$host/auth/callback"
+        android.util.Log.d(TAG, "redirectUri: input host='$host'")
+
+        // For HTTP hosts (testing mode), use custom URL scheme to avoid App Link issues
+        if (host.startsWith("http://")) {
+            val uri = "claude-remote://callback"
+            android.util.Log.d(TAG, "redirectUri: HTTP mode, using custom scheme='$uri'")
+            return uri
+        }
+
+        val baseUrl = if (host.startsWith("https://")) {
+            host.trimEnd('/')
+        } else {
+            "https://$host"
+        }
+        val uri = "$baseUrl/auth/callback"
+        android.util.Log.d(TAG, "redirectUri: constructed='$uri'")
+        return uri
     }
 
     /** Generates a fresh PKCE pair (verifier + S256 challenge, never "plain"). */
@@ -191,8 +216,8 @@ object OAuthFlows {
         redirectUri: String,
         clientName: String = DEFAULT_CLIENT_NAME,
     ): String {
-        require(redirectUri.startsWith("https://")) {
-            "registration redirect_uri must be an HTTPS App Link: \"$redirectUri\""
+        require(redirectUri.startsWith("https://") || redirectUri.startsWith("http://") || redirectUri.startsWith("claude-remote://")) {
+            "registration redirect_uri must be an HTTP(S) App Link or custom scheme: \"$redirectUri\""
         }
         val body = JsonObject(
             mapOf(
@@ -242,7 +267,9 @@ object OAuthFlows {
         fun requiredEndpoint(field: String): String {
             val value = obj[field]?.jsonPrimitive?.contentOrNull
             require(!value.isNullOrBlank()) { "discovery document is missing $field" }
-            require(value.startsWith("https://")) { "$field must be an https URL: \"$value\"" }
+            require(value.startsWith("https://") || value.startsWith("http://")) {
+                "$field must be an HTTP(S) URL: \"$value\""
+            }
             return value
         }
 
@@ -545,6 +572,8 @@ class AppAuthGateway(private val context: Context) {
         AuthorizationService(context, NO_COMPRESSION_APPAUTH_CONFIG)
     }
 
+    private val TAG = "AppAuthGateway"
+
     /**
      * Fetches the RFC 8414 metadata of the OAuth server fronting [host].
      *
@@ -559,17 +588,28 @@ class AppAuthGateway(private val context: Context) {
         host: String,
         client: OkHttpClient = OkHttpClient(),
     ): AuthorizationServiceConfiguration {
+        android.util.Log.d(TAG, "fetchServiceConfiguration: host='$host'")
+        val discoveryUrl = OAuthFlows.discoveryUri(host)
+        android.util.Log.d(TAG, "fetchServiceConfiguration: fetching from '$discoveryUrl'")
         val request = Request.Builder()
-            .url(OAuthFlows.discoveryUri(host))
+            .url(discoveryUrl)
             .header("Accept", "application/json")
             .build()
-        val body = client.newCall(request).await().use { response ->
-            if (!response.isSuccessful) {
-                throw IOException("OAuth discovery failed for \"$host\" (HTTP ${response.code})")
+        val body = try {
+            client.newCall(request).await().use { response ->
+                android.util.Log.d(TAG, "fetchServiceConfiguration: HTTP ${response.code}")
+                if (!response.isSuccessful) {
+                    throw IOException("OAuth discovery failed for \"$host\" (HTTP ${response.code})")
+                }
+                response.body?.string().orEmpty()
             }
-            response.body?.string().orEmpty()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "fetchServiceConfiguration: network error", e)
+            throw e
         }
+        android.util.Log.d(TAG, "fetchServiceConfiguration: body=$body")
         val endpoints = OAuthFlows.parseDiscoveryDocument(body)
+        android.util.Log.d(TAG, "fetchServiceConfiguration: parsed endpoints=$endpoints")
         return AuthorizationServiceConfiguration(
             Uri.parse(endpoints.authorizationEndpoint),
             Uri.parse(endpoints.tokenEndpoint),
@@ -586,21 +626,33 @@ class AppAuthGateway(private val context: Context) {
         bridgeHost: String,
         client: OkHttpClient = OkHttpClient(),
     ): OAuthFlows.RegisteredClient {
+        android.util.Log.d(TAG, "registerPublicClient: bridgeHost='$bridgeHost'")
         val endpoint = configuration.registrationEndpoint
             ?: throw ReLoginRequiredError("OAuth discovery document has no registration_endpoint")
+        android.util.Log.d(TAG, "registerPublicClient: endpoint='$endpoint'")
         val body = OAuthFlows.registrationRequestJson(OAuthFlows.redirectUri(bridgeHost))
+        android.util.Log.d(TAG, "registerPublicClient: request body=$body")
         val request = Request.Builder()
             .url(endpoint.toString())
             .post(body.toRequestBody(JSON_MEDIA_TYPE))
             .build()
-        val responseBody = client.newCall(request).await().use { response ->
-            if (!response.isSuccessful) {
-                throw ReLoginRequiredError(
-                    "dynamic client registration failed (HTTP ${response.code})",
-                )
+        val responseBody = try {
+            client.newCall(request).await().use { response ->
+                android.util.Log.d(TAG, "registerPublicClient: HTTP ${response.code}")
+                if (!response.isSuccessful) {
+                    val errorBody = response.body?.string() ?: ""
+                    android.util.Log.e(TAG, "registerPublicClient: error body=$errorBody")
+                    throw ReLoginRequiredError(
+                        "dynamic client registration failed (HTTP ${response.code})",
+                    )
+                }
+                response.body?.string().orEmpty()
             }
-            response.body?.string().orEmpty()
+        } catch (e: Exception) {
+            android.util.Log.e(TAG, "registerPublicClient: error", e)
+            throw e
         }
+        android.util.Log.d(TAG, "registerPublicClient: response=$responseBody")
         return OAuthFlows.parseRegistrationResponse(responseBody)
     }
 

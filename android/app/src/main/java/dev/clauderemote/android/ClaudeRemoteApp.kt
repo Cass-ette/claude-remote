@@ -60,16 +60,23 @@ class ClaudeRemoteApp : Application() {
     }
 
     companion object {
+        private const val TAG = "ClaudeRemoteApp"
+
         /**
          * Resolves the bridge base URL: a full http(s) URL is used verbatim,
-         * a bare host gets the production https scheme, and no configured
-         * host falls back to the debug default (BuildConfig).
+         * a bare host gets the http scheme (for testing with reverse proxy),
+         * and no configured host falls back to the debug default (BuildConfig).
          */
-        fun resolveBaseUrl(hostInput: String?): String = when {
-            hostInput.isNullOrBlank() -> BuildConfig.DEFAULT_BRIDGE_BASE_URL
-            hostInput.startsWith("http://") || hostInput.startsWith("https://") ->
-                hostInput.trim().trimEnd('/')
-            else -> "https://" + hostInput.trim().trimEnd('/')
+        fun resolveBaseUrl(hostInput: String?): String {
+            android.util.Log.d(TAG, "resolveBaseUrl: input='$hostInput'")
+            val result = when {
+                hostInput.isNullOrBlank() -> BuildConfig.DEFAULT_BRIDGE_BASE_URL
+                hostInput.startsWith("http://") || hostInput.startsWith("https://") ->
+                    hostInput.trim().trimEnd('/')
+                else -> "http://" + hostInput.trim().trimEnd('/')
+            }
+            android.util.Log.d(TAG, "resolveBaseUrl: resolved='$result'")
+            return result
         }
     }
 }

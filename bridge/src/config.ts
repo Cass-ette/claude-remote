@@ -72,6 +72,12 @@ export interface BridgeConfig {
    */
   readonly publicHost?: string | undefined;
   /**
+   * Public URL scheme for OAuth endpoints (BRIDGE_PUBLIC_SCHEME).
+   * Defaults to "https" for production. Set to "http" for local development
+   * or testing with reverse proxies that handle TLS termination.
+   */
+  readonly publicScheme: "http" | "https";
+  /**
    * APK signing certificate SHA-256 fingerprint
    * (BRIDGE_ASSETLINKS_FINGERPRINT), e.g. `AA:BB:…` (colons optional,
    * normalized to colon-separated uppercase hex). Optional: when set the
@@ -352,6 +358,12 @@ export function loadConfig(env: EnvSource): BridgeConfig {
   const cloudflareAud = readString(source, "BRIDGE_CLOUDFLARE_AUD");
   const deviceSessionTtlSeconds = parseDeviceSessionTtlSeconds(source);
   const publicHost = readString(source, "BRIDGE_PUBLIC_HOST");
+  const publicScheme = readString(source, "BRIDGE_PUBLIC_SCHEME") || "https";
+  if (publicScheme !== "http" && publicScheme !== "https") {
+    throw new Error(
+      `BRIDGE_PUBLIC_SCHEME must be "http" or "https"; got ${JSON.stringify(publicScheme)}`,
+    );
+  }
   const assetlinksFingerprint = parseAssetlinksFingerprint(source);
   const claudeConfigDir = parseClaudeConfigDir(source);
 
@@ -372,6 +384,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     cloudflareAud,
     deviceSessionTtlSeconds,
     publicHost,
+    publicScheme: publicScheme as "http" | "https",
     assetlinksFingerprint,
     claudeConfigDir,
   });

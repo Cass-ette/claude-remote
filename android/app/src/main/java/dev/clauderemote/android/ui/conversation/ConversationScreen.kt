@@ -83,7 +83,11 @@ fun ConversationScreen(
     onDenyPermission: (String) -> Unit,
 ) {
     Box(modifier = Modifier.fillMaxSize()) {
-        Column(modifier = Modifier.fillMaxSize().imePadding()) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = MaterialTheme.colorScheme.background
+        ) {
+            Column(modifier = Modifier.fillMaxSize().imePadding()) {
             ConversationHeader(
                 session = state.session,
                 expiryWarning = expiryWarning,
@@ -105,6 +109,7 @@ fun ConversationScreen(
                 onStop = onStop,
                 onRelease = onRelease,
             )
+        }
         }
         // §12.3: the pending permission takes over as a modal bottom sheet.
         state.pendingPermission?.let { pending ->

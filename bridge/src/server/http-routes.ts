@@ -252,6 +252,8 @@ export function registerApiRoutes(app: FastifyInstance, deps: ApiRoutesDeps): vo
         expiresAt: challenge.expiresAt,
       });
     } catch (error) {
+      // Log the error for debugging 500 responses
+      console.error("auth.challenge error:", error instanceof Error ? error.message : String(error), error);
       deps.audit.write({
         operationType: "auth.challenge",
         accessSubject: identity.subject,

@@ -10,7 +10,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
 /**
- * Typography following GitHub's design system
+ * Typography following GitHub's design system.
+ * No color specified - uses MaterialTheme.colorScheme defaults (onBackground/onSurface).
  */
 val AppTypography = Typography(
     displayLarge = TextStyle(
@@ -19,7 +20,6 @@ val AppTypography = Typography(
         fontSize = 32.sp,
         lineHeight = 40.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     displayMedium = TextStyle(
         fontFamily = FontFamily.Default,
@@ -27,7 +27,6 @@ val AppTypography = Typography(
         fontSize = 28.sp,
         lineHeight = 36.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     displaySmall = TextStyle(
         fontFamily = FontFamily.Default,
@@ -35,7 +34,6 @@ val AppTypography = Typography(
         fontSize = 24.sp,
         lineHeight = 32.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     headlineLarge = TextStyle(
         fontFamily = FontFamily.Default,
@@ -43,7 +41,6 @@ val AppTypography = Typography(
         fontSize = 22.sp,
         lineHeight = 28.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     headlineMedium = TextStyle(
         fontFamily = FontFamily.Default,
@@ -51,7 +48,6 @@ val AppTypography = Typography(
         fontSize = 20.sp,
         lineHeight = 26.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     headlineSmall = TextStyle(
         fontFamily = FontFamily.Default,
@@ -59,7 +55,6 @@ val AppTypography = Typography(
         fontSize = 18.sp,
         lineHeight = 24.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     titleLarge = TextStyle(
         fontFamily = FontFamily.Default,
@@ -67,7 +62,6 @@ val AppTypography = Typography(
         fontSize = 16.sp,
         lineHeight = 24.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     titleMedium = TextStyle(
         fontFamily = FontFamily.Default,
@@ -75,7 +69,6 @@ val AppTypography = Typography(
         fontSize = 15.sp,
         lineHeight = 22.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     titleSmall = TextStyle(
         fontFamily = FontFamily.Default,
@@ -83,7 +76,6 @@ val AppTypography = Typography(
         fontSize = 14.sp,
         lineHeight = 20.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextSecondary,
     ),
     bodyLarge = TextStyle(
         fontFamily = FontFamily.Default,
@@ -91,7 +83,6 @@ val AppTypography = Typography(
         fontSize = 15.sp,
         lineHeight = 22.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     bodyMedium = TextStyle(
         fontFamily = FontFamily.Default,
@@ -99,7 +90,6 @@ val AppTypography = Typography(
         fontSize = 14.sp,
         lineHeight = 20.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextPrimary,
     ),
     bodySmall = TextStyle(
         fontFamily = FontFamily.Default,
@@ -107,7 +97,6 @@ val AppTypography = Typography(
         fontSize = 13.sp,
         lineHeight = 18.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextSecondary,
     ),
     labelLarge = TextStyle(
         fontFamily = FontFamily.Default,
@@ -115,7 +104,6 @@ val AppTypography = Typography(
         fontSize = 13.sp,
         lineHeight = 18.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextSecondary,
     ),
     labelMedium = TextStyle(
         fontFamily = FontFamily.Default,
@@ -123,7 +111,6 @@ val AppTypography = Typography(
         fontSize = 12.sp,
         lineHeight = 16.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextSecondary,
     ),
     labelSmall = TextStyle(
         fontFamily = FontFamily.Default,
@@ -131,7 +118,6 @@ val AppTypography = Typography(
         fontSize = 11.sp,
         lineHeight = 14.sp,
         letterSpacing = 0.sp,
-        color = AppColors.TextTertiary,
     ),
 )
 

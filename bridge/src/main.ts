@@ -198,11 +198,12 @@ export async function startBridge(
       : null;
   const oauthStore = createOAuthStore(db);
   // API/WS Bearer credentials are bridge-issued opaque tokens (7-day TTL,
-  // minted at /auth/token); the Cloudflare assertion is only ever verified at
-  // /auth/authorize and the code exchange. Local-only boots keep auth off.
+  // minted at /auth/token). In self-hosted mode (cfVerifier === null), the
+  // OAuth flow uses a default identity instead of Cloudflare Access JWT.
+  // BridgeAccessVerifier is created whenever OAuth is enabled (publicHost set).
   const bridgeVerifier =
     overrides.accessVerifier ??
-    (cfVerifier !== null && config.publicHost !== undefined
+    (config.publicHost !== undefined
       ? createBridgeAccessVerifier({ store: oauthStore, now })
       : null);
 
@@ -392,14 +393,14 @@ export async function startBridge(
     now,
   });
 
-  // Revised §10.2: the Bridge is the OAuth authorization server fronting
-  // Cloudflare Access (the edge keeps /auth/authorize; everything the app
-  // calls directly is origin-verified). Local-only boots expose nothing.
-  if (cfVerifier !== null && config.publicHost !== undefined) {
+  // Revised §10.2: OAuth authorization server. In non-Cloudflare mode,
+  // we use a simplified flow without edge verification.
+  if (config.publicHost !== undefined) {
     registerOAuthRoutes(app, {
-      verifier: cfVerifier,
+      verifier: cfVerifier ?? null,  // null = no edge verification (self-hosted mode)
       store: oauthStore,
       publicHost: config.publicHost,
+      publicScheme: config.publicScheme,
       audit,
       now,
       ...(config.assetlinksFingerprint !== undefined

@@ -222,6 +222,8 @@ export interface OAuthRoutesDeps {
   readonly store: OAuthStore;
   /** BRIDGE_PUBLIC_HOST — issuer host and redirect-uri pin. */
   readonly publicHost: string;
+  /** BRIDGE_PUBLIC_SCHEME — OAuth endpoint URL scheme (http or https). */
+  readonly publicScheme: "http" | "https";
   /** §10.6 audit sink (token/assertion values never reach it). */
   readonly audit: AuditLog;
   readonly now: () => number;
@@ -294,20 +296,46 @@ function oauthError(status: number, error: string, description?: string): { stat
 }
 
 /**
- * The only acceptable redirect_uri: https, exactly the public host, exactly
- * /auth/callback, no userinfo/query/fragment (no open-redirect surface).
+ * The acceptable redirect_uri:
+ * - For HTTPS: exactly the public host with /auth/callback path
+ * - For HTTP (testing mode): also accept claude-remote://callback custom scheme
+ * No userinfo/query/fragment allowed (no open-redirect surface).
  */
-export function isValidRedirectUri(redirectUri: string, publicHost: string): boolean {
+export function isValidRedirectUri(
+  redirectUri: string,
+  publicHost: string,
+  publicScheme: "http" | "https",
+): boolean {
   let url: URL;
   try {
     url = new URL(redirectUri);
   } catch {
     return false;
   }
+
+  // For HTTP mode, also accept custom scheme
+  if (publicScheme === "http" && url.protocol === "claude-remote:" && url.hostname === "callback") {
+    return (
+      url.pathname === "" &&
+      url.username === "" &&
+      url.password === "" &&
+      url.search === "" &&
+      url.hash === ""
+    );
+  }
+
+  // publicHost may include port (e.g., "example.com:8888")
+  // Split it to compare hostname and port separately
+  const colonIndex = publicHost.indexOf(":");
+  const expectedHostname = colonIndex >= 0 ? publicHost.slice(0, colonIndex) : publicHost;
+  const expectedPort = colonIndex >= 0 ? publicHost.slice(colonIndex + 1) : "";
+  const actualPort = url.port || (url.protocol === "https:" ? "443" : "80");
+  const expectedPortNormalized = expectedPort || (publicScheme === "https" ? "443" : "80");
+
   return (
-    url.protocol === "https:" &&
-    url.hostname.toLowerCase() === publicHost.toLowerCase() &&
-    url.port === "" &&
+    url.protocol === `${publicScheme}:` &&
+    url.hostname.toLowerCase() === expectedHostname.toLowerCase() &&
+    actualPort === expectedPortNormalized &&
     url.pathname === OAUTH_REDIRECT_PATH &&
     url.username === "" &&
     url.password === "" &&
@@ -321,12 +349,22 @@ function isValidCodeChallenge(challenge: string): boolean {
   return /^[A-Za-z0-9\-_]{43,128}$/.test(challenge);
 }
 
-/** Verify the request's Access assertion; null → uniform 401-style outcome. */
+/** Verify the request's Access assertion; null → self-hosted mode (default identity). */
 async function requireAccess(
   deps: OAuthRoutesDeps,
   request: FastifyRequest,
 ): Promise<{ identity: VerifiedAccessIdentity; assertion: string } | { status: 401 }> {
-  if (deps.verifier === null) return { status: 401 };
+  if (deps.verifier === null) {
+    // Self-hosted mode: no edge verification, use default identity
+    return {
+      identity: {
+        subject: "self-hosted-user",
+        audience: "bridge",
+        expiresAt: new Date(Date.now() + 86400000).toISOString(), // 24h from now
+      },
+      assertion: "self-hosted-mode",
+    };
+  }
   try {
     const identity = await deps.verifier.verifyRequest(request.headers);
     return { identity, assertion: extractRawAssertion(request.headers) };
@@ -379,7 +417,7 @@ export function createBridgeAccessVerifier(deps: BridgeAccessVerifierDeps): Acce
 }
 
 export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps): void {
-  const issuer = `https://${deps.publicHost}`;
+  const issuer = `${deps.publicScheme}://${deps.publicHost}`;
   const authorizationEndpoint = `${issuer}/auth/authorize`;
   const tokenEndpoint = `${issuer}/auth/token`;
   const registrationEndpoint = `${issuer}/auth/registration`;
@@ -395,7 +433,8 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
     },
   );
 
-  app.get("/.well-known/oauth-authorization-server", async () => ({
+  // OAuth 2.0 Authorization Server Metadata (RFC 8414)
+  const discoveryMetadata = {
     issuer,
     authorization_endpoint: authorizationEndpoint,
     token_endpoint: tokenEndpoint,
@@ -404,7 +443,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
     grant_types_supported: grantTypes,
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["none"],
-  }));
+  };
+
+  app.get("/.well-known/oauth-authorization-server", async () => discoveryMetadata);
+
+  // OpenID Connect Discovery (for compatibility with AppAuth and other OIDC clients)
+  app.get("/.well-known/openid-configuration", async () => discoveryMetadata);
 
   app.post("/auth/registration", async (request, reply) => {
     const body = (request.body ?? {}) as FormBody;
@@ -413,12 +457,12 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
       !Array.isArray(redirectUris) ||
       redirectUris.length !== 1 ||
       typeof redirectUris[0] !== "string" ||
-      !isValidRedirectUri(redirectUris[0], deps.publicHost)
+      !isValidRedirectUri(redirectUris[0], deps.publicHost, deps.publicScheme)
     ) {
       deps.audit.write({ operationType: "oauth.registration", resultCode: "invalid_redirect_uri" });
       return reply.code(400).send({
         error: "invalid_redirect_uri",
-        error_description: `redirect_uris must be exactly [https://${deps.publicHost}${OAUTH_REDIRECT_PATH}]`,
+        error_description: `redirect_uris must be exactly [${deps.publicScheme}://${deps.publicHost}${OAUTH_REDIRECT_PATH}]`,
       });
     }
     const client = deps.store.registerClient(redirectUris[0], deps.now());
@@ -506,9 +550,6 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
       const mapped = oauthError(400, error, description);
       return reply.code(mapped.status).send(mapped.body);
     };
-    if (deps.verifier === null) {
-      return reply.code(503).send({ error: "temporarily_unavailable" });
-    }
     const clientId = formString(body, "client_id");
     const client = clientId === null ? undefined : deps.store.findClient(clientId);
     if (client === undefined) {
@@ -531,11 +572,14 @@ export function registerOAuthRoutes(app: FastifyInstance, deps: OAuthRoutesDeps)
       }
       // The assertion is verified exactly once, here: a code may only be
       // exchanged while its underlying Access session is still live.
-      try {
-        await deps.verifier.verifyAssertion(row.assertion);
-      } catch {
-        // The Access assertion expired inside the 5-minute code window.
-        return badGrant("invalid_grant", "the Access assertion behind this code is no longer valid");
+      // In self-hosted mode (verifier === null), skip assertion verification.
+      if (deps.verifier !== null) {
+        try {
+          await deps.verifier.verifyAssertion(row.assertion);
+        } catch {
+          // The Access assertion expired inside the 5-minute code window.
+          return badGrant("invalid_grant", "the Access assertion behind this code is no longer valid");
+        }
       }
       const { accessToken, expiresAt } = mintAccessToken(deps.store, client.clientId, row.subject, deps.now());
       const refreshToken = randomToken();

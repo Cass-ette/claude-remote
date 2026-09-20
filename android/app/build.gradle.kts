@@ -18,11 +18,9 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Debug/CI default bridge endpoint: the emulator's alias for the host
-        // loopback, on the bridge's DEFAULT_BRIDGE_PORT (bridge/src/config.ts).
-        // Production installs override this with the user-entered host on the
-        // ConnectionScreen (persisted via BridgeHostStore).
-        buildConfigField("String", "DEFAULT_BRIDGE_BASE_URL", "\"http://10.0.2.2:43111\"")
+        // Temporary HTTP configuration for testing via Nginx reverse proxy.
+        // Nginx on 8888 proxies to Bridge on 127.0.0.1:43111.
+        buildConfigField("String", "DEFAULT_BRIDGE_BASE_URL", "\"http://8.147.59.78:8888\"")
 
         // Required by the AppAuth library manifest merger
         // (net.openid.appauth.RedirectUriReceiverActivity uses

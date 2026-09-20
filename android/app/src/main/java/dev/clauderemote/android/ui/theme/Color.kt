@@ -45,18 +45,18 @@ object CatppuccinMacchiato {
 }
 
 /**
- * Semantic color mapping for the app
+ * Semantic color mapping for the app - darker variant
  */
 object AppColors {
-    // Backgrounds
-    val Background = CatppuccinMacchiato.Base
-    val BackgroundDeep = CatppuccinMacchiato.Mantle
-    val BackgroundDeepest = CatppuccinMacchiato.Crust
+    // Backgrounds - much darker
+    val Background = CatppuccinMacchiato.Crust           // #181926 (deepest)
+    val BackgroundDeep = CatppuccinMacchiato.Mantle      // #1E2030
+    val BackgroundDeepest = Color(0xFF0D0E14)            // Even darker than Crust
 
-    // Surfaces
-    val Surface = CatppuccinMacchiato.Surface0
-    val SurfaceElevated = CatppuccinMacchiato.Surface1
-    val SurfaceHigh = CatppuccinMacchiato.Surface2
+    // Surfaces - darker hierarchy
+    val Surface = CatppuccinMacchiato.Mantle             // #1E2030
+    val SurfaceElevated = CatppuccinMacchiato.Base       // #24273A
+    val SurfaceHigh = CatppuccinMacchiato.Surface0       // #363A4F
 
     // Text
     val TextPrimary = CatppuccinMacchiato.Text
@@ -76,10 +76,10 @@ object AppColors {
 
     // Interactive
     val Link = CatppuccinMacchiato.Blue
-    val CodeBackground = CatppuccinMacchiato.Mantle
+    val CodeBackground = Color(0xFF0D0E14)               // Darker than Mantle
     val CodeText = CatppuccinMacchiato.Sky
 
-    // Borders & dividers
-    val Border = CatppuccinMacchiato.Surface2
-    val Divider = CatppuccinMacchiato.Surface1
+    // Borders & dividers - more subtle
+    val Border = CatppuccinMacchiato.Surface1
+    val Divider = CatppuccinMacchiato.Surface0
 }

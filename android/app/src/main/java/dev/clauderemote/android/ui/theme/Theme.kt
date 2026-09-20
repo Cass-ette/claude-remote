@@ -7,19 +7,19 @@ import androidx.compose.runtime.Composable
 private val DarkColorScheme = darkColorScheme(
     // Primary colors
     primary = AppColors.Primary,
-    onPrimary = AppColors.BackgroundDeepest,
+    onPrimary = CatppuccinMacchiato.Crust,  // Dark text on primary button
     primaryContainer = AppColors.PrimaryVariant.copy(alpha = 0.2f),
     onPrimaryContainer = AppColors.Primary,
 
     // Secondary colors
     secondary = AppColors.Secondary,
-    onSecondary = AppColors.BackgroundDeepest,
+    onSecondary = CatppuccinMacchiato.Crust,  // Dark text on secondary button
     secondaryContainer = AppColors.Secondary.copy(alpha = 0.2f),
     onSecondaryContainer = AppColors.Secondary,
 
     // Tertiary colors
     tertiary = AppColors.Info,
-    onTertiary = AppColors.BackgroundDeepest,
+    onTertiary = CatppuccinMacchiato.Crust,  // Dark text on tertiary button
     tertiaryContainer = AppColors.Info.copy(alpha = 0.2f),
     onTertiaryContainer = AppColors.Info,
 

@@ -122,6 +122,7 @@ beforeAll(async () => {
     verifier,
     store,
     publicHost: PUBLIC_HOST,
+    publicScheme: "https",
     audit,
     now: () => nowMs,
     fingerprint: FINGERPRINT,
@@ -153,13 +154,13 @@ describe("GET /.well-known/oauth-authorization-server", () => {
 
 describe("isValidRedirectUri", () => {
   it("accepts only https://<publicHost>/auth/callback with nothing extra", () => {
-    expect(isValidRedirectUri(`https://${PUBLIC_HOST}/auth/callback`, PUBLIC_HOST)).toBe(true);
-    expect(isValidRedirectUri(`https://${PUBLIC_HOST}/auth/callback?x=1`, PUBLIC_HOST)).toBe(false);
-    expect(isValidRedirectUri(`https://${PUBLIC_HOST}/auth/callback/`, PUBLIC_HOST)).toBe(false);
-    expect(isValidRedirectUri(`https://evil.example.com/auth/callback`, PUBLIC_HOST)).toBe(false);
-    expect(isValidRedirectUri(`http://${PUBLIC_HOST}/auth/callback`, PUBLIC_HOST)).toBe(false);
-    expect(isValidRedirectUri(`https://${PUBLIC_HOST}:8443/auth/callback`, PUBLIC_HOST)).toBe(false);
-    expect(isValidRedirectUri(`https://user@${PUBLIC_HOST}/auth/callback`, PUBLIC_HOST)).toBe(false);
+    expect(isValidRedirectUri(`https://${PUBLIC_HOST}/auth/callback`, PUBLIC_HOST, "https")).toBe(true);
+    expect(isValidRedirectUri(`https://${PUBLIC_HOST}/auth/callback?x=1`, PUBLIC_HOST, "https")).toBe(false);
+    expect(isValidRedirectUri(`https://${PUBLIC_HOST}/auth/callback/`, PUBLIC_HOST, "https")).toBe(false);
+    expect(isValidRedirectUri(`https://evil.example.com/auth/callback`, PUBLIC_HOST, "https")).toBe(false);
+    expect(isValidRedirectUri(`http://${PUBLIC_HOST}/auth/callback`, PUBLIC_HOST, "https")).toBe(false);
+    expect(isValidRedirectUri(`https://${PUBLIC_HOST}:8443/auth/callback`, PUBLIC_HOST, "https")).toBe(false);
+    expect(isValidRedirectUri(`https://user@${PUBLIC_HOST}/auth/callback`, PUBLIC_HOST, "https")).toBe(false);
   });
 });
 
@@ -471,6 +472,7 @@ describe("GET /.well-known/assetlinks.json", () => {
       verifier,
       store: createOAuthStore(db),
       publicHost: PUBLIC_HOST,
+      publicScheme: "https",
       audit,
       now: () => nowMs,
     });

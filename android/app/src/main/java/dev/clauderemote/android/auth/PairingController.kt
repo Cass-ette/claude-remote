@@ -72,32 +72,39 @@ class PairingController(
 
     /** True for the OAuth redirect this controller can complete. */
     fun isOAuthRedirect(uri: Uri): Boolean =
-        uri.scheme == "https" && uri.path == REDIRECT_PATH
+        (uri.scheme == "https" && uri.path == REDIRECT_PATH) ||
+        (uri.scheme == "claude-remote" && uri.host == "callback")
 
     /**
-     * Starts the interactive login against [hostInput] (bare host or https
+     * Starts the interactive login against [hostInput] (bare host or http(s)
      * URL). Returns the browser intent the caller must start. [pairingToken]
      * is stashed for the redirect; null means a plain re-login.
      */
     suspend fun begin(hostInput: String, pairingToken: String?): Intent {
-        val host = bareHost(hostInput)
+        val hostWithPort = bareHost(hostInput)
             ?: throw PairingFlowException("无效的 Bridge 主机：\"$hostInput\"")
+        // Extract bare hostname (without port) for App Link verification
+        val bareHostname = hostWithPort.substringBefore(':')
         val graph = graphProvider() ?: throw PairingFlowException("应用图不可用")
+        // Skip App Link verification for IP addresses (development/testing)
+        // App Links only work with verified domain names, not raw IPs
+        if (!isIpAddress(bareHostname)) {
+            graph.oauth.requireVerifiedAppLink(bareHostname)
+        }
         val gateway = AppAuthGateway(appContext)
-        val configuration = gateway.fetchServiceConfiguration(host)
-        val client = gateway.registerPublicClient(configuration, host)
+        // Pass full hostInput (with scheme) to OAuth flow
+        val configuration = gateway.fetchServiceConfiguration(hostInput)
+        val client = gateway.registerPublicClient(configuration, hostInput)
         // Persist endpoints + client id BEFORE the browser trip: a refresh
         // after a process death must not depend on in-memory state.
         StoredTokenRefresher(appContext).storeLogin(configuration, client.clientId)
-        // Throws AppLinkUnverifiedError for a host this install cannot
-        // receive the redirect from — OAuth never starts on such a host.
-        val prepared = graph.oauth.prepareAuthorization(host)
-        pending = PendingLogin(host, configuration, client.clientId, prepared, pairingToken)
+        val prepared = OAuthFlows.prepareAuthorization(hostInput)
+        pending = PendingLogin(hostInput, configuration, client.clientId, prepared, pairingToken)
         return gateway.buildAuthorizationRequestIntent(
             graph.oauth,
             configuration,
             client.clientId,
-            host,
+            hostInput,
             prepared,
         )
     }
@@ -140,7 +147,14 @@ class PairingController(
             }
             // Establish the first device session right away so the connect
             // loop has both credential layers.
-            runCatching { graph.deviceSessions.getValidDeviceSessionToken() }
+            try {
+                graph.deviceSessions.getValidDeviceSessionToken()
+            } catch (e: Exception) {
+                throw PairingFlowException(
+                    "设备配对成功，但无法建立会话（challenge/verify 失败）",
+                    e,
+                )
+            }
             graph.coordinator.start()
             Outcome.Paired(deviceId)
         } else {
@@ -156,8 +170,16 @@ class PairingController(
             trimmed.startsWith("http://") -> trimmed.removePrefix("http://")
             else -> trimmed
         }
-        val host = bare.substringBefore('/').substringBefore(':')
-        return host.takeIf { it.isNotBlank() && host.contains('.') }
+        // Keep port: host:port is needed for OAuth discovery/redirect URIs
+        val hostWithPort = bare.substringBefore('/')
+        // Validate that the hostname part (before :port) looks reasonable
+        val hostname = hostWithPort.substringBefore(':')
+        return hostWithPort.takeIf { hostname.isNotBlank() && hostname.contains('.') }
+    }
+
+    private fun isIpAddress(host: String): Boolean {
+        // Simple check: IPv4 address contains only digits and dots
+        return host.matches(Regex("""^\d+\.\d+\.\d+\.\d+$"""))
     }
 
     private companion object {

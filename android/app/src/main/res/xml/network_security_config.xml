@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Temporary cleartext configuration for testing.
+  Allows HTTP connection to 8.147.59.78 for initial verification.
+-->
+<network-security-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">8.147.59.78</domain>
+    </domain-config>
+</network-security-config>

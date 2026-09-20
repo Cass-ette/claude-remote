@@ -159,7 +159,7 @@ private fun ClaudeRemoteNavGraph() {
             activity?.pairingStatus?.value = "正在打开浏览器登录…"
             runCatching { app.pairingController.begin(host, pairingToken) }
                 .onSuccess { intent ->
-                    activity?.pairingStatus?.value = "请在浏览器中完成 Cloudflare 登录"
+                    activity?.pairingStatus?.value = "请在浏览器中完成登录"
                     // Application contexts cannot startActivity without
                     // FLAG_ACTIVITY_NEW_TASK — that crashes instead of opening
                     // the Custom Tab, so prefer the activity context.
