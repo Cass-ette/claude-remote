@@ -5,6 +5,7 @@ struct SettingsView: View {
     @Environment(StatusStore.self) private var store
     @State private var launchAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginItemError: String?
+    @State private var showResetConfirm = false
 
     var body: some View {
         @Bindable var store = store
@@ -17,6 +18,21 @@ struct SettingsView: View {
                         Label("已读取", systemImage: "checkmark.circle.fill").foregroundStyle(.green)
                     } else {
                         Label("未找到 admin-api-token", systemImage: "xmark.circle.fill").foregroundStyle(.red)
+                    }
+                }
+                HStack {
+                    Spacer()
+                    Button("重置为默认配置") {
+                        showResetConfirm = true
+                    }
+                    .buttonStyle(.bordered)
+                    .confirmationDialog("确认重置配置？", isPresented: $showResetConfirm) {
+                        Button("重置", role: .destructive) {
+                            resetToDefaults()
+                        }
+                        Button("取消", role: .cancel) {}
+                    } message: {
+                        Text("将恢复默认的数据目录和 Admin 地址配置")
                     }
                 }
             }
@@ -37,5 +53,10 @@ struct SettingsView: View {
         }
         .formStyle(.grouped)
         .frame(width: 420)
+    }
+
+    private func resetToDefaults() {
+        store.dataDirPath = NSHomeDirectory() + "/.local/share/claude-remote"
+        store.baseURLString = "http://127.0.0.1:43112"
     }
 }
