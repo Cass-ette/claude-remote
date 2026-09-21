@@ -11,10 +11,7 @@ struct MenuPanelView: View {
         @Bindable var store = store
         VStack(alignment: .leading, spacing: 10) {
             statusCard
-            if let error = store.lastError {
-                Label(message(for: error), systemImage: "exclamationmark.bubble")
-                    .font(.caption).foregroundStyle(.secondary)
-            }
+            errorHelpCard
             Divider()
             Button { showPairing = true } label: { Label("配对新设备", systemImage: "qrcode") }
             Button(role: .destructive) { confirmRevoke = true } label: {
@@ -61,18 +58,44 @@ struct MenuPanelView: View {
                 if let device = s.device {
                     row("设备", device.displayName + " · " + Self.expiryText(device.sessionExpiresAt))
                 }
+
+                // 隧道不可达提示
+                if let reachable = s.publicReachable, !reachable {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Label("隧道不可达", systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption).foregroundStyle(.orange)
+                        Text("手机无法通过公网连接到 Bridge")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Text("→ 检查 Cloudflare Tunnel 是否运行")
+                            .font(.caption2).foregroundStyle(.secondary)
+                        Text("→ 或在设置中配置公网地址")
+                            .font(.caption2).foregroundStyle(.secondary)
+                    }
+                    .padding(8)
+                    .background(Color.orange.opacity(0.1))
+                    .cornerRadius(6)
+                }
             }
             if !store.bridgeReachable {
-                HStack(spacing: 4) {
-                    Text(Self.startBridgeCommand)
-                        .font(.system(.caption2, design: .monospaced))
-                        .lineLimit(1).truncationMode(.middle)
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(Self.startBridgeCommand, forType: .string)
-                    } label: { Image(systemName: "doc.on.doc") }
-                        .buttonStyle(.borderless)
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("Bridge 未运行", systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption).foregroundStyle(.red)
+                    Text("尝试运行以下命令启动：")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    HStack(spacing: 4) {
+                        Text(Self.startBridgeCommand)
+                            .font(.system(.caption2, design: .monospaced))
+                            .lineLimit(1).truncationMode(.middle)
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(Self.startBridgeCommand, forType: .string)
+                        } label: { Image(systemName: "doc.on.doc") }
+                            .buttonStyle(.borderless)
+                    }
                 }
+                .padding(8)
+                .background(Color.red.opacity(0.1))
+                .cornerRadius(6)
             }
         }
     }
@@ -84,8 +107,45 @@ struct MenuPanelView: View {
     private func message(for error: AdminError) -> String {
         switch error {
         case .unreachable(let why): "连不上 admin API：\(why)"
-        case .unauthorized: "token 与 bridge 不匹配，检查设置里的 data dir"
+        case .unauthorized: "配置问题"
         case .api(let code, let message): "[\(code)] \(message)"
+        }
+    }
+
+    @ViewBuilder
+    private var errorHelpCard: some View {
+        if let error = store.lastError {
+            switch error {
+            case .unauthorized:
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("token 不匹配", systemImage: "key.slash.fill")
+                        .font(.caption).foregroundStyle(.orange)
+                    Text("BridgeBar 无法读取 admin token")
+                        .font(.caption2).foregroundStyle(.secondary)
+                    Button("点击重置配置") {
+                        store.dataDirPath = NSHomeDirectory() + "/.local/share/claude-remote"
+                        store.baseURLString = "http://127.0.0.1:43112"
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .tint(.orange)
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(6)
+            case .unreachable:
+                VStack(alignment: .leading, spacing: 4) {
+                    Label("无法连接 Admin API", systemImage: "network.slash")
+                        .font(.caption).foregroundStyle(.orange)
+                    Text("检查 Bridge 是否运行或端口是否正确")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+                .padding(8)
+                .background(Color.orange.opacity(0.1))
+                .cornerRadius(6)
+            default:
+                EmptyView()
+            }
         }
     }
 
