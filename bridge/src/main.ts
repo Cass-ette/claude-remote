@@ -573,7 +573,9 @@ export async function startBridge(
       try {
         // Any HTTP answer (including Cloudflare Access 401/302) proves the
         // tunnel path is up; only network failure means down.
-        await fetch(`https://${config.publicHost}/api/v1/health`, { signal: AbortSignal.timeout(3000) });
+        const scheme = config.publicScheme ?? "https";
+        const port = config.publicPort ? `:${config.publicPort}` : "";
+        await fetch(`${scheme}://${config.publicHost}${port}/api/v1/health`, { signal: AbortSignal.timeout(3000) });
         return true;
       } catch {
         return false;

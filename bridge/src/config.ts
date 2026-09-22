@@ -78,6 +78,11 @@ export interface BridgeConfig {
    */
   readonly publicScheme: "http" | "https";
   /**
+   * Public port number for OAuth endpoints (BRIDGE_PUBLIC_PORT).
+   * Only needed when the public URL uses a non-standard port (not 80/443).
+   */
+  readonly publicPort?: number | undefined;
+  /**
    * APK signing certificate SHA-256 fingerprint
    * (BRIDGE_ASSETLINKS_FINGERPRINT), e.g. `AA:BB:…` (colons optional,
    * normalized to colon-separated uppercase hex). Optional: when set the
@@ -364,6 +369,13 @@ export function loadConfig(env: EnvSource): BridgeConfig {
       `BRIDGE_PUBLIC_SCHEME must be "http" or "https"; got ${JSON.stringify(publicScheme)}`,
     );
   }
+  const publicPort = readString(source, "BRIDGE_PUBLIC_PORT");
+  const publicPortNumber = publicPort ? parseInt(publicPort, 10) : undefined;
+  if (publicPortNumber !== undefined && (isNaN(publicPortNumber) || publicPortNumber < 1 || publicPortNumber > 65535)) {
+    throw new Error(
+      `BRIDGE_PUBLIC_PORT must be a valid port number (1-65535); got ${JSON.stringify(publicPort)}`,
+    );
+  }
   const assetlinksFingerprint = parseAssetlinksFingerprint(source);
   const claudeConfigDir = parseClaudeConfigDir(source);
 
@@ -385,6 +397,7 @@ export function loadConfig(env: EnvSource): BridgeConfig {
     deviceSessionTtlSeconds,
     publicHost,
     publicScheme: publicScheme as "http" | "https",
+    publicPort: publicPortNumber,
     assetlinksFingerprint,
     claudeConfigDir,
   });

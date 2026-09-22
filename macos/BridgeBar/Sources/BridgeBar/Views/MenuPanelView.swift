@@ -66,9 +66,9 @@ struct MenuPanelView: View {
                             .font(.caption).foregroundStyle(.orange)
                         Text("手机无法通过公网连接到 Bridge")
                             .font(.caption2).foregroundStyle(.secondary)
-                        Text("→ 检查 Cloudflare Tunnel 是否运行")
+                        Text("→ 检查公网隧道是否正常运行")
                             .font(.caption2).foregroundStyle(.secondary)
-                        Text("→ 或在设置中配置公网地址")
+                        Text("→ 或在 launchd env 文件中检查公网地址配置")
                             .font(.caption2).foregroundStyle(.secondary)
                     }
                     .padding(8)
