@@ -168,7 +168,7 @@ private fun ClaudeRemoteNavGraph() {
                 }
                 .onFailure { e ->
                     activity?.pairingStatus?.value =
-                        "无法开始登录：${e.message ?: e.javaClass.simpleName}"
+                        e.message ?: "登录失败：${e.javaClass.simpleName}"
                 }
         }
     }

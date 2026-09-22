@@ -599,13 +599,21 @@ class AppAuthGateway(private val context: Context) {
             client.newCall(request).await().use { response ->
                 android.util.Log.d(TAG, "fetchServiceConfiguration: HTTP ${response.code}")
                 if (!response.isSuccessful) {
-                    throw IOException("OAuth discovery failed for \"$host\" (HTTP ${response.code})")
+                    val userMessage = when (response.code) {
+                        502, 503, 504 -> "无法连接到 Bridge。请在 Mac 上检查 Bridge 是否正在运行，或检查网络隧道配置。"
+                        404 -> "Bridge 地址配置错误。请重新扫描配对二维码。"
+                        else -> "连接 Bridge 失败（HTTP ${response.code}）。请检查网络连接或联系技术支持。"
+                    }
+                    throw IOException(userMessage)
                 }
                 response.body?.string().orEmpty()
             }
+        } catch (e: IOException) {
+            android.util.Log.e(TAG, "fetchServiceConfiguration: HTTP error", e)
+            throw e
         } catch (e: Exception) {
             android.util.Log.e(TAG, "fetchServiceConfiguration: network error", e)
-            throw e
+            throw IOException("网络连接失败。请检查手机网络连接或 Mac 上的网络隧道配置。", e)
         }
         android.util.Log.d(TAG, "fetchServiceConfiguration: body=$body")
         val endpoints = OAuthFlows.parseDiscoveryDocument(body)
